@@ -9,4 +9,4 @@ resources:
 # Repoint the image here (e.g. to a freshly built tag) without editing the Deployments.
 images:
   - name: quay.io/wseaton/mock-engine-nixl
-    newTag: dev
+    newTag: amd64
