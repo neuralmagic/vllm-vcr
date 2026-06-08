@@ -1,0 +1,77 @@
+# Prefill instances. Adapted from the llm-d pd-disaggregation GPU/vLLM model server:
+# our CPU mock image instead of vllm/vllm-openai, no GPU, a small model for a light
+# tokenizer. The image's entrypoint runs vllm-rs (frontend) + mock-engine-nixl (engine).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-pd-prefill
+  labels:
+    llm-d.ai/guide: pd-disaggregation
+    llm-d.ai/model: qwen3-0-6b
+    llm-d.ai/role: prefill
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      llm-d.ai/guide: pd-disaggregation
+      llm-d.ai/model: qwen3-0-6b
+      llm-d.ai/role: prefill
+  template:
+    metadata:
+      labels:
+        llm-d.ai/guide: pd-disaggregation
+        llm-d.ai/model: qwen3-0-6b
+        llm-d.ai/role: prefill
+    spec:
+      serviceAccountName: mock-pd-sa
+      containers:
+        - name: modelserver
+          image: quay.io/wseaton/mock-engine-nixl:dev
+          env:
+            - name: MODEL
+              value: Qwen/Qwen3-0.6B
+            - name: MOCK_PD_ROLE
+              value: prefill
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: modelserver
+              containerPort: 8000
+              protocol: TCP
+            - name: nixl
+              containerPort: 5600
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: modelserver
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: modelserver
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: modelserver
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              memory: 4Gi

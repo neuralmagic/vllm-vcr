@@ -1,0 +1,97 @@
+# A GPU-free model-server image for the llm-d P/D path: the real vLLM Rust frontend
+# (vllm-rs) in front of our mock engine-core backend, with a minimal CPU-only libnixl
+# (UCX backend) so the prefill/decode KV transfer runs over CPU RDMA / shared memory.
+#
+# Multi-stage: one Fedora builder compiles libnixl, our engine, and vllm-rs; the runtime
+# stage carries just the libs + binaries.
+
+ARG FEDORA_VERSION=42
+# Keep these in lockstep with Cargo.toml's git deps so the wire protocol matches.
+ARG NIXL_REF=41685d39
+ARG VLLM_REF=ba94a3b9989666f950e1f784d18f2033c63c6cad
+
+# ---------------------------------------------------------------------------------------
+FROM fedora:${FEDORA_VERSION} AS builder
+ARG NIXL_REF
+ARG VLLM_REF
+
+# Toolchain: C/C++ + meson/ninja for libnixl, clang/libclang for bindgen (nixl-sys),
+# ucx-devel for the UCX backend, perl for the vendored OpenSSL build (vllm-rs), protoc
+# for vllm-rs's prost build.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        gcc gcc-c++ make cmake meson ninja-build pkgconf-pkg-config git-core \
+        autoconf automake libtool rdma-core-devel numactl-devel libstdc++-devel \
+        clang clang-devel llvm-devel \
+        protobuf-compiler perl-core python3 python3-devel pybind11-devel \
+        curl ca-certificates findutils which xz \
+    && dnf clean all
+
+# Current stable Rust (edition 2024 needs >= 1.85; Fedora's may lag).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# 1. Build UCX from source. Fedora's packaged UCX is too old for current nixl
+#    (missing UCS_BIT_GET etc.); the nixl contrib pins v1.21.x. CPU + RDMA, no CUDA.
+RUN git clone --depth 1 -b v1.21.x https://github.com/openucx/ucx.git /src/ucx \
+    && cd /src/ucx && ./autogen.sh \
+    && ./configure --prefix=/usr/local/ucx --enable-mt \
+        --without-cuda --without-rocm --with-verbs --with-rdmacm \
+    && make -j"$(nproc)" && make install
+
+# 2. Build a minimal, CPU-only libnixl (UCX plugin only; no CUDA/GDS, no tests/examples).
+ENV PKG_CONFIG_PATH="/usr/local/ucx/lib/pkgconfig"
+RUN git clone https://github.com/ai-dynamo/nixl.git /src/nixl \
+    && cd /src/nixl && git checkout ${NIXL_REF} \
+    && meson setup build --prefix=/usr/local --buildtype=release \
+        -Denable_plugins=UCX \
+        -Ddisable_gds_backend=true \
+        -Dbuild_tests=false \
+        -Dbuild_examples=false \
+        -Drust=false \
+        -Ducx_path=/usr/local/ucx \
+    && ninja -C build install \
+    && echo /usr/local/ucx/lib > /etc/ld.so.conf.d/nixl.conf \
+    && echo /usr/local/lib64  >> /etc/ld.so.conf.d/nixl.conf \
+    && echo /usr/local/lib    >> /etc/ld.so.conf.d/nixl.conf \
+    && ldconfig
+ENV PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/ucx/lib/pkgconfig"
+
+# 2. Build the vLLM Rust frontend (vllm-rs) at the same rev as our engine-core-client dep.
+RUN git clone https://github.com/vllm-project/vllm.git /src/vllm \
+    && cd /src/vllm && git checkout ${VLLM_REF} \
+    && cd rust && cargo build --release --bin vllm-rs \
+    && cp target/release/vllm-rs /usr/local/bin/vllm-rs
+
+# 3. Build our mock engine against the real libnixl.
+COPY . /src/mock-engine-nixl
+RUN cd /src/mock-engine-nixl \
+    && cargo build --release --features nixl \
+    && cp target/release/mock-engine-nixl /usr/local/bin/mock-engine-nixl
+
+# ---------------------------------------------------------------------------------------
+FROM fedora:${FEDORA_VERSION} AS runtime
+ARG FEDORA_VERSION
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        libstdc++ rdma-core numactl-libs ca-certificates bash \
+    && dnf clean all
+
+# Source-built UCX, libnixl + its UCX plugin, and the two binaries.
+COPY --from=builder /usr/local/ucx/ /usr/local/ucx/
+COPY --from=builder /usr/local/lib64/ /usr/local/lib64/
+COPY --from=builder /usr/local/lib/ /usr/local/lib/
+COPY --from=builder /usr/local/bin/vllm-rs /usr/local/bin/vllm-rs
+COPY --from=builder /usr/local/bin/mock-engine-nixl /usr/local/bin/mock-engine-nixl
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN echo /usr/local/ucx/lib > /etc/ld.so.conf.d/nixl.conf \
+    && echo /usr/local/lib64 >> /etc/ld.so.conf.d/nixl.conf \
+    && echo /usr/local/lib >> /etc/ld.so.conf.d/nixl.conf \
+    && ldconfig \
+    && chmod +x /usr/local/bin/entrypoint.sh
+
+# Tokenizer cache (vllm-rs fetches the tokenizer from HF at startup).
+ENV HF_HOME=/tmp/hf
+# modelserver (prefill) / vllm-behind-sidecar (decode) / NIXL metadata side channel.
+EXPOSE 8000 8200 5600
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

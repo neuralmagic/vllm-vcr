@@ -22,9 +22,10 @@ nixl-stub = ["nixl", "nixl-sys/stub-api"]
 # pulled straight from the in-tree Rust frontend so the wire format never drifts.
 vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "ba94a3b9989666f950e1f784d18f2033c63c6cad" }
 
-# NIXL bindings live in the local nixl checkout. Optional: only compiled with the
-# `nixl`/`nixl-stub` features so the default (bird-one) build needs nothing extra.
-nixl-sys = { path = "/Users/weaton/git/nixl/src/bindings/rust", optional = true }
+# NIXL bindings, pinned to the same nixl source the container builds libnixl from, so the
+# crate resolves identically on macOS (stub) and in the image (real). Optional: only
+# compiled with the `nixl`/`nixl-stub` features so the default (bird-one) build needs nothing.
+nixl-sys = { git = "https://github.com/ai-dynamo/nixl.git", rev = "41685d39", optional = true }
 base64 = { version = "0.22.1", optional = true }
 
 anyhow = "1.0.100"

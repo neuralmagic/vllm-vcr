@@ -935,6 +935,7 @@ dependencies = [
 [[package]]
 name = "nixl-sys"
 version = "1.2.0"
+source = "git+https://github.com/ai-dynamo/nixl.git?rev=41685d39#41685d392ffa9c03657dbfb82a2f2324b3749ac6"
 dependencies = [
  "anyhow",
  "bincode",
