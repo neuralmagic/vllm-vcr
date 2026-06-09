@@ -28,6 +28,15 @@ pub mod latency;
 use dataplane::PdRole;
 use latency::LatencyModel;
 
+/// Waiting-queue ordering, matching vLLM's `--scheduling-policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SchedulingPolicy {
+    /// First-come, first-served: requests are admitted in arrival order.
+    Fcfs,
+    /// Priority order: smaller `priority` value first, ties broken by earlier arrival.
+    Priority,
+}
+
 /// Mock engine-core backend for frontend + prefill/decode data-plane testing.
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -139,10 +148,29 @@ pub struct Opt {
     #[arg(long, default_value_t = 1.0)]
     pub time_factor_under_load: f64,
 
-    /// Concurrency at which the load factor reaches `--time-factor-under-load`. Also the
-    /// denominator for `kv_cache_usage` reporting.
-    #[arg(long, default_value_t = 5)]
+    /// Maximum requests running (in the model batch) at once (vLLM `--max-num-seqs`). Excess
+    /// requests wait in an unbounded FIFO/priority queue, producing `vllm:num_requests_waiting`
+    /// and realistic backpressure. Also the load-factor denominator. vLLM never rejects on
+    /// queue length, so neither do we.
+    #[arg(long, default_value_t = 128)]
     pub max_num_seqs: u64,
+
+    /// Per-step token budget (vLLM `--max-num-batched-tokens`): the running batch's per-step
+    /// token demand (1 per decoding request + each prefilling request's prompt chunk) cannot
+    /// exceed this. Throttles prefill admission under load even when batch slots are free.
+    #[arg(long, default_value_t = 2048)]
+    pub max_num_batched_tokens: u64,
+
+    /// Chunked-prefill cap (vLLM `--long-prefill-token-threshold`): a single prefill consumes
+    /// at most this many tokens of budget per step. `0` (default) disables the cap (a prefill
+    /// is bounded only by the token budget).
+    #[arg(long, default_value_t = 0)]
+    pub long_prefill_token_threshold: u64,
+
+    /// Waiting-queue ordering (vLLM `--scheduling-policy`): `fcfs` (arrival order) or
+    /// `priority` (smaller `priority` value first, ties by earlier arrival).
+    #[arg(long, value_enum, default_value_t = SchedulingPolicy::Fcfs)]
+    pub scheduling_policy: SchedulingPolicy,
 
     /// KV-cache capacity in blocks, used to report `vllm:kv_cache_usage_perc`.
     #[arg(long, default_value_t = 1024)]

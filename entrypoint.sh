@@ -30,7 +30,16 @@ LATENCY_ARGS=(
     --kv-cache-transfer-time-per-token "${MOCK_KV_TRANSFER_TIME_PER_TOKEN_MS:-0}"
     --kv-cache-transfer-time-std-dev "${MOCK_KV_TRANSFER_TIME_STDDEV_MS:-0}"
     --time-factor-under-load "${MOCK_TIME_FACTOR_UNDER_LOAD:-1.0}"
-    --max-num-seqs "${MOCK_MAX_NUM_SEQS:-5}"
+)
+
+# Scheduler knobs, mirroring vLLM's flags/defaults. max-num-seqs caps the running batch;
+# max-num-batched-tokens is the per-step token budget; scheduling-policy is fcfs|priority.
+# The waiting queue is unbounded (vLLM never sheds load on queue length).
+SCHEDULER_ARGS=(
+    --max-num-seqs "${MOCK_MAX_NUM_SEQS:-128}"
+    --max-num-batched-tokens "${MOCK_MAX_NUM_BATCHED_TOKENS:-2048}"
+    --long-prefill-token-threshold "${MOCK_LONG_PREFILL_TOKEN_THRESHOLD:-0}"
+    --scheduling-policy "${MOCK_SCHEDULING_POLICY:-fcfs}"
     --kv-cache-size "${MOCK_KV_CACHE_SIZE:-1024}"
 )
 
@@ -58,6 +67,7 @@ inference-sim \
     --side-channel-host "$SIDE_CHANNEL_HOST" \
     --side-channel-port "$SIDE_CHANNEL_PORT" \
     "${LATENCY_ARGS[@]}" \
+    "${SCHEDULER_ARGS[@]}" \
     --log-requests &
 ENGINE_PID=$!
 
