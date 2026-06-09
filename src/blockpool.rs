@@ -225,15 +225,20 @@ impl BlockPool {
         let mut in_prefix = true;
         let mut num_cached_blocks = 0usize;
 
-        // The contiguous run of newly stored blocks, accumulated into one BlockStored.
-        let mut new_hashes: Vec<BlockHash> = Vec::new();
-        let mut new_tokens: Vec<u32> = Vec::new();
-        let mut stored_parent: Option<BlockHash> = None;
+        // Each contiguous run of misses gets its own Stored event with the correct
+        // parent hash (the preceding block's hash, whether that block was a hit or a
+        // miss from a prior run). Under the current global-LRU eviction policy a
+        // miss-hit-miss hole is likely unreachable (chain ticks increase monotonically
+        // and pins are prefix-closed, so the block after a gap is always the next
+        // eviction victim), but the invariant is emergent and fragile, so we handle
+        // it correctly anyway.
+        let mut run_hashes: Vec<BlockHash> = Vec::new();
+        let mut run_tokens: Vec<u32> = Vec::new();
+        let mut run_parent: Option<BlockHash> = None;
+        let mut prev_was_miss = false;
 
         for i in 0..n_blocks {
             let block_toks = &tokens[i * self.block_size..(i + 1) * self.block_size];
-            // `parent` holds the previous block's hash (None for the first block); capture it
-            // before we overwrite it, so the first miss can record it as the stored run's parent.
             let parent_before = parent;
             // vLLM's extra-key order: LoRA name on every block, cache salt on the first only.
             let mut extra: [&str; 2] = ["", ""];
@@ -252,7 +257,17 @@ impl BlockPool {
             parent = Some(hash);
 
             if let Some(slot) = self.cached.get_mut(&hash) {
-                // Cache hit. A hit only counts toward the prefix while the run is unbroken.
+                // Cache hit. Flush any pending miss run before transitioning.
+                if prev_was_miss && !run_hashes.is_empty() {
+                    events.push(KvCacheEvent::Stored {
+                        block_hashes: std::mem::take(&mut run_hashes),
+                        parent_hash: run_parent,
+                        token_ids: std::mem::take(&mut run_tokens),
+                        block_size: self.block_size,
+                        lora_name: lora_name.map(str::to_string),
+                    });
+                }
+                prev_was_miss = false;
                 slot.refcnt += 1;
                 slot.last_used = {
                     self.tick += 1;
@@ -263,12 +278,15 @@ impl BlockPool {
                     num_cached_blocks += 1;
                 }
             } else {
-                // First miss breaks the prefix run; everything after is freshly stored. The
-                // stored run's parent is the last cached block's hash (or None at i == 0).
+                // First miss breaks the prefix run.
                 if in_prefix {
                     in_prefix = false;
-                    stored_parent = parent_before;
                 }
+                // Starting a new miss run: record its parent (the previous block's hash).
+                if !prev_was_miss {
+                    run_parent = parent_before;
+                }
+                prev_was_miss = true;
                 let Some((block_id, removed)) = self.allocate_slot() else {
                     // Pool fully pinned: cannot store this block. Stop; the caller still gets
                     // the prefix it found and the slots allocated so far.
@@ -289,18 +307,19 @@ impl BlockPool {
                     },
                 );
                 block_ids.push(block_id);
-                new_hashes.push(hash);
-                new_tokens.extend_from_slice(block_toks);
+                run_hashes.push(hash);
+                run_tokens.extend_from_slice(block_toks);
             }
         }
 
         self.hits += num_cached_blocks as u64;
 
-        if !new_hashes.is_empty() {
+        // Flush the final miss run if the loop ended on misses.
+        if !run_hashes.is_empty() {
             events.push(KvCacheEvent::Stored {
-                block_hashes: new_hashes,
-                parent_hash: stored_parent,
-                token_ids: new_tokens,
+                block_hashes: run_hashes,
+                parent_hash: run_parent,
+                token_ids: run_tokens,
                 block_size: self.block_size,
                 lora_name: lora_name.map(str::to_string),
             });
@@ -682,6 +701,84 @@ mod tests {
         // Same adapter + same salt -> full hit.
         let z = p.cache_prompt(&toks(8), Some("a"), Some("t1"));
         assert_eq!(z.num_cached_tokens, 8, "same adapter + same salt -> hit");
+    }
+
+    #[test]
+    fn mid_chain_hole_emits_two_stored_events_with_correct_parents() {
+        // Constructs a miss-hit-miss pattern that the current global-LRU eviction
+        // policy cannot produce naturally, by surgically removing two non-adjacent
+        // middle blocks from the cached map and returning their slots to free_slots.
+        let bs = 4;
+        let mut p = pool(bs, 16);
+        let prompt = toks(24); // 6 full blocks
+
+        // Warm the cache with all 6 blocks.
+        let warm = p.cache_prompt(&prompt, None, None);
+        assert_eq!(warm.block_ids.len(), 6);
+        let all_hashes = match &warm.events[0] {
+            KvCacheEvent::Stored { block_hashes, .. } => block_hashes.clone(),
+            other => panic!("expected Stored, got {other:?}"),
+        };
+        assert_eq!(all_hashes.len(), 6);
+        p.unpin(&warm.block_ids);
+
+        // Surgically remove blocks at index 1 and 4 (non-adjacent) to create two holes.
+        // Pattern will be: hit(0), miss(1), hit(2), hit(3), miss(4), hit(5)
+        let hash_1 = all_hashes[1];
+        let hash_4 = all_hashes[4];
+        let slot_1 = p.cached.remove(&hash_1).unwrap();
+        let slot_4 = p.cached.remove(&hash_4).unwrap();
+        p.free_slots.push(slot_1.block_id);
+        p.free_slots.push(slot_4.block_id);
+
+        // Re-cache the same prompt. Blocks 0,2,3,5 are hits; blocks 1,4 are misses.
+        let out = p.cache_prompt(&prompt, None, None);
+
+        // The leading prefix hit is only block 0 (block 1 breaks it).
+        assert_eq!(
+            out.num_cached_tokens, bs,
+            "only block 0 is a contiguous prefix hit"
+        );
+
+        let stored_events: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                KvCacheEvent::Stored {
+                    block_hashes,
+                    parent_hash,
+                    token_ids,
+                    ..
+                } => Some((block_hashes.clone(), *parent_hash, token_ids.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            stored_events.len(),
+            2,
+            "two separate miss runs -> two Stored events"
+        );
+
+        // First Stored: block 1, parent is block 0's hash.
+        let (ref hashes_0, parent_0, ref toks_0) = stored_events[0];
+        assert_eq!(hashes_0.len(), 1);
+        assert_eq!(
+            parent_0,
+            Some(all_hashes[0]),
+            "first miss run's parent is the preceding cached block (block 0)"
+        );
+        assert_eq!(toks_0, &prompt[bs..2 * bs], "block 1's tokens");
+
+        // Second Stored: block 4, parent is block 3's hash.
+        let (ref hashes_1, parent_1, ref toks_1) = stored_events[1];
+        assert_eq!(hashes_1.len(), 1);
+        assert_eq!(
+            parent_1,
+            Some(all_hashes[3]),
+            "second miss run's parent is the preceding cached block (block 3)"
+        );
+        assert_eq!(toks_1, &prompt[4 * bs..5 * bs], "block 4's tokens");
     }
 
     #[test]

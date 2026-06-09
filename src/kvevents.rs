@@ -79,6 +79,9 @@ fn now_secs() -> f64 {
 }
 
 /// True if the endpoint should `bind` (a stable wildcard) rather than `connect`.
+/// The "::" check makes any IPv6-literal endpoint bind rather than connect, faithful to
+/// vLLM's heuristic. Deployers must use wildcard-free IPv4 or hostnames to get connect
+/// semantics.
 fn should_bind(endpoint: &str) -> bool {
     endpoint.contains('*')
         || endpoint.contains("::")
