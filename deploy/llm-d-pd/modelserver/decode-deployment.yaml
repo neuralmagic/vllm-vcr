@@ -58,6 +58,21 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # Latency model (ms). Decode requests are do_remote_prefill, so their TTFT is
+            # the KV-cache transfer time (per prompt token, matching the real NIXL pull),
+            # then inter-token latency per generated token. All simulated; tune to taste.
+            - name: MOCK_KV_TRANSFER_TIME_PER_TOKEN_MS
+              value: "1"
+            - name: MOCK_KV_TRANSFER_TIME_STDDEV_MS
+              value: "1"
+            - name: MOCK_ITL_MS
+              value: "10"
+            - name: MOCK_ITL_STDDEV_MS
+              value: "3"
+            - name: MOCK_TIME_FACTOR_UNDER_LOAD
+              value: "1.5"
+            - name: MOCK_MAX_NUM_SEQS
+              value: "5"
           ports:
             - name: modelserver
               containerPort: 8200

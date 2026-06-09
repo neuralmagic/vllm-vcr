@@ -15,9 +15,10 @@ use rmpv::Value as MsgpackValue;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
-use tokio::task::yield_now;
+use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use vllm_engine_core_client::protocol::stats::{PrefillStats, SchedulerStats};
 use vllm_engine_core_client::protocol::utility::{
     EngineCoreUtilityRequest, UtilityOutput, UtilityResultEnvelope,
 };
@@ -27,6 +28,7 @@ use vllm_engine_core_client::protocol::{
 
 use crate::Opt;
 use crate::dataplane::{KvDataPlane, NixlConfig, RemoteKv, RequestKv, make_data_plane};
+use crate::latency::LatencyModel;
 
 /// Derive a stable per-request seed from the CLI seed, engine, and request id.
 fn request_seed(base_seed: u64, engine_index: u32, request_id: &str) -> u64 {
@@ -222,19 +224,35 @@ struct ActiveRequest {
     /// This request asked us to prefill for a remote decoder (`do_remote_decode`), so on
     /// finish we register its KV and stamp the `remote_*` descriptor onto its output.
     prefill_advertise: bool,
+    /// This request's KV was prefilled remotely and pulled in (`do_remote_prefill`), so its
+    /// prompt tokens count as externally cached for prefill stats / metrics.
+    remote_prefill: bool,
+    /// When the next output token is due. Set to `now + first-token delay` at admission, then
+    /// advanced by the inter-token delay after each emitted token. The engine loop sleeps
+    /// until the earliest deadline across all active requests, so this is the timing model.
+    next_at: Instant,
 }
 
 impl ActiveRequest {
     /// Create a new active request, or return an immediate finish reason if invalid.
+    ///
+    /// `num_running` is the running-request count *including* this one, used to scale the
+    /// first-token delay under load.
     fn new(
         engine_index: u32,
         request: Box<EngineCoreRequest>,
         opt: &Opt,
+        latency: &LatencyModel,
+        num_running: u64,
     ) -> Result<Self, EngineCoreFinishReason> {
         let incoming_kv = extract_kv_params(&request);
         let prefill_advertise = incoming_kv
             .as_ref()
             .map(|kv| kv_flag(kv, "do_remote_decode"))
+            .unwrap_or(false);
+        let remote_prefill = incoming_kv
+            .as_ref()
+            .map(|kv| kv_flag(kv, "do_remote_prefill"))
             .unwrap_or(false);
         let request_id = request.request_id;
         let client_index = request.client_index;
@@ -271,14 +289,21 @@ impl ActiveRequest {
             return Err(EngineCoreFinishReason::Length);
         }
 
+        let mut rng = StdRng::seed_from_u64(request_seed(opt.seed, engine_index, &request_id));
+        // No prefix cache yet, so no prompt tokens are served from the local cache.
+        let first_delay =
+            latency.first_token_delay(&mut rng, prompt_len, 0, remote_prefill, num_running);
+
         Ok(ActiveRequest {
-            rng: StdRng::seed_from_u64(request_seed(opt.seed, engine_index, &request_id)),
+            rng,
             request_id,
             client_index,
             prompt_len,
             max_tokens,
             generated: 0,
             prefill_advertise,
+            remote_prefill,
+            next_at: Instant::now() + first_delay,
         })
     }
 
@@ -299,12 +324,40 @@ impl ActiveRequest {
             finished.then_some(EngineCoreFinishReason::Length),
         )
     }
+
+    /// KV blocks this request currently occupies (prompt + generated so far), for the
+    /// `kv_cache_usage` metric. Rounds up to whole blocks.
+    fn blocks_used(&self, tokens_per_block: usize) -> u64 {
+        if tokens_per_block == 0 {
+            return 0;
+        }
+        let tokens = self.prompt_len + self.generated;
+        tokens.div_ceil(tokens_per_block) as u64
+    }
+
+    /// Prefill breakdown for this request's first output, feeding the prefix-cache and
+    /// KV-transfer metrics. Until the prefix-cache model lands, prompt tokens are either all
+    /// local compute, or (for a remote-prefilled decode request) all externally cached.
+    fn prefill_stats(&self) -> PrefillStats {
+        let external = if self.remote_prefill {
+            self.prompt_len as u32
+        } else {
+            0
+        };
+        PrefillStats {
+            num_prompt_tokens: self.prompt_len as u32,
+            num_computed_tokens: (self.prompt_len as u32).saturating_sub(external),
+            num_external_cached_tokens: external,
+            ..Default::default()
+        }
+    }
 }
 
 /// Internal state for one engine instance, owned by the engine loop task.
 struct Engine {
     engine_index: u32,
     opt: Opt,
+    latency: LatencyModel,
     data_plane: Box<dyn KvDataPlane>,
     active_requests: HashMap<String, ActiveRequest>,
 }
@@ -361,7 +414,15 @@ impl Engine {
                     }
                 }
 
-                match ActiveRequest::new(self.engine_index, request, &self.opt) {
+                // Count this request among the running set for its own load-factor scaling.
+                let num_running = self.active_requests.len() as u64 + 1;
+                match ActiveRequest::new(
+                    self.engine_index,
+                    request,
+                    &self.opt,
+                    &self.latency,
+                    num_running,
+                ) {
                     Ok(request) => {
                         self.active_requests.insert(request_id, request);
                     }
@@ -435,11 +496,17 @@ impl Engine {
         Ok(outputs)
     }
 
-    /// Advance active requests once and return one batched engine output per client.
+    /// Advance every request whose token is due, returning one batched engine output per
+    /// client. Each emitted token reschedules the request by the inter-token delay; the
+    /// engine loop sleeps until the earliest deadline, so this is paced by the latency model.
     fn step(&mut self) -> Vec<EngineOutput> {
         if self.active_requests.is_empty() {
             return Vec::new();
         }
+
+        let now = Instant::now();
+        // Running-request count drives the inter-token load factor; snapshot before the loop.
+        let num_running = self.active_requests.len() as u64;
 
         let mut by_client = BTreeMap::<u32, (Vec<EngineCoreOutput>, BTreeSet<String>)>::new();
         let mut finished_ids = BTreeSet::new();
@@ -449,10 +516,21 @@ impl Engine {
         let mut to_advertise: Vec<(u32, String, usize)> = Vec::new();
 
         for request in self.active_requests.values_mut() {
+            if request.next_at > now {
+                // Not due yet; its deadline keeps the engine loop's sleep honest.
+                continue;
+            }
             let client_index = request.client_index;
+            let is_first = request.generated == 0;
             let mut output = request.step(&self.opt);
             let request_id = request.request_id.clone();
             let finished = output.finished();
+
+            // The first output of a request carries its prefill breakdown for metrics.
+            if is_first {
+                output.prefill_stats = Some(request.prefill_stats());
+            }
+
             if finished {
                 finished_ids.insert(request_id.clone());
                 if request.prefill_advertise {
@@ -467,7 +545,14 @@ impl Engine {
                         "request finished"
                     );
                 }
+            } else {
+                // Schedule the next decode token.
+                request.next_at = now
+                    + self
+                        .latency
+                        .inter_token_delay(&mut request.rng, num_running);
             }
+
             let (outs, finished_set) = by_client
                 .entry(client_index)
                 .or_insert_with(|| (Vec::new(), BTreeSet::new()));
@@ -503,6 +588,10 @@ impl Engine {
             }
         }
 
+        // Computed once after removals so the gauges reflect post-step state (e.g. the batch
+        // that finishes the last request reports num_running = 0). Cloned onto each client.
+        let stats = self.scheduler_stats();
+
         by_client
             .into_iter()
             .filter_map(|(client_index, (outputs, finished_requests))| {
@@ -511,6 +600,7 @@ impl Engine {
                     outputs: EngineCoreOutputs {
                         engine_index: self.engine_index,
                         outputs,
+                        scheduler_stats: Some(Box::new(stats.clone())),
                         timestamp: now_secs(),
                         finished_requests: (!finished_requests.is_empty())
                             .then_some(finished_requests),
@@ -519,6 +609,37 @@ impl Engine {
                 })
             })
             .collect()
+    }
+
+    /// Snapshot of scheduler state for the frontend's `vllm:*` gauges. `num_waiting_reqs`
+    /// stays 0 until the admission-queue model (Phase 3) lands.
+    fn scheduler_stats(&self) -> SchedulerStats {
+        let used_blocks: u64 = self
+            .active_requests
+            .values()
+            .map(|request| request.blocks_used(self.opt.tokens_per_block))
+            .sum();
+        let kv_cache_usage = if self.opt.kv_cache_size == 0 {
+            0.0
+        } else {
+            (used_blocks as f64 / self.opt.kv_cache_size as f64).min(1.0)
+        };
+
+        SchedulerStats {
+            num_running_reqs: self.active_requests.len() as u64,
+            num_waiting_reqs: 0,
+            kv_cache_usage,
+            ..Default::default()
+        }
+    }
+
+    /// The soonest a token is due across all active requests; `None` when idle. The engine
+    /// loop sleeps until this instant before calling `step`.
+    fn earliest_deadline(&self) -> Option<Instant> {
+        self.active_requests
+            .values()
+            .map(|request| request.next_at)
+            .min()
     }
 }
 
@@ -539,14 +660,18 @@ pub(crate) async fn run_engine_loop(
         side_channel_host: opt.side_channel_host.clone(),
         side_channel_port: opt.side_channel_port,
     };
+    let latency = opt.latency_model();
     let mut engine = Engine {
         engine_index,
         opt,
+        latency,
         data_plane: make_data_plane(role, cfg),
         active_requests: HashMap::new(),
     };
 
     loop {
+        // Wake at the soonest token deadline; disabled (no timer branch) when idle.
+        let next_deadline = engine.earliest_deadline();
         let outputs = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
@@ -556,7 +681,9 @@ pub(crate) async fn run_engine_loop(
                 engine.handle_input(input)?
             }
 
-            _ = yield_now(), if !engine.active_requests.is_empty() => {
+            _ = async { sleep_until(next_deadline.unwrap_or_else(Instant::now)).await },
+                if next_deadline.is_some() =>
+            {
                 engine.step()
             }
         };
@@ -570,4 +697,183 @@ pub(crate) async fn run_engine_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use clap::Parser as _;
+    use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
+
+    use super::*;
+    use crate::dataplane::{NixlConfig, PdRole, make_data_plane};
+
+    fn test_opt() -> Opt {
+        // clap fills every field with its declared default (all latency knobs = 0 / instant).
+        Opt::parse_from(["inference-sim"])
+    }
+
+    fn test_engine(opt: Opt) -> Engine {
+        let cfg = NixlConfig {
+            kv_block_bytes: opt.kv_block_bytes,
+            tokens_per_block: opt.tokens_per_block,
+            engine_id: opt.engine_id.clone(),
+            side_channel_host: opt.side_channel_host.clone(),
+            side_channel_port: opt.side_channel_port,
+        };
+        Engine {
+            engine_index: 0,
+            latency: opt.latency_model(),
+            data_plane: make_data_plane(PdRole::Both, cfg),
+            active_requests: HashMap::new(),
+            opt,
+        }
+    }
+
+    fn request(id: &str, prompt_len: usize, max_tokens: u32) -> EngineCoreRequest {
+        EngineCoreRequest {
+            request_id: id.to_string(),
+            prompt_token_ids: Some(vec![0u32; prompt_len]),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens,
+                ..EngineCoreSamplingParams::for_test()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn add(engine: &mut Engine, req: EngineCoreRequest) {
+        engine
+            .handle_input(EngineInput::Request(Box::new(req)))
+            .expect("handle_input");
+    }
+
+    /// Drain steps until the engine is idle, returning the flat output list. Safe only when
+    /// the latency model is instant (deadlines never in the future), as in these tests.
+    fn drain(engine: &mut Engine) -> Vec<EngineCoreOutput> {
+        let mut all = Vec::new();
+        while !engine.active_requests.is_empty() {
+            let batch = engine.step();
+            assert!(
+                !batch.is_empty(),
+                "instant model must make progress each step"
+            );
+            for output in batch {
+                all.extend(output.outputs.outputs);
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn unconfigured_engine_is_instant() {
+        let mut engine = test_engine(test_opt());
+        add(&mut engine, request("r1", 4, 3));
+        // Instant model: the first token is due immediately.
+        assert!(engine.earliest_deadline().unwrap() <= Instant::now());
+        let outputs = drain(&mut engine);
+        let tokens: usize = outputs.iter().map(|o| o.new_token_ids.len()).sum();
+        assert_eq!(tokens, 3);
+        assert!(outputs.last().unwrap().finished());
+    }
+
+    #[test]
+    fn ttft_delays_the_first_token() {
+        let mut opt = test_opt();
+        opt.time_to_first_token = 10_000; // 10s, no std-dev -> exact, comfortably in the future
+        let mut engine = test_engine(opt);
+
+        let before = Instant::now();
+        add(&mut engine, request("r1", 4, 2));
+        let deadline = engine.earliest_deadline().expect("a deadline");
+        assert!(deadline >= before + Duration::from_millis(9_000));
+
+        // The token is not due yet, so a step right now produces nothing and keeps the request.
+        assert!(engine.step().is_empty());
+        assert_eq!(engine.active_requests.len(), 1);
+    }
+
+    #[test]
+    fn prefill_stats_only_on_first_output() {
+        let mut engine = test_engine(test_opt());
+        add(&mut engine, request("r1", 7, 4));
+        let outputs = drain(&mut engine);
+
+        let with_prefill: Vec<_> = outputs
+            .iter()
+            .filter(|o| o.prefill_stats.is_some())
+            .collect();
+        assert_eq!(
+            with_prefill.len(),
+            1,
+            "exactly one output carries prefill stats"
+        );
+        let stats = with_prefill[0].prefill_stats.as_ref().unwrap();
+        assert_eq!(stats.num_prompt_tokens, 7);
+        assert_eq!(stats.num_computed_tokens, 7);
+        assert_eq!(stats.num_external_cached_tokens, 0);
+    }
+
+    #[test]
+    fn scheduler_stats_report_running_and_kv_usage() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 16;
+        opt.kv_cache_size = 100; // blocks
+        let mut engine = test_engine(opt);
+
+        // One request, 32 prompt tokens -> ceil(32/16) = 2 blocks while running.
+        add(&mut engine, request("r1", 32, 5));
+        let stats = engine.scheduler_stats();
+        assert_eq!(stats.num_running_reqs, 1);
+        assert_eq!(stats.num_waiting_reqs, 0);
+        assert!(
+            (stats.kv_cache_usage - 0.02).abs() < 1e-9,
+            "got {}",
+            stats.kv_cache_usage
+        );
+
+        // Drain to completion; the engine is empty so usage is back to zero.
+        let _ = drain(&mut engine);
+        let idle = engine.scheduler_stats();
+        assert_eq!(idle.num_running_reqs, 0);
+        assert_eq!(idle.kv_cache_usage, 0.0);
+    }
+
+    #[test]
+    fn final_batch_reports_zero_running() {
+        let mut engine = test_engine(test_opt());
+        add(&mut engine, request("r1", 4, 1)); // single output token, finishes in one step
+        let batch = engine.step();
+        let stats = batch[0]
+            .outputs
+            .scheduler_stats
+            .as_ref()
+            .expect("stats on batch");
+        // Computed after the finished request is removed, so the gauge drops to 0.
+        assert_eq!(stats.num_running_reqs, 0);
+        assert!(engine.active_requests.is_empty());
+    }
+
+    #[test]
+    fn remote_prefill_request_counts_prompt_as_external_cached() {
+        let mut engine = test_engine(test_opt());
+        let mut req = request("r1", 9, 2);
+        let mut extra = HashMap::new();
+        extra.insert(
+            "kv_transfer_params".to_string(),
+            serde_json::json!({ "do_remote_prefill": true }),
+        );
+        req.sampling_params.as_mut().unwrap().extra_args = Some(extra);
+        add(&mut engine, req);
+
+        let outputs = drain(&mut engine);
+        let stats = outputs
+            .iter()
+            .find_map(|o| o.prefill_stats.as_ref())
+            .expect("prefill stats");
+        assert_eq!(stats.num_external_cached_tokens, 9);
+        assert_eq!(stats.num_computed_tokens, 0);
+    }
 }

@@ -13,6 +13,27 @@ SIDE_CHANNEL_HOST="${POD_IP:-0.0.0.0}"       # advertised as remote_host
 SIDE_CHANNEL_PORT="${MOCK_SIDE_CHANNEL_PORT:-5600}"
 HANDSHAKE_PORT="${MOCK_HANDSHAKE_PORT:-29550}"
 
+# Latency model knobs (milliseconds; 0 = instant, the binary's default). The frontend
+# measures TTFT/ITL from when the engine emits tokens, so these drive the vllm:* timing
+# metrics. Left unset -> instant, identical to the pre-latency behavior. Tune per-pod from
+# the deployment env (prefill vs decode use different paths, see the manifests).
+LATENCY_ARGS=(
+    --time-to-first-token "${MOCK_TTFT_MS:-0}"
+    --time-to-first-token-std-dev "${MOCK_TTFT_STDDEV_MS:-0}"
+    --inter-token-latency "${MOCK_ITL_MS:-0}"
+    --inter-token-latency-std-dev "${MOCK_ITL_STDDEV_MS:-0}"
+    --prefill-overhead "${MOCK_PREFILL_OVERHEAD_MS:-0}"
+    --prefill-time-per-token "${MOCK_PREFILL_TIME_PER_TOKEN_MS:-0}"
+    --prefill-time-std-dev "${MOCK_PREFILL_TIME_STDDEV_MS:-0}"
+    --kv-cache-transfer-latency "${MOCK_KV_TRANSFER_LATENCY_MS:-0}"
+    --kv-cache-transfer-latency-std-dev "${MOCK_KV_TRANSFER_LATENCY_STDDEV_MS:-0}"
+    --kv-cache-transfer-time-per-token "${MOCK_KV_TRANSFER_TIME_PER_TOKEN_MS:-0}"
+    --kv-cache-transfer-time-std-dev "${MOCK_KV_TRANSFER_TIME_STDDEV_MS:-0}"
+    --time-factor-under-load "${MOCK_TIME_FACTOR_UNDER_LOAD:-1.0}"
+    --max-num-seqs "${MOCK_MAX_NUM_SEQS:-5}"
+    --kv-cache-size "${MOCK_KV_CACHE_SIZE:-1024}"
+)
+
 # Decode sits behind the routing sidecar (sidecar :8000 -> vllm-rs :8200); prefill is
 # hit directly on :8000. Override with VLLM_PORT if needed.
 case "$ROLE" in
@@ -36,6 +57,7 @@ inference-sim \
     --engine-id "$ENGINE_ID" \
     --side-channel-host "$SIDE_CHANNEL_HOST" \
     --side-channel-port "$SIDE_CHANNEL_PORT" \
+    "${LATENCY_ARGS[@]}" \
     --log-requests &
 ENGINE_PID=$!
 

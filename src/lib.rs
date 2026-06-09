@@ -23,8 +23,10 @@ use vllm_engine_core_client::mock_engine::{
 pub mod dataplane;
 mod engine;
 mod io;
+pub mod latency;
 
 use dataplane::PdRole;
+use latency::LatencyModel;
 
 /// Mock engine-core backend for frontend + prefill/decode data-plane testing.
 #[derive(Debug, Clone, Parser)]
@@ -82,6 +84,90 @@ pub struct Opt {
     /// Log a summary line for each request.
     #[arg(long)]
     pub log_requests: bool,
+
+    // === Latency model (all milliseconds; 0 = instant, the default) ===
+    // Ported from llm-d-inference-sim. The real frontend measures TTFT/ITL from when we
+    // emit tokens, so these knobs drive both response timing and the vllm:* latency metrics.
+    /// Fixed time-to-first-token. When this and its std-dev are 0, the token-count prefill
+    /// model (`--prefill-overhead` + `--prefill-time-per-token`) is used instead.
+    #[arg(long, default_value_t = 0)]
+    pub time_to_first_token: u64,
+
+    /// Standard deviation for time-to-first-token.
+    #[arg(long, default_value_t = 0)]
+    pub time_to_first_token_std_dev: u64,
+
+    /// Time to generate one output token (decode step).
+    #[arg(long, default_value_t = 0)]
+    pub inter_token_latency: u64,
+
+    /// Standard deviation for inter-token latency.
+    #[arg(long, default_value_t = 0)]
+    pub inter_token_latency_std_dev: u64,
+
+    /// Fixed prefill overhead, added once per request in the token-count prefill model.
+    #[arg(long, default_value_t = 0)]
+    pub prefill_overhead: u64,
+
+    /// Per-(uncached-)prompt-token prefill cost in the token-count prefill model.
+    #[arg(long, default_value_t = 0)]
+    pub prefill_time_per_token: u64,
+
+    /// Standard deviation for the token-count prefill time.
+    #[arg(long, default_value_t = 0)]
+    pub prefill_time_std_dev: u64,
+
+    /// Fixed KV-cache transfer time for a `do_remote_prefill` decode request. When this and
+    /// its std-dev are 0, the per-token transfer model is used instead.
+    #[arg(long, default_value_t = 0)]
+    pub kv_cache_transfer_latency: u64,
+
+    /// Standard deviation for the fixed KV-cache transfer time.
+    #[arg(long, default_value_t = 0)]
+    pub kv_cache_transfer_latency_std_dev: u64,
+
+    /// Per-prompt-token KV-cache transfer cost for a `do_remote_prefill` decode request.
+    #[arg(long, default_value_t = 0)]
+    pub kv_cache_transfer_time_per_token: u64,
+
+    /// Standard deviation for the per-token KV-cache transfer cost.
+    #[arg(long, default_value_t = 0)]
+    pub kv_cache_transfer_time_std_dev: u64,
+
+    /// Latency multiplier at full load (`>= 1.0`; 1.0 disables load scaling). Latency grows
+    /// linearly from 1.0 with one request to this value at `--max-num-seqs` concurrent ones.
+    #[arg(long, default_value_t = 1.0)]
+    pub time_factor_under_load: f64,
+
+    /// Concurrency at which the load factor reaches `--time-factor-under-load`. Also the
+    /// denominator for `kv_cache_usage` reporting.
+    #[arg(long, default_value_t = 5)]
+    pub max_num_seqs: u64,
+
+    /// KV-cache capacity in blocks, used to report `vllm:kv_cache_usage_perc`.
+    #[arg(long, default_value_t = 1024)]
+    pub kv_cache_size: u64,
+}
+
+impl Opt {
+    /// Build the latency model from the configured timing knobs.
+    pub fn latency_model(&self) -> LatencyModel {
+        LatencyModel {
+            time_to_first_token: self.time_to_first_token,
+            time_to_first_token_std_dev: self.time_to_first_token_std_dev,
+            inter_token_latency: self.inter_token_latency,
+            inter_token_latency_std_dev: self.inter_token_latency_std_dev,
+            prefill_overhead: self.prefill_overhead,
+            prefill_time_per_token: self.prefill_time_per_token,
+            prefill_time_std_dev: self.prefill_time_std_dev,
+            kv_cache_transfer_latency: self.kv_cache_transfer_latency,
+            kv_cache_transfer_latency_std_dev: self.kv_cache_transfer_latency_std_dev,
+            kv_cache_transfer_time_per_token: self.kv_cache_transfer_time_per_token,
+            kv_cache_transfer_time_std_dev: self.kv_cache_transfer_time_std_dev,
+            time_factor_under_load: self.time_factor_under_load,
+            max_num_seqs: self.max_num_seqs,
+        }
+    }
 }
 
 /// Run one mock engine until shutdown or transport failure.
