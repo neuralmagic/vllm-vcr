@@ -1,0 +1,59 @@
+# Pre-commit hooks, run with prek (https://github.com/j178/prek), a fast Rust drop-in for
+# pre-commit that reads this same config.
+#
+#   prek install --install-hooks   # install the git hooks (pre-commit + pre-push)
+#   prek run --all-files           # run everything once
+#
+# Commit-time hooks are kept fast (formatting + hygiene); the compile-heavy Rust checks run
+# on pre-push, mirroring the CI gates so a push that would fail CI fails locally first.
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: mixed-line-ending
+
+  # GitHub Actions linting + security scanning. actionlint catches workflow syntax/expression
+  # mistakes; zizmor audits the workflows for security issues (unpinned actions, injectable
+  # expressions, credential persistence, over-broad permissions).
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.25.2
+    hooks:
+      - id: zizmor
+
+  # Rust checks as local hooks so they use the project's own toolchain and match CI exactly.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets --locked --no-deps -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --locked
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]

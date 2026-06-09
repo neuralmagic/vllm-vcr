@@ -41,6 +41,23 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # Latency model (ms). Prefill uses the token-count prefill path for TTFT
+            # (overhead + per-token), then inter-token latency for any tokens it emits.
+            # All simulated; tune to taste. Drives vllm:time_to_first_token_seconds etc.
+            - name: MOCK_PREFILL_OVERHEAD_MS
+              value: "30"
+            - name: MOCK_PREFILL_TIME_PER_TOKEN_MS
+              value: "1"
+            - name: MOCK_PREFILL_TIME_STDDEV_MS
+              value: "5"
+            - name: MOCK_ITL_MS
+              value: "8"
+            - name: MOCK_ITL_STDDEV_MS
+              value: "2"
+            - name: MOCK_TIME_FACTOR_UNDER_LOAD
+              value: "1.5"
+            - name: MOCK_MAX_NUM_SEQS
+              value: "5"
           ports:
             - name: modelserver
               containerPort: 8000

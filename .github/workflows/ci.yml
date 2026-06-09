@@ -1,0 +1,60 @@
+name: CI
+
+# Trusted triggers only. We deliberately avoid `pull_request`, which would execute an
+# untrusted PR's build scripts and test code on the runner. PRs are instead validated in
+# the merge queue (`merge_group`), which runs the trusted, about-to-merge content.
+on:
+  push:
+    branches: ['**']
+  merge_group:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref so pushes don't pile up.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: this workflow only reads the repo.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation is a loss in CI (no warm incremental dir); turning it
+  # off shrinks the cached target/ and speeds cold builds.
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # One job, ordered fail-fast: fmt is instant, then the compile-heavy steps share a
+  # single warm target/ and the cached git deps (vllm-engine-core-client, nixl-sys),
+  # which dominate build time. The default build is pure-Rust (no libnixl/UCX), so it
+  # needs nothing beyond the toolchain.
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # Sets up the toolchain (rustfmt + clippy) and bundles Swatinem/rust-cache, which
+      # caches ~/.cargo/{registry,git} and target/ keyed on Cargo.lock + toolchain. The
+      # cache is the single biggest speedup; the git deps compile slowly when cold.
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets --locked --no-deps -- -D warnings
+
+      - name: Test (default features)
+        run: cargo test --locked
+
+      # Typecheck the NIXL data-plane code (incl. the loopback test + examples) against
+      # the stub bindings. The real transfer needs libnixl/UCX and runs on Linux with
+      # the `nixl` feature (out of this fast lane); `check` doesn't link, so it's quick.
+      - name: Check (nixl-stub)
+        run: cargo check --all-targets --locked --features nixl-stub
