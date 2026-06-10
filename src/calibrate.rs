@@ -5,10 +5,11 @@
 //!   2. `KnobLatency` structurally cannot reproduce heavy tails: its `[0.3*mean, 1.7*mean]`
 //!      clamp caps p99/p50 at roughly 1.7 for any knob settings.
 //!
-//! Three entry points, each exposed as a subcommand on the `inference-sim-trace` binary:
+//! Four entry points, each exposed on the `inference-sim-trace` binary:
 //!   - `gen_demo`: synthesize a heavy-tailed demo trace (lognormal TTFT/ITL).
 //!   - `calibrate`: model-level quantile comparison (source vs replay vs knob-fit).
 //!   - `calibrate_e2e`: wire-level proof using the real simulator in-process.
+//!   - `replay_arrivals`: wire-level open-loop replay of a recorded arrival schedule.
 
 use std::io::Write;
 use std::path::Path;
@@ -20,14 +21,10 @@ use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 
 use crate::latency::{
-    CONCURRENCY_RANGES, DecodePacing, FirstTokenCtx, KnobLatency, LatencyModel,
-    NUM_CONCURRENCY_BUCKETS, TraceLatency, concurrency_bucket, random_norm,
+    DecodePacing, FirstTokenCtx, KnobLatency, LatencyModel, NUM_CONCURRENCY_BUCKETS, TraceLatency,
+    concurrency_bucket, concurrency_label, random_norm,
 };
 use crate::trace::{TraceMeta, TraceRecord, read_trace, write_trace};
-
-// ---------------------------------------------------------------------------
-// Quantile helpers
-// ---------------------------------------------------------------------------
 
 /// Nearest-rank percentile on a sorted slice. Returns 0.0 for empty input.
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -83,10 +80,6 @@ impl Quantiles {
         max_err
     }
 }
-
-// ---------------------------------------------------------------------------
-// Bucket-level stats
-// ---------------------------------------------------------------------------
 
 /// Stats for one concurrency bucket from one source (source trace, replay, or knob-fit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,10 +139,6 @@ pub struct Verdict {
     pub knobfit_tail_capped: bool,
     pub tolerance: f64,
 }
-
-// ---------------------------------------------------------------------------
-// gen-demo: synthesize a heavy-tailed demo trace
-// ---------------------------------------------------------------------------
 
 /// Lognormal sample: exp(N(mu, sigma)).
 fn lognormal(rng: &mut StdRng, mu: f64, sigma: f64) -> f64 {
@@ -363,10 +352,6 @@ pub fn write_demo_trace(path: &Path, meta: &TraceMeta, records: &[TraceRecord]) 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// calibrate: model-level comparison
-// ---------------------------------------------------------------------------
-
 /// Collect TTFT and ITL samples from trace records, grouped by concurrency bucket.
 pub fn source_samples_by_bucket(records: &[TraceRecord]) -> Vec<(String, Vec<f64>, Vec<f64>)> {
     // Group by concurrency bucket index.
@@ -392,17 +377,9 @@ pub fn source_samples_by_bucket(records: &[TraceRecord]) -> Vec<(String, Vec<f64
         if ttfts.is_empty() {
             continue;
         }
-        let (lo, hi) = CONCURRENCY_RANGES[i];
-        let label = if hi == u64::MAX {
-            format!("{lo}+")
-        } else if lo == hi {
-            format!("{lo}")
-        } else {
-            format!("{lo}-{hi}")
-        };
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         itls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        result.push((label, ttfts, itls));
+        result.push((concurrency_label(i), ttfts, itls));
     }
     result
 }
@@ -497,7 +474,7 @@ fn std_dev(values: &[f64], mean: f64) -> f64 {
 }
 
 /// Labeled buckets of (label, ttft_samples, itl_samples) plus pooled ttft and itl vecs.
-type BucketedSamples = (Vec<(String, Vec<f64>, Vec<f64>)>, Vec<f64>, Vec<f64>);
+pub type BucketedSamples = (Vec<(String, Vec<f64>, Vec<f64>)>, Vec<f64>, Vec<f64>);
 
 /// Sample TTFT and ITL from a model, bucketed to match the source trace structure.
 ///
@@ -533,6 +510,16 @@ fn sample_model_to_buckets(
         }
     }
 
+    buckets_from_measured(bucket_ttfts, bucket_itls)
+}
+
+/// Sort per-concurrency-bucket TTFT/ITL sample arrays into labeled buckets plus
+/// pooled arrays, dropping buckets with no TTFT observations. Input vecs are
+/// indexed by concurrency bucket.
+pub fn buckets_from_measured(
+    bucket_ttfts: Vec<Vec<f64>>,
+    bucket_itls: Vec<Vec<f64>>,
+) -> BucketedSamples {
     let mut pooled_ttft = Vec::new();
     let mut pooled_itl = Vec::new();
     let mut result = Vec::new();
@@ -544,17 +531,9 @@ fn sample_model_to_buckets(
         pooled_ttft.extend(ttfts.iter().copied());
         pooled_itl.extend(itls.iter().copied());
 
-        let (lo, hi) = CONCURRENCY_RANGES[i];
-        let label = if hi == u64::MAX {
-            format!("{lo}+")
-        } else if lo == hi {
-            format!("{lo}")
-        } else {
-            format!("{lo}-{hi}")
-        };
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         itls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        result.push((label, ttfts, itls));
+        result.push((concurrency_label(i), ttfts, itls));
     }
 
     pooled_ttft.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -823,10 +802,6 @@ fn request_total_report(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Report rendering
-// ---------------------------------------------------------------------------
-
 /// Render an aligned text table and verdict block. The knob-fit columns appear only when
 /// the report carries knob-fit data (model-level calibration); the e2e harness measures one
 /// model per run and labels the measured column accordingly.
@@ -1000,10 +975,6 @@ fn write_verdict(writer: &mut impl Write, v: &Verdict, measured_label: &str) -> 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// calibrate from file
-// ---------------------------------------------------------------------------
-
 /// Run calibrate from a trace file path. Convenience for the CLI.
 pub fn calibrate_from_file(
     path: &Path,
@@ -1019,13 +990,374 @@ pub fn calibrate_from_file(
     calibrate(&records, num_samples, seed, tolerance)
 }
 
-// ---------------------------------------------------------------------------
-// calibrate-e2e (wire-level proof)
-// ---------------------------------------------------------------------------
+/// Config for the open-loop arrival replay harness ([`replay_arrivals`]).
+pub struct ReplayArrivalsConfig<'a> {
+    /// Trace supplying the arrival schedule, request shapes, and ground-truth
+    /// quantiles. Records without `arrival_ms` are skipped.
+    pub trace_path: &'a Path,
+    /// Build the sim's latency model from this trace instead of `trace_path`,
+    /// validating the model against an arrival process it was not fitted on.
+    pub latency_trace: Option<&'a Path>,
+    /// Replay only the first N arrivals (default: the whole schedule).
+    pub max_requests: Option<usize>,
+    /// Max allowed relative error on pooled quantiles and request totals.
+    pub tolerance: f64,
+    /// Drive the sim with fitted knobs instead of trace replay.
+    pub use_knob_fit: bool,
+    /// Disambiguates the IPC socket when several replays share a process.
+    pub ipc_tag: String,
+}
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// Outcome of an open-loop arrival replay: the calibration report plus
+/// schedule-fidelity diagnostics.
+#[derive(Debug)]
+pub struct ArrivalReplayOutcome {
+    pub report: CalibrationReport,
+    /// Requests in the replayed schedule.
+    pub requests_replayed: usize,
+    /// Requests that produced a first token (no error, no timeout).
+    pub requests_completed: usize,
+    /// Worst observed lag between a request's scheduled and actual send time.
+    /// Large values mean the harness could not keep up with the schedule and
+    /// the measured quantiles are suspect.
+    pub max_send_lag_ms: f64,
+    pub wall_time_s: f64,
+}
+
+/// One replayed request's client-side measurements.
+struct ReplayedRequest {
+    index: usize,
+    send_lag_ms: f64,
+    ttft_ms: Option<f64>,
+    gaps_ms: Vec<f64>,
+}
+
+/// Reactive wire-level validation: replay a trace's recorded arrival schedule
+/// against the real in-process simulator over ZMQ. Each request is sent at its
+/// recorded offset regardless of how earlier requests are progressing (open
+/// loop), so the sim's scheduler state (num_running, prefill admissions)
+/// emerges from the workload instead of being pinned by closed-loop batching.
+/// Client-side TTFT/ITL/request-totals are then compared against the source
+/// quantiles.
+pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalReplayOutcome> {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use clap::Parser as _;
+    use futures::StreamExt as _;
+    use tokio_util::sync::CancellationToken;
+    use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
+    use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
+
+    let file = std::fs::File::open(cfg.trace_path)
+        .with_context(|| format!("opening trace: {}", cfg.trace_path.display()))?;
+    let (meta, all_records) = read_trace(std::io::BufReader::new(file))
+        .with_context(|| format!("parsing trace: {}", cfg.trace_path.display()))?;
+
+    let mut subset: Vec<TraceRecord> = all_records
+        .into_iter()
+        .filter(|r| r.arrival_ms.is_some())
+        .collect();
+    if subset.is_empty() {
+        bail!(
+            "trace has no records with arrival_ms; capture with a tap/loadgen that \
+             records the arrival schedule"
+        );
+    }
+    subset.sort_by(|a, b| {
+        a.arrival_ms
+            .partial_cmp(&b.arrival_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if let Some(n) = cfg.max_requests {
+        subset.truncate(n);
+    }
+    let first_arrival = subset[0].arrival_ms.unwrap_or(0.0);
+    let span_ms = subset
+        .last()
+        .and_then(|r| r.arrival_ms)
+        .unwrap_or(first_arrival)
+        - first_arrival;
+    tracing::info!(
+        "replaying {} arrivals spanning {:.1}s (real time)",
+        subset.len(),
+        span_ms / 1000.0
+    );
+
+    // Build the simulator's latency model from the fitting source, which is the
+    // replayed trace itself unless the caller supplies a separate one.
+    let latency_path = cfg.latency_trace.unwrap_or(cfg.trace_path);
+    let max_num_seqs = meta.max_num_seqs.unwrap_or(64);
+
+    let addr = format!(
+        "ipc:///tmp/inf-sim-replay-{}-{}.ipc",
+        std::process::id(),
+        cfg.ipc_tag
+    );
+    let mut args: Vec<String> = vec![
+        "inference-sim".to_string(),
+        "--handshake-address".to_string(),
+        addr.clone(),
+        "--max-num-seqs".to_string(),
+        max_num_seqs.to_string(),
+    ];
+    if cfg.use_knob_fit {
+        let lat_file = std::fs::File::open(latency_path)
+            .with_context(|| format!("opening latency trace: {}", latency_path.display()))?;
+        let (_, lat_records) = read_trace(std::io::BufReader::new(lat_file))
+            .with_context(|| format!("parsing latency trace: {}", latency_path.display()))?;
+        let knob = fit_knob_from_trace(&lat_records);
+        args.extend([
+            "--time-to-first-token".to_string(),
+            knob.time_to_first_token.to_string(),
+            "--time-to-first-token-std-dev".to_string(),
+            knob.time_to_first_token_std_dev.to_string(),
+            "--inter-token-latency".to_string(),
+            knob.inter_token_latency.to_string(),
+            "--inter-token-latency-std-dev".to_string(),
+            knob.inter_token_latency_std_dev.to_string(),
+        ]);
+    } else {
+        args.extend([
+            "--latency-trace".to_string(),
+            latency_path.to_string_lossy().to_string(),
+        ]);
+    }
+
+    let opt = crate::Opt::parse_from(&args);
+    let token = CancellationToken::new();
+    let sim_token = token.clone();
+    tokio::spawn(async move {
+        let _ = crate::run(opt, sim_token).await;
+    });
+
+    let config = EngineCoreClientConfig::new_single(&addr);
+    let client = tokio::time::timeout(Duration::from_secs(30), EngineCoreClient::connect(config))
+        .await
+        .map_err(|_| anyhow::anyhow!("client connect timed out"))?
+        .context("client connect failed")?;
+    let client = Arc::new(client);
+
+    let wall_start = Instant::now();
+    let base = tokio::time::Instant::now();
+
+    let mut handles = Vec::with_capacity(subset.len());
+    for (i, rec) in subset.iter().enumerate() {
+        let offset_ms = (rec.arrival_ms.unwrap_or(first_arrival) - first_arrival).max(0.0);
+        let target = base + Duration::from_secs_f64(offset_ms / 1000.0);
+        let prompt_len = rec.prompt_tokens;
+        let max_tokens = rec.output_tokens.max(1).min(u32::MAX as usize) as u32;
+        // Generous per-request timeout scaled to the source duration: open-loop
+        // replay can queue far past the source under model mismatch, and a
+        // timeout there should fail the gate, not hang the harness.
+        let source_ms = rec.ttft_ms
+            + rec
+                .itl_ms
+                .as_ref()
+                .map(|g| g.iter().sum::<f64>())
+                .or_else(|| rec.itl_summary.as_ref().map(|s| s.mean_ms * s.count as f64))
+                .unwrap_or(0.0);
+        let timeout_dur = Duration::from_secs_f64(60.0 + 5.0 * source_ms / 1000.0);
+        let client = Arc::clone(&client);
+
+        handles.push(tokio::spawn(async move {
+            tokio::time::sleep_until(target).await;
+            let send_lag_ms = (tokio::time::Instant::now() - target).as_secs_f64() * 1000.0;
+            let mut measured = ReplayedRequest {
+                index: i,
+                send_lag_ms,
+                ttft_ms: None,
+                gaps_ms: Vec::new(),
+            };
+
+            let request = EngineCoreRequest {
+                request_id: format!("replay-{i}"),
+                prompt_token_ids: Some(vec![42u32; prompt_len]),
+                sampling_params: Some(EngineCoreSamplingParams {
+                    max_tokens,
+                    ..EngineCoreSamplingParams::for_test()
+                }),
+                ..Default::default()
+            };
+            let call_start = Instant::now();
+            let mut stream = match client.call(request).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("replay-{i}: call failed: {e:#}");
+                    return measured;
+                }
+            };
+
+            let mut token_times: Vec<Instant> = Vec::new();
+            let result = tokio::time::timeout(timeout_dur, async {
+                while let Some(item) = stream.next().await {
+                    let output = item.context("stream item error")?;
+                    let now = Instant::now();
+                    if !output.new_token_ids.is_empty() {
+                        token_times.push(now);
+                    }
+                    if output.finish_reason.is_some() {
+                        break;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("replay-{i}: stream error: {e:#}");
+                    return measured;
+                }
+                Err(_) => {
+                    tracing::warn!("replay-{i}: timed out after {timeout_dur:?}");
+                    return measured;
+                }
+            }
+
+            if let Some(first) = token_times.first() {
+                measured.ttft_ms = Some((*first - call_start).as_secs_f64() * 1000.0);
+            }
+            measured.gaps_ms = token_times
+                .windows(2)
+                .map(|w| (w[1] - w[0]).as_secs_f64() * 1000.0)
+                .collect();
+            measured
+        }));
+    }
+
+    let mut completed_requests: Vec<ReplayedRequest> = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok(m) => completed_requests.push(m),
+            Err(e) => tracing::warn!("replay task failed to join: {e}"),
+        }
+    }
+    let wall_time_s = wall_start.elapsed().as_secs_f64();
+    token.cancel();
+
+    // Bucket measurements by the source record's concurrency so they compare
+    // against the same source bucketing.
+    let mut measured_ttfts: Vec<Vec<f64>> = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
+    let mut measured_itls: Vec<Vec<f64>> = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
+    let mut replay_totals: Vec<f64> = Vec::new();
+    let mut requests_completed = 0usize;
+    let mut max_send_lag_ms = 0.0_f64;
+
+    for m in &completed_requests {
+        max_send_lag_ms = max_send_lag_ms.max(m.send_lag_ms);
+        let Some(ttft) = m.ttft_ms else { continue };
+        requests_completed += 1;
+        let Some(rec) = subset.get(m.index) else {
+            continue;
+        };
+        let cb = concurrency_bucket(rec.concurrency);
+        measured_ttfts[cb].push(ttft);
+        measured_itls[cb].extend(m.gaps_ms.iter().copied());
+        if !m.gaps_ms.is_empty() {
+            replay_totals.push(m.gaps_ms.iter().sum());
+        }
+    }
+
+    let (measured_buckets, pooled_ttft, pooled_itl) =
+        buckets_from_measured(measured_ttfts, measured_itls);
+    let replay_stats = quantiles_from_buckets(&measured_buckets, &pooled_ttft, &pooled_itl);
+
+    let source_buckets = source_samples_by_bucket(&subset);
+    let (source_pooled_ttft, source_pooled_itl) = pool_samples(&subset);
+    let source_stats =
+        quantiles_from_buckets(&source_buckets, &source_pooled_ttft, &source_pooled_itl);
+
+    // Per-request decode totals: the reactive gate that catches lost
+    // within-request correlation and mistimed stall draws.
+    let mut source_totals: Vec<f64> = subset
+        .iter()
+        .filter_map(|r| {
+            r.itl_ms
+                .as_ref()
+                .filter(|g| !g.is_empty())
+                .map(|g| g.iter().sum())
+                .or_else(|| {
+                    r.itl_summary
+                        .as_ref()
+                        .filter(|s| s.count > 0)
+                        .map(|s| s.mean_ms * s.count as f64)
+                })
+        })
+        .collect();
+    source_totals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    replay_totals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let request_total = if source_totals.is_empty() || replay_totals.is_empty() {
+        None
+    } else {
+        let source = Quantiles::from_sorted(&source_totals);
+        let replay = Quantiles::from_sorted(&replay_totals);
+        let max_error = source.max_relative_error(&replay);
+        Some(RequestTotalReport {
+            count: source_totals.len(),
+            source,
+            replay,
+            max_error,
+            within_tolerance: max_error <= cfg.tolerance,
+        })
+    };
+
+    let zero_q = Quantiles {
+        p50: 0.0,
+        p90: 0.0,
+        p99: 0.0,
+    };
+    let (src_ttft_q, src_itl_q) = source_stats
+        .last()
+        .map(|b| (b.ttft, b.itl))
+        .unwrap_or((zero_q, zero_q));
+    let (rep_ttft_q, rep_itl_q) = replay_stats
+        .last()
+        .map(|b| (b.ttft, b.itl))
+        .unwrap_or((zero_q, zero_q));
+
+    let replay_ttft_err = src_ttft_q.max_relative_error(&rep_ttft_q);
+    let replay_itl_err = src_itl_q.max_relative_error(&rep_itl_q);
+    let replay_pass = replay_ttft_err <= cfg.tolerance
+        && replay_itl_err <= cfg.tolerance
+        && request_total.as_ref().is_none_or(|rt| rt.within_tolerance);
+
+    let measured_label = if cfg.use_knob_fit {
+        "knobfit"
+    } else {
+        "replay"
+    }
+    .to_string();
+    let verdict = Verdict {
+        source_ttft_tail_ratio: src_ttft_q.tail_ratio(),
+        source_itl_tail_ratio: src_itl_q.tail_ratio(),
+        replay_ttft_tail_ratio: rep_ttft_q.tail_ratio(),
+        replay_itl_tail_ratio: rep_itl_q.tail_ratio(),
+        // One model measured per run; no separate knob-fit sample set.
+        knobfit_ttft_tail_ratio: None,
+        knobfit_itl_tail_ratio: None,
+        replay_ttft_max_error: replay_ttft_err,
+        replay_itl_max_error: replay_itl_err,
+        replay_pass,
+        knobfit_tail_capped: false,
+        tolerance: cfg.tolerance,
+    };
+
+    Ok(ArrivalReplayOutcome {
+        report: CalibrationReport {
+            measured_label,
+            source: source_stats,
+            replay: replay_stats,
+            knobfit: None,
+            request_total,
+            verdict,
+        },
+        requests_replayed: subset.len(),
+        requests_completed,
+        max_send_lag_ms,
+        wall_time_s,
+    })
+}
 
 #[cfg(test)]
 mod tests {

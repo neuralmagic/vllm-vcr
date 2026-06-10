@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use inference_simulator_rs::calibrate;
 
-// ---------------------------------------------------------------------------
 // Test (a): gen-demo + model-level calibrate
 //
 // This single test IS the theorem made executable:
@@ -18,7 +17,6 @@ use inference_simulator_rs::calibrate;
 //   - Assert replay passes tolerance.
 //   - Assert the source trace has a heavy tail (p99/p50 >= 3.0).
 //   - Assert the knob-fit tail is capped (<= 1.75).
-// ---------------------------------------------------------------------------
 
 #[test]
 fn calibrate_model_level_proves_both_claims() {
@@ -66,13 +64,11 @@ fn calibrate_model_level_proves_both_claims() {
     eprintln!("\n{text}");
 }
 
-// ---------------------------------------------------------------------------
 // Test (b): calibrate-e2e smoke test
 //
 // Generates a small, fast-magnitude trace, spins the real simulator in-process,
 // sends requests through it, and checks that measured TTFT p50s are within 40%
 // of the source. Wrapped in a 120s timeout because CI can be slow.
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn calibrate_e2e_smoke() {
@@ -199,4 +195,108 @@ async fn calibrate_e2e_smoke() {
     .await;
 
     result.expect("calibrate_e2e_smoke timed out (120s)");
+}
+
+// Test (c): open-loop arrival replay (calibrate-e2e --replay-arrivals)
+//
+// A constant trace (80ms TTFT, 7x20ms gaps) with arrivals every 100ms: every
+// value the replay model can draw IS the source value, so the comparison
+// isolates the harness's own transport and scheduling overhead. Also pins the
+// open-loop property: wall time must cover the arrival schedule's span.
+
+#[tokio::test]
+async fn replay_arrivals_constant_trace() {
+    use inference_simulator_rs::trace::{TraceMeta, TraceRecord};
+
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let n = 25usize;
+        let records: Vec<TraceRecord> = (0..n)
+            .map(|i| TraceRecord {
+                prompt_tokens: 128,
+                cached_tokens: 0,
+                output_tokens: 8,
+                ttft_ms: 80.0,
+                itl_ms: Some(vec![20.0; 7]),
+                itl_summary: None,
+                concurrency: 3,
+                arrival_ms: Some(i as f64 * 100.0),
+                itl_ctx: None,
+            })
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "inf-sim-replay-const-{}.jsonl",
+            std::process::id()
+        ));
+        calibrate::write_demo_trace(&path, &TraceMeta::default(), &records)
+            .expect("writing trace");
+
+        let cfg = calibrate::ReplayArrivalsConfig {
+            trace_path: &path,
+            latency_trace: None,
+            max_requests: None,
+            tolerance: 0.25,
+            use_knob_fit: false,
+            ipc_tag: "test-const".to_string(),
+        };
+        let outcome = calibrate::replay_arrivals(&cfg).await.expect("replay should run");
+
+        assert_eq!(outcome.requests_replayed, n);
+        assert_eq!(outcome.requests_completed, n, "all requests should complete");
+
+        let mut buf = Vec::new();
+        calibrate::write_report(&mut buf, &outcome.report).unwrap();
+        eprintln!("\n{}", String::from_utf8(buf).unwrap());
+
+        let rt = outcome
+            .report
+            .request_total
+            .as_ref()
+            .expect("request totals should be measured");
+        assert!(
+            outcome.report.verdict.replay_pass,
+            "constant trace should replay within 25%: ttft err {:.3}, itl err {:.3}, totals err {:.3}",
+            outcome.report.verdict.replay_ttft_max_error,
+            outcome.report.verdict.replay_itl_max_error,
+            rt.max_error,
+        );
+
+        // Open loop in real time: 25 arrivals at 100ms spacing span 2.4s.
+        assert!(
+            outcome.wall_time_s >= 2.4,
+            "open-loop replay should honor the arrival schedule, took {:.2}s",
+            outcome.wall_time_s,
+        );
+    })
+    .await;
+
+    result.expect("replay_arrivals_constant_trace timed out (120s)");
+}
+
+// Test (d): replay refuses traces without an arrival schedule, before
+// spinning anything up.
+
+#[tokio::test]
+async fn replay_arrivals_requires_arrival_ms() {
+    let (meta, records) = calibrate::gen_demo_fast(10, 7);
+    let path = std::env::temp_dir().join(format!(
+        "inf-sim-replay-noarrivals-{}.jsonl",
+        std::process::id()
+    ));
+    calibrate::write_demo_trace(&path, &meta, &records).expect("writing trace");
+
+    let cfg = calibrate::ReplayArrivalsConfig {
+        trace_path: &path,
+        latency_trace: None,
+        max_requests: None,
+        tolerance: 0.25,
+        use_knob_fit: false,
+        ipc_tag: "test-noarrivals".to_string(),
+    };
+    let err = calibrate::replay_arrivals(&cfg)
+        .await
+        .expect_err("traces without arrival_ms must be rejected");
+    assert!(
+        format!("{err:#}").contains("arrival_ms"),
+        "error should name the missing field: {err:#}"
+    );
 }

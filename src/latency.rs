@@ -210,10 +210,6 @@ impl LatencyModel for FixedLatency {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TraceLatency: replay latency model driven by recorded traces
-// ---------------------------------------------------------------------------
-
 use crate::trace::{TraceMeta, TraceRecord};
 
 /// Prompt-token bucket edges (powers of two). A value `v` falls into bucket `i` where
@@ -257,6 +253,16 @@ pub fn concurrency_bucket(concurrency: u64) -> usize {
         }
     }
     NUM_CONCURRENCY_BUCKETS - 1
+}
+
+/// Human-readable label for a concurrency bucket index: "1", "2-4", "65+".
+pub fn concurrency_label(bucket: usize) -> String {
+    match CONCURRENCY_RANGES.get(bucket) {
+        Some(&(lo, hi)) if hi == u64::MAX => format!("{lo}+"),
+        Some(&(lo, hi)) if lo == hi => format!("{lo}"),
+        Some(&(lo, hi)) => format!("{lo}-{hi}"),
+        None => format!("bucket-{bucket}"),
+    }
 }
 
 /// A grid cell holding sorted TTFT samples and pooled ITL samples.
@@ -758,9 +764,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // TraceLatency tests
-    // -----------------------------------------------------------------------
 
     use crate::latency::TraceLatency;
     use crate::trace::{ItlSummary, TraceMeta, TraceRecord};

@@ -94,9 +94,10 @@ enum Command {
     CalibrateE2e {
         /// Path to the JSONL trace file.
         trace: PathBuf,
-        /// Number of requests to send through the simulator.
-        #[arg(long, default_value_t = 60)]
-        requests: usize,
+        /// Number of requests to send through the simulator
+        /// (default: 60 sampled; with --replay-arrivals, the whole schedule).
+        #[arg(long)]
+        requests: Option<usize>,
         /// RNG seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
@@ -106,6 +107,16 @@ enum Command {
         /// Maximum allowed relative error (looser default for transport jitter).
         #[arg(long, default_value_t = 0.25)]
         tolerance: f64,
+        /// Replay the trace's recorded arrival schedule open-loop (real time)
+        /// instead of sampling closed-loop batches. Requires records with
+        /// arrival_ms; runtime equals the schedule's span.
+        #[arg(long)]
+        replay_arrivals: bool,
+        /// With --replay-arrivals: build the sim's latency model from this
+        /// trace instead of the replayed one, validating against an arrival
+        /// process the model was not fitted on.
+        #[arg(long, requires = "replay_arrivals")]
+        latency_trace: Option<PathBuf>,
         /// Emit JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -205,6 +216,8 @@ fn run() -> Result<ExitCode> {
             seed,
             knob_fit,
             tolerance,
+            replay_arrivals,
+            latency_trace,
             json,
         } => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -212,9 +225,33 @@ fn run() -> Result<ExitCode> {
                 .build()
                 .context("building tokio runtime for calibrate-e2e")?;
 
-            let report = runtime.block_on(calibrate_e2e_impl(
-                &trace, requests, seed, knob_fit, tolerance,
-            ))?;
+            let report = if replay_arrivals {
+                let cfg = calibrate::ReplayArrivalsConfig {
+                    trace_path: &trace,
+                    latency_trace: latency_trace.as_deref(),
+                    max_requests: requests,
+                    tolerance,
+                    use_knob_fit: knob_fit,
+                    ipc_tag: seed.to_string(),
+                };
+                let outcome = runtime.block_on(calibrate::replay_arrivals(&cfg))?;
+                eprintln!(
+                    "replay-arrivals: {}/{} requests completed in {:.1}s (max send lag {:.1}ms)",
+                    outcome.requests_completed,
+                    outcome.requests_replayed,
+                    outcome.wall_time_s,
+                    outcome.max_send_lag_ms,
+                );
+                outcome.report
+            } else {
+                runtime.block_on(calibrate_e2e_impl(
+                    &trace,
+                    requests.unwrap_or(60),
+                    seed,
+                    knob_fit,
+                    tolerance,
+                ))?
+            };
 
             if json {
                 let stdout = io::stdout();
@@ -255,9 +292,7 @@ async fn calibrate_e2e_impl(
 
     use clap::Parser as _;
     use futures::StreamExt;
-    use inference_simulator_rs::latency::{
-        CONCURRENCY_RANGES, NUM_CONCURRENCY_BUCKETS, concurrency_bucket,
-    };
+    use inference_simulator_rs::latency::{NUM_CONCURRENCY_BUCKETS, concurrency_bucket};
     use inference_simulator_rs::trace::{TraceRecord, read_trace};
     use inference_simulator_rs::{Opt, run};
     use rand::Rng;
@@ -426,36 +461,8 @@ async fn calibrate_e2e_impl(
     token.cancel();
 
     // Build measured quantiles
-    let mut measured_buckets = Vec::new();
-    let mut pooled_ttft = Vec::new();
-    let mut pooled_itl = Vec::new();
-
-    for (i, (ttfts, itls)) in measured_ttfts
-        .iter_mut()
-        .zip(measured_itls.iter_mut())
-        .enumerate()
-    {
-        if ttfts.is_empty() {
-            continue;
-        }
-        pooled_ttft.extend(ttfts.iter().copied());
-        pooled_itl.extend(itls.iter().copied());
-
-        let (lo, hi) = CONCURRENCY_RANGES[i];
-        let label = if hi == u64::MAX {
-            format!("{lo}+")
-        } else if lo == hi {
-            format!("{lo}")
-        } else {
-            format!("{lo}-{hi}")
-        };
-        ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        itls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        measured_buckets.push((label, ttfts.clone(), itls.clone()));
-    }
-
-    pooled_ttft.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    pooled_itl.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let (measured_buckets, pooled_ttft, pooled_itl) =
+        calibrate::buckets_from_measured(measured_ttfts, measured_itls);
 
     let replay_stats =
         calibrate::quantiles_from_buckets(&measured_buckets, &pooled_ttft, &pooled_itl);
