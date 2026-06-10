@@ -1271,9 +1271,17 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         "inference-sim".to_string(),
         "--handshake-address".to_string(),
         addr.clone(),
-        "--max-num-seqs".to_string(),
-        max_num_seqs.to_string(),
     ];
+    // The trace meta's max_num_seqs (default 64) is only a fallback; an
+    // explicit --sim-arg override wins, and duplicating the flag would make
+    // clap reject the args.
+    if !cfg
+        .extra_sim_args
+        .iter()
+        .any(|a| a.contains("--max-num-seqs"))
+    {
+        args.extend(["--max-num-seqs".to_string(), max_num_seqs.to_string()]);
+    }
     if cfg.use_knob_fit {
         let lat_file = std::fs::File::open(latency_path)
             .with_context(|| format!("opening latency trace: {}", latency_path.display()))?;

@@ -9,7 +9,7 @@
 #   just calibrate /tmp/trace-capture-h200/tap-trace.jsonl
 #   just plots /tmp/trace-capture-h200/tap-trace.jsonl docs/images
 
-image := "quay.io/wseaton/mock-engine-nixl:trace-capture-v2"
+image := "quay.io/wseaton/mock-engine-nixl:trace-capture-v3"
 namespace := "weaton-dev"
 deploy := "trace-capture-h200"
 
@@ -89,3 +89,10 @@ compare +labeled_traces:
 replay trace latency_trace tolerance="0.10":
     cargo run --release --bin inference-sim-trace -- calibrate-e2e {{trace}} \
         --replay-arrivals --latency-trace {{latency_trace}} --tolerance {{tolerance}}
+
+# Apply the rig with the engine's prefix cache DISABLED (counterfactual capture).
+capture-up-nocache:
+    kubectl apply -f deploy/trace-capture/h200-capture.yaml
+    kubectl -n {{namespace}} patch deploy {{deploy}} --type=json \
+        -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--no-enable-prefix-caching"}]'
+    kubectl -n {{namespace}} scale deploy {{deploy}} --replicas=1
