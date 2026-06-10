@@ -285,16 +285,18 @@ pub fn summarize_trace(reader: impl BufRead) -> Result<(TraceMeta, Vec<BucketSta
         let mut ttfts: Vec<f64> = recs.iter().map(|r| r.ttft_ms).collect();
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Collect mean ITL values: from itl_ms (compute mean) or from itl_summary.
+        // Pool per-token ITL samples, matching calibrate::pool_samples: full arrays
+        // contribute every token's gap; summary-only records (e.g. guidellm, which has
+        // no per-token timings) contribute their mean once per token so weighting is
+        // consistent. Percentiles below are therefore per-token, not per-request.
         let mut itls: Vec<f64> = Vec::new();
         for r in recs {
             if let Some(ref arr) = r.itl_ms {
-                if !arr.is_empty() {
-                    let mean = arr.iter().sum::<f64>() / arr.len() as f64;
-                    itls.push(mean);
-                }
+                itls.extend(arr.iter().copied());
             } else if let Some(ref s) = r.itl_summary {
-                itls.push(s.mean_ms);
+                for _ in 0..s.count {
+                    itls.push(s.mean_ms);
+                }
             }
         }
         itls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));

@@ -537,6 +537,79 @@ fn sample_model_to_buckets(
     (result, pooled_ttft, pooled_itl)
 }
 
+/// A KnobLatency that adds nothing: the TraceLatency fallback for traces with no
+/// P/D transfer data, and the base for replay-only comparisons.
+fn zero_knob() -> KnobLatency {
+    KnobLatency {
+        time_to_first_token: 0,
+        time_to_first_token_std_dev: 0,
+        inter_token_latency: 0,
+        inter_token_latency_std_dev: 0,
+        prefill_overhead: 0,
+        prefill_time_per_token: 0,
+        prefill_time_std_dev: 0,
+        kv_cache_transfer_latency: 0,
+        kv_cache_transfer_latency_std_dev: 0,
+        kv_cache_transfer_time_per_token: 0,
+        kv_cache_transfer_time_std_dev: 0,
+        time_factor_under_load: 1.0,
+        max_num_seqs: 128,
+    }
+}
+
+/// Pooled TTFT/ITL sample arrays for one model, sorted ascending.
+#[derive(Debug, Serialize)]
+pub struct ModelSamples {
+    pub ttft_ms: Vec<f64>,
+    pub itl_ms: Vec<f64>,
+}
+
+/// Raw pooled samples behind a calibration run, for external plotting: the source
+/// trace observations plus replay and knob-fit draws using the same seeds and
+/// per-record contexts as `calibrate`.
+#[derive(Debug, Serialize)]
+pub struct SampleDump {
+    pub source: ModelSamples,
+    pub replay: ModelSamples,
+    pub knobfit: ModelSamples,
+}
+
+/// Produce the pooled sample arrays that `calibrate` reduces to quantiles.
+pub fn dump_samples(records: &[TraceRecord], num_samples: usize, seed: u64) -> Result<SampleDump> {
+    if records.is_empty() {
+        bail!("no records in trace");
+    }
+    let samples_per_record = (num_samples / records.len()).max(10);
+
+    let (mut source_ttft, mut source_itl) = pool_samples(records);
+    source_ttft.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    source_itl.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let trace_model = TraceLatency::from_records(TraceMeta::default(), records, zero_knob())
+        .context("building TraceLatency for replay")?;
+    let (_, replay_ttft, replay_itl) =
+        sample_model_to_buckets(&trace_model, records, samples_per_record, seed);
+
+    let knob_model = fit_knob_from_trace(records);
+    let (_, knob_ttft, knob_itl) =
+        sample_model_to_buckets(&knob_model, records, samples_per_record, seed + 1);
+
+    Ok(SampleDump {
+        source: ModelSamples {
+            ttft_ms: source_ttft,
+            itl_ms: source_itl,
+        },
+        replay: ModelSamples {
+            ttft_ms: replay_ttft,
+            itl_ms: replay_itl,
+        },
+        knobfit: ModelSamples {
+            ttft_ms: knob_ttft,
+            itl_ms: knob_itl,
+        },
+    })
+}
+
 /// Run the model-level calibration. Returns the full report.
 pub fn calibrate(
     records: &[TraceRecord],
@@ -556,22 +629,7 @@ pub fn calibrate(
     let source = quantiles_from_buckets(&source_buckets, &source_pooled_ttft, &source_pooled_itl);
 
     // REPLAY: build TraceLatency with a zero KnobLatency fallback
-    let zero_knob = KnobLatency {
-        time_to_first_token: 0,
-        time_to_first_token_std_dev: 0,
-        inter_token_latency: 0,
-        inter_token_latency_std_dev: 0,
-        prefill_overhead: 0,
-        prefill_time_per_token: 0,
-        prefill_time_std_dev: 0,
-        kv_cache_transfer_latency: 0,
-        kv_cache_transfer_latency_std_dev: 0,
-        kv_cache_transfer_time_per_token: 0,
-        kv_cache_transfer_time_std_dev: 0,
-        time_factor_under_load: 1.0,
-        max_num_seqs: 128,
-    };
-    let trace_model = TraceLatency::from_records(TraceMeta::default(), records, zero_knob)
+    let trace_model = TraceLatency::from_records(TraceMeta::default(), records, zero_knob())
         .context("building TraceLatency for replay")?;
 
     let (replay_buckets, replay_pooled_ttft, replay_pooled_itl) =
@@ -992,24 +1050,8 @@ mod tests {
 
         // Build TraceLatency from original records, but compare against shifted source.
         // The replay (from original records) should NOT match shifted source quantiles.
-        let zero_knob = KnobLatency {
-            time_to_first_token: 0,
-            time_to_first_token_std_dev: 0,
-            inter_token_latency: 0,
-            inter_token_latency_std_dev: 0,
-            prefill_overhead: 0,
-            prefill_time_per_token: 0,
-            prefill_time_std_dev: 0,
-            kv_cache_transfer_latency: 0,
-            kv_cache_transfer_latency_std_dev: 0,
-            kv_cache_transfer_time_per_token: 0,
-            kv_cache_transfer_time_std_dev: 0,
-            time_factor_under_load: 1.0,
-            max_num_seqs: 128,
-        };
-
         let replay_model =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob).unwrap();
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
 
         // Sample from the replay model using the shifted records' contexts
         let samples_per_record = 200;

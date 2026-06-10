@@ -207,3 +207,31 @@ Knob-fit tail capped at ~1.7x by construction (source TTFT ratio 11.507 > 1.75, 
 Use `--fast` on `gen-demo` to produce a small-magnitude trace suitable for
 quick e2e testing (TTFT ~15-40ms, ITL ~3-10ms). All subcommands accept `--json`
 for machine-readable output and `--seed` for determinism.
+
+### Calibration against a real engine
+
+Both figures below come from one capture: the recording tap (`inference-sim-tap`)
+sitting between the vLLM Rust frontend and a real headless vLLM engine
+(Qwen3-8B, TP=1, H200), recording per-token inter-token gaps server-side over
+in-pod localhost ZMQ. 1230 requests at concurrency 1 and 16, 118k token gaps.
+
+Source vs `TraceLatency` replay vs best-fit `KnobLatency`, as survival curves
+and Q-Q plots. Replay max relative error on this trace: TTFT 0.47%, ITL 0.21%.
+The knob model's `[0.3*mean, 1.7*mean]` clamp is visible as a vertical cutoff
+in both survival plots.
+
+![Source vs replay vs knob-fit](docs/images/replay-fidelity.png)
+
+The same trace viewed two ways: pooled per-token ITLs against per-request mean
+ITLs (what client-side benchmark reports expose, e.g. guidellm, which records
+only first/last token timestamps). On this run, 2.1% of all tokens are slower
+than the largest per-request mean observed.
+
+![Per-token vs per-request-mean ITL](docs/images/mean-vs-pertoken.png)
+
+To regenerate from any trace with per-token `itl_ms` arrays:
+
+```bash
+cargo run --bin inference-sim-trace -- calibrate trace.jsonl --dump-samples samples.json
+uv run scripts/plot_calibration.py --samples samples.json --trace trace.jsonl --out-dir docs/images
+```

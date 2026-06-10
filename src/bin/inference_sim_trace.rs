@@ -80,6 +80,10 @@ enum Command {
         /// Emit JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
+        /// Also write the pooled source/replay/knob-fit sample arrays to this path
+        /// as JSON, for external plotting.
+        #[arg(long)]
+        dump_samples: Option<PathBuf>,
     },
     /// Wire-level calibration: spin the real simulator in-process and measure
     /// client-side TTFT/ITL against source trace quantiles.
@@ -162,8 +166,22 @@ fn run() -> Result<ExitCode> {
             seed,
             tolerance,
             json,
+            dump_samples,
         } => {
             let report = calibrate::calibrate_from_file(&trace, samples, seed, tolerance)?;
+
+            if let Some(dump_path) = dump_samples {
+                let file = fs::File::open(&trace)
+                    .with_context(|| format!("opening {}", trace.display()))?;
+                let (_meta, records) =
+                    inference_simulator_rs::trace::read_trace(BufReader::new(file))?;
+                let dump = calibrate::dump_samples(&records, samples, seed)?;
+                let out = fs::File::create(&dump_path)
+                    .with_context(|| format!("creating {}", dump_path.display()))?;
+                serde_json::to_writer(BufWriter::new(out), &dump)
+                    .context("serializing sample dump")?;
+                eprintln!("wrote sample dump to {}", dump_path.display());
+            }
 
             if json {
                 let stdout = io::stdout();

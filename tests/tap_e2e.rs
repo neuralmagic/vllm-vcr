@@ -52,6 +52,10 @@ fn make_request(id: &str, prompt_len: usize, max_tokens: u32) -> EngineCoreReque
 
 /// Spin up the simulator as the "real engine" that the tap will connect to.
 /// Returns a guard that cancels on drop.
+///
+/// The max-model-len/kv-cache-size values are distinct from the mock-engine
+/// defaults so the test can prove the tap relays the engine's real ready
+/// response downstream instead of fabricating one.
 async fn start_sim(handshake_address: &str) -> CancellationToken {
     let args = vec![
         "inference-sim",
@@ -59,6 +63,10 @@ async fn start_sim(handshake_address: &str) -> CancellationToken {
         handshake_address,
         "--inter-token-latency",
         "30",
+        "--max-model-len",
+        "16384",
+        "--kv-cache-size",
+        "2048",
     ];
     let opt = Opt::parse_from(&args);
     let token = CancellationToken::new();
@@ -130,6 +138,19 @@ async fn tap_records_trace() {
         .await
         .expect("client connect timed out")
         .expect("client connect failed");
+
+    // The tap must relay the engine's real registration ready response, not
+    // the mock-engine defaults (1Mi max_model_len / default block count).
+    assert_eq!(
+        client.max_model_len(),
+        16384,
+        "frontend should see the engine's real max_model_len through the tap"
+    );
+    assert_eq!(
+        client.total_num_gpu_blocks(),
+        2048,
+        "frontend should see the engine's real num_gpu_blocks through the tap"
+    );
 
     // Step 4: Send requests through the chain.
 

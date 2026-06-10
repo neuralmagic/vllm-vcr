@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::mock_engine::{
-    MockEngineConfig, MockEngineSockets, connect_to_frontend,
+    MockEngineConfig, MockEngineSockets, connect_to_frontend, default_ready_response,
 };
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
@@ -373,10 +373,22 @@ impl Opt {
 
 /// Run one mock engine until shutdown or transport failure.
 async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) -> Result<()> {
+    // Advertise the sim's actual configured limits in the registration ready
+    // response so the frontend validates against what this engine enforces.
+    let mut ready_response = default_ready_response();
+    ready_response.num_gpu_blocks = opt.kv_cache_size;
+    if opt.max_model_len > 0 {
+        ready_response.max_model_len = opt.max_model_len;
+    }
+    let config = MockEngineConfig {
+        ready_response,
+        ..MockEngineConfig::default()
+    };
+
     let MockEngineSockets { data_sockets, .. } = connect_to_frontend(
         &opt.handshake_address,
         EngineId::from_engine_index(engine_index),
-        MockEngineConfig::default(),
+        config,
     )
     .await
     .with_context(|| format!("engine {engine_index} failed to connect to frontend"))?;

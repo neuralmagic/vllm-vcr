@@ -8,13 +8,19 @@
 ARG FEDORA_VERSION=42
 # Keep NIXL_REF in lockstep with Cargo.toml's git dep so the data-plane ABI matches.
 ARG NIXL_REF=41685d39
-# The vllm-rs frontend source. Defaults to Will's fork at the lora-info-gauge commit, which is
-# vLLM's ba94a3b plus the `vllm:lora_requests_info` exporter the upstream Rust frontend still
-# lacks (see the divergence note). Our engine-core-client Cargo dep stays pinned at ba94a3b;
-# the fork's wire protocol is compatible with it (verified by scripts/e2e_lora.sh). Once the
-# gauge lands upstream, point these back at vllm-project/vllm @ ba94a3b.
-ARG VLLM_REPO=https://github.com/wseaton/vllm.git
-ARG VLLM_REF=e96171e4ecf911126295cee87173e7777b721484
+# The vllm-rs frontend source. Defaults to upstream vLLM at ba94a3b, the exact commit our
+# engine-core-client Cargo dep is pinned to, so the frontend, the tap, and a real engine
+# built from the same commit are all wire-identical (the msgspec data-path structs are
+# positional; do not mix revs).
+#
+# The `vllm:lora_requests_info` gauge only exists on Will's fork (lora-info-gauge branch,
+# still unmerged upstream). The previously pinned fork rev (e96171e) went dangling when
+# that branch was rebased past ba94a3b, including a utility-call protocol refactor, so it
+# is no longer a safe default. For LoRA-metric builds, pass:
+#   --build-arg VLLM_REPO=https://github.com/wseaton/vllm.git --build-arg VLLM_REF=<rev>
+# and verify protocol compat with scripts/e2e_lora.sh first.
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+ARG VLLM_REF=ba94a3b9989666f950e1f784d18f2033c63c6cad
 
 # ---------------------------------------------------------------------------------------
 FROM fedora:${FEDORA_VERSION} AS builder
@@ -77,11 +83,12 @@ RUN git clone ${VLLM_REPO} /src/vllm \
     && cd rust && cargo build --release --bin vllm-rs \
     && cp target/release/vllm-rs /usr/local/bin/vllm-rs
 
-# 3. Build our mock engine against the real libnixl.
+# 3. Build our mock engine against the real libnixl, plus the engine-core recording tap.
 COPY . /src/inference-simulator-rs
 RUN cd /src/inference-simulator-rs \
     && cargo build --release --features nixl \
-    && cp target/release/inference-sim /usr/local/bin/inference-sim
+    && cp target/release/inference-sim /usr/local/bin/inference-sim \
+    && cp target/release/inference-sim-tap /usr/local/bin/inference-sim-tap
 
 # ---------------------------------------------------------------------------------------
 FROM fedora:${FEDORA_VERSION} AS runtime
@@ -91,12 +98,13 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         libstdc++ rdma-core numactl-libs ca-certificates bash \
     && dnf clean all
 
-# Source-built UCX, libnixl + its UCX plugin, and the two binaries.
+# Source-built UCX, libnixl + its UCX plugin, and the three binaries.
 COPY --from=builder /usr/local/ucx/ /usr/local/ucx/
 COPY --from=builder /usr/local/lib64/ /usr/local/lib64/
 COPY --from=builder /usr/local/lib/ /usr/local/lib/
 COPY --from=builder /usr/local/bin/vllm-rs /usr/local/bin/vllm-rs
 COPY --from=builder /usr/local/bin/inference-sim /usr/local/bin/inference-sim
+COPY --from=builder /usr/local/bin/inference-sim-tap /usr/local/bin/inference-sim-tap
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN echo /usr/local/ucx/lib > /etc/ld.so.conf.d/nixl.conf \
     && echo /usr/local/lib64 >> /etc/ld.so.conf.d/nixl.conf \

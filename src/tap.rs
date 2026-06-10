@@ -15,12 +15,8 @@
 //! ## Limitations (prototype)
 //!
 //! - Single engine, single client (client_index 0).
-//! - The tap cannot forward all fields from the real engine's ReadyMessage to
-//!   MockEngineConfig: `parallel_config_hash` is not surfaced by MockEngineConfig,
-//!   and the EngineCoreReadyResponse (max_model_len, num_gpu_blocks, dtype,
-//!   vllm_version) is received on the input registration, not the handshake, so
-//!   the tap uses the default mock values for the downstream connection. A real
-//!   deployment should use matching values.
+//! - `parallel_config_hash` from the real engine's ReadyMessage is not relayed
+//!   downstream (MockEngineConfig does not surface it); only relevant for DP > 1.
 //! - Abort handling: aborted requests are discarded with a debug log and do not
 //!   appear in the trace. This avoids polluting TTFT/ITL stats with incomplete
 //!   data.
@@ -42,7 +38,7 @@ use vllm_engine_core_client::mock_engine::{
     MockEngineConfig, MockEngineSockets, connect_to_frontend,
 };
 use vllm_engine_core_client::protocol::handshake::{
-    HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
+    EngineCoreReadyResponse, HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
 };
 use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreRequest, EngineCoreRequestType, decode_engine_core_outputs,
@@ -85,14 +81,21 @@ pub struct TapConfig {
     pub model: String,
 }
 
+/// Sockets and handshake payloads captured while connecting the real engine.
+struct UpstreamEngine {
+    input: RouterSocket,
+    output: PullSocket,
+    ready_message: ReadyMessage,
+    /// Post-initialization config from the engine's input-socket registration
+    /// (max_model_len, num_gpu_blocks, dtype, vllm_version). Relayed verbatim
+    /// to the downstream frontend so it validates against the real engine.
+    ready_response: EngineCoreReadyResponse,
+}
+
 /// Run the upstream handshake: bind the handshake socket, wait for the engine's
 /// HELLO, reply with INIT pointing to the tap-bound input/output sockets, wait
 /// for READY, then wait for the engine to register on the input socket.
-///
-/// Returns (input_router_send_half_as_RouterSocket, output_pull, ready_message).
-async fn upstream_handshake(
-    config: &TapConfig,
-) -> Result<(RouterSocket, PullSocket, ReadyMessage)> {
+async fn upstream_handshake(config: &TapConfig) -> Result<UpstreamEngine> {
     // Bind input (ROUTER) and output (PULL) sockets for the upstream engine.
     let mut input_socket = RouterSocket::new();
     input_socket
@@ -198,19 +201,31 @@ async fn upstream_handshake(
             reg_frames.len()
         ));
     }
-    debug!("engine registered on tap input socket");
+    // A decode failure here means the engine speaks an incompatible protocol
+    // version; fail loudly instead of recording a trace against a broken pair.
+    let ready_response: EngineCoreReadyResponse = decode_msgpack(&reg_frames[1])
+        .map_err(|e| anyhow!("decoding engine registration ready response: {e}"))?;
+    debug!(?ready_response, "engine registered on tap input socket");
 
-    Ok((input_socket, output_socket, ready_message))
+    Ok(UpstreamEngine {
+        input: input_socket,
+        output: output_socket,
+        ready_message,
+        ready_response,
+    })
 }
 
-/// Connect downstream to the real frontend as an engine.
+/// Connect downstream to the real frontend as an engine, presenting the real
+/// engine's handshake payloads.
 async fn downstream_connect(
     frontend_handshake: &str,
     ready_message: &ReadyMessage,
+    ready_response: EngineCoreReadyResponse,
 ) -> Result<MockEngineSockets> {
     let config = MockEngineConfig {
         local: ready_message.local.unwrap_or(false),
         headless: ready_message.headless.unwrap_or(true),
+        ready_response,
         ..MockEngineConfig::default()
     };
 
@@ -229,14 +244,18 @@ pub async fn run_tap<W: Write>(
     shutdown: CancellationToken,
 ) -> Result<()> {
     // Step 1: Bind upstream side and wait for the real engine's HELLO first.
-    let (mut upstream_input, mut upstream_output, ready_message) =
-        upstream_handshake(&config).await?;
+    let UpstreamEngine {
+        input: mut upstream_input,
+        output: mut upstream_output,
+        ready_message,
+        ready_response,
+    } = upstream_handshake(&config).await?;
 
     info!("upstream engine connected, connecting downstream to frontend");
 
     // Step 2: Connect downstream to the real frontend.
     let MockEngineSockets { data_sockets, .. } =
-        downstream_connect(&config.frontend_handshake, &ready_message).await?;
+        downstream_connect(&config.frontend_handshake, &ready_message, ready_response).await?;
 
     // Single client, single engine: take the first data socket pair.
     let (mut downstream_dealer, mut downstream_push) =
@@ -260,38 +279,45 @@ pub async fn run_tap<W: Write>(
 
             // Downstream -> Upstream: frames from the frontend to the engine.
             // The dealer receives [request_type, payload] frames.
+            //
+            // Stamp arrival, forward first, observe after: the timestamp is taken
+            // at the wire, but the observation decode stays out of the forwarding
+            // path. Frame clones are Bytes refcount bumps, not copies.
             result = downstream_dealer.recv() => {
                 let message = result.context("receiving from frontend")?;
+                let arrival = Instant::now();
                 let frames = message.into_vec();
-
-                // Decode a copy for observation.
-                observe_request(&frames, &mut requests);
 
                 // Forward verbatim to the upstream engine via the ROUTER socket.
                 // The ROUTER needs [identity, ...frames]. The engine registered
                 // with engine_index 0 identity.
                 let engine_id = EngineId::from_engine_index(0);
                 let mut router_frames = vec![engine_id.to_frame()];
-                router_frames.extend(frames);
+                router_frames.extend(frames.iter().cloned());
                 let fwd = ZmqMessage::try_from(router_frames)
                     .map_err(|e| anyhow!("building router forward message: {e}"))?;
                 upstream_input.send(fwd).await
                     .context("forwarding request to engine")?;
+
+                // Decode a copy for observation.
+                observe_request(&frames, &mut requests, arrival);
             }
 
             // Upstream -> Downstream: frames from the engine to the frontend.
             result = upstream_output.recv() => {
                 let message = result.context("receiving from engine")?;
+                let arrival = Instant::now();
                 let frames = message.into_vec();
-
-                // Decode a copy for observation.
-                observe_output(&frames, &mut requests, writer);
 
                 // Forward verbatim to the frontend via the PUSH socket.
                 let fwd = ZmqMessage::try_from(frames.clone())
                     .map_err(|e| anyhow!("building push forward message: {e}"))?;
                 downstream_push.send(fwd).await
                     .context("forwarding output to frontend")?;
+
+                // Decode a copy for observation; the trace write at request
+                // completion also lands here, after the frame is already out.
+                observe_output(&frames, &mut requests, writer, arrival);
             }
         }
     }
@@ -300,8 +326,13 @@ pub async fn run_tap<W: Write>(
     Ok(())
 }
 
-/// Observe (decode a copy of) an incoming request for recording.
-fn observe_request<F: AsRef<[u8]>>(frames: &[F], requests: &mut HashMap<String, RequestState>) {
+/// Observe (decode a copy of) an incoming request for recording. `arrival` is
+/// the instant the frames came off the wire, stamped before forwarding.
+fn observe_request<F: AsRef<[u8]>>(
+    frames: &[F],
+    requests: &mut HashMap<String, RequestState>,
+    arrival: Instant,
+) {
     if frames.len() != 2 {
         warn!(
             frame_count = frames.len(),
@@ -330,7 +361,7 @@ fn observe_request<F: AsRef<[u8]>>(frames: &[F], requests: &mut HashMap<String, 
                     requests.insert(
                         req.request_id.clone(),
                         RequestState {
-                            arrival: Instant::now(),
+                            arrival,
                             prompt_tokens,
                             last_output: None,
                             output_tokens: 0,
@@ -364,11 +395,13 @@ fn observe_request<F: AsRef<[u8]>>(frames: &[F], requests: &mut HashMap<String, 
 }
 
 /// Observe (decode a copy of) an engine output for recording. Finalized
-/// records are written to the trace writer.
+/// records are written to the trace writer. `arrival` is the instant the
+/// frames came off the wire, stamped before forwarding.
 fn observe_output<W: Write, F: AsRef<[u8]>>(
     frames: &[F],
     requests: &mut HashMap<String, RequestState>,
     writer: &mut W,
+    arrival: Instant,
 ) {
     let outputs = match decode_engine_core_outputs(frames) {
         Ok(outputs) => outputs,
@@ -377,8 +410,6 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
             return;
         }
     };
-
-    let now = Instant::now();
 
     for output in &outputs.outputs {
         let request_id = &output.request_id;
@@ -407,13 +438,13 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
 
         if state.ttft_ms.is_none() {
             // First token(s) for this request.
-            let ttft = now.duration_since(state.arrival);
+            let ttft = arrival.duration_since(state.arrival);
             state.ttft_ms = Some(ttft.as_secs_f64() * 1000.0);
             state.output_tokens += num_new_tokens;
-            state.last_output = Some(now);
+            state.last_output = Some(arrival);
         } else {
             // Subsequent tokens: compute ITL gap.
-            let gap = now.duration_since(state.last_output.unwrap_or(state.arrival));
+            let gap = arrival.duration_since(state.last_output.unwrap_or(state.arrival));
             let gap_ms = gap.as_secs_f64() * 1000.0;
 
             // For multi-token chunks, divide the gap evenly across the tokens.
@@ -425,7 +456,7 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
             }
 
             state.output_tokens += num_new_tokens;
-            state.last_output = Some(now);
+            state.last_output = Some(arrival);
         }
 
         // Check for finish.
@@ -470,7 +501,12 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
 }
 
 /// Write the trace metadata line.
-pub fn write_meta<W: Write>(writer: &mut W, model: &str) -> Result<()> {
+pub fn write_meta<W: Write>(
+    writer: &mut W,
+    model: &str,
+    gpu: Option<&str>,
+    tp: Option<u32>,
+) -> Result<()> {
     let meta = TraceMeta {
         source: Some("tap".to_string()),
         model: if model.is_empty() {
@@ -478,6 +514,8 @@ pub fn write_meta<W: Write>(writer: &mut W, model: &str) -> Result<()> {
         } else {
             Some(model.to_string())
         },
+        gpu: gpu.map(str::to_string),
+        tp,
         ..TraceMeta::default()
     };
     let wrapper = serde_json::json!({"meta": meta});

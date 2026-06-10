@@ -27,10 +27,7 @@
 //! ## Limitations (prototype)
 //!
 //! - Single engine, single client (client_index 0).
-//! - MockEngineConfig fields `parallel_config_hash` and the EngineCoreReadyResponse
-//!   values (max_model_len, num_gpu_blocks, dtype, vllm_version) are not passed
-//!   through from the real engine; the tap uses default mock values for its
-//!   downstream presentation. A production tap would need to relay these.
+//! - `parallel_config_hash` is not relayed downstream (only relevant for DP > 1).
 //! - No coordinator pass-through.
 //! - Multi-token output chunks: ITL is divided evenly across the tokens in the chunk.
 //! - Aborted requests are silently discarded (no trace record emitted).
@@ -75,6 +72,14 @@ struct TapOpt {
     /// Model name recorded in the trace metadata line.
     #[arg(long, default_value = "")]
     model: String,
+
+    /// GPU type recorded in the trace metadata line (e.g. "H200").
+    #[arg(long)]
+    gpu: Option<String>,
+
+    /// Tensor-parallel size recorded in the trace metadata line.
+    #[arg(long)]
+    tp: Option<u32>,
 }
 
 fn init_tracing() {
@@ -130,7 +135,7 @@ async fn run_main(opt: TapOpt) -> Result<()> {
         .with_context(|| format!("creating trace file: {}", opt.trace_out))?;
     let mut writer = BufWriter::new(file);
 
-    write_meta(&mut writer, &opt.model)?;
+    write_meta(&mut writer, &opt.model, opt.gpu.as_deref(), opt.tp)?;
 
     let config = TapConfig {
         frontend_handshake: opt.frontend_handshake,
