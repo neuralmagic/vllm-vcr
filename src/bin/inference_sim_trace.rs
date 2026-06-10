@@ -122,6 +122,17 @@ enum Command {
         /// scripts/plot_calibration.py --compare).
         #[arg(long, requires = "replay_arrivals")]
         dump_trace: Option<PathBuf>,
+        /// With --replay-arrivals: pace each multiturn session closed-loop
+        /// (turn N+1 fires when turn N completes plus the recorded think gap)
+        /// instead of at recorded wall-clock offsets. Sessions are inferred
+        /// from block-hash chains.
+        #[arg(long, requires = "replay_arrivals")]
+        replay_sessions: bool,
+        /// With --replay-arrivals: cache-off what-if. Replay every prompt as
+        /// unique tokens even when the trace carries block_hashes; the TTFT
+        /// delta vs a normal replay is the prefix cache's contribution.
+        #[arg(long, requires = "replay_arrivals")]
+        cold_prompts: bool,
         /// With --replay-arrivals: extra flag tokens for the in-process sim,
         /// repeated per token (e.g. --sim-arg=--kv-cache-size --sim-arg=8192).
         /// Must mirror the capture engine's scheduler/cache config.
@@ -233,6 +244,8 @@ fn run() -> Result<ExitCode> {
             replay_arrivals,
             latency_trace,
             dump_trace,
+            replay_sessions,
+            cold_prompts,
             sim_args,
             json,
         } => {
@@ -250,6 +263,8 @@ fn run() -> Result<ExitCode> {
                     use_knob_fit: knob_fit,
                     ipc_tag: seed.to_string(),
                     extra_sim_args: sim_args,
+                    session_replay: replay_sessions,
+                    cold_prompts,
                 };
                 let outcome = runtime.block_on(calibrate::replay_arrivals(&cfg))?;
                 eprintln!(

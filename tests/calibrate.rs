@@ -239,6 +239,8 @@ async fn replay_arrivals_constant_trace() {
             use_knob_fit: false,
             ipc_tag: "test-const".to_string(),
             extra_sim_args: Vec::new(),
+            session_replay: false,
+            cold_prompts: false,
         };
         let outcome = calibrate::replay_arrivals(&cfg).await.expect("replay should run");
 
@@ -294,6 +296,8 @@ async fn replay_arrivals_requires_arrival_ms() {
         use_knob_fit: false,
         ipc_tag: "test-noarrivals".to_string(),
         extra_sim_args: Vec::new(),
+        session_replay: false,
+        cold_prompts: false,
     };
     let err = calibrate::replay_arrivals(&cfg)
         .await

@@ -189,6 +189,83 @@ def comparison_figure(traces: list[tuple[str, Path]], out: Path) -> None:
     print(f"wrote {out}")
 
 
+def load_records(path: Path) -> list[dict]:
+    """All non-meta records of a trace JSONL, as dicts."""
+    records = []
+    with open(path) as f:
+        for line in f:
+            r = json.loads(line)
+            if "meta" in r:
+                continue
+            records.append(r)
+    return records
+
+
+def turn_depths(records: list[dict]) -> list[int]:
+    """Session-turn depth per record (1 = session root), inferred from chained
+    block_hashes the same way the replay harness infers sessions: a record's
+    parent is the most recent earlier record whose full hash chain is a proper
+    prefix of its own chain."""
+    by_last_hash: dict[int, int] = {}
+    depths: list[int] = []
+    for i, r in enumerate(records):
+        chain = r.get("block_hashes") or []
+        depth = 1
+        for k in range(len(chain) - 1, 0, -1):
+            p = by_last_hash.get(chain[k - 1])
+            if p is not None and len(records[p].get("block_hashes") or []) == k:
+                depth = depths[p] + 1
+                break
+        if chain:
+            by_last_hash[chain[-1]] = i
+        depths.append(depth)
+    return depths
+
+
+def cache_effect_figure(traces: list[tuple[str, Path]], out: Path) -> None:
+    """Prove the prefix-cache effect is reproduced shape-wise, not just in the
+    pooled marginal: cohort requests by session-turn depth (turn 1 hits only
+    the shared prefix; deeper turns hit their session's growing context) and
+    overlay real vs replay TTFT survival per cohort. Compensating errors
+    between cohorts would show here and not in the pooled curve. An optional
+    nocache=... trace adds the cache-off what-if for magnitude."""
+    by_label = dict(traces)
+    src = load_records(by_label["real"])
+    src.sort(key=lambda r: r["arrival_ms"])
+    depths = turn_depths(src)
+
+    def by_arrival(label: str) -> dict[float, dict]:
+        return {round(r["arrival_ms"], 3): r for r in load_records(by_label[label])}
+
+    rep = by_arrival("replay")
+    cold = by_arrival("nocache") if "nocache" in by_label else {}
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    cohorts = [
+        ("turn 1 (shared-prefix hit)", lambda d: d == 1, axes[0]),
+        ("turns 2+ (growing-context hit)", lambda d: d >= 2, axes[1]),
+    ]
+    for title, pred, ax in cohorts:
+        keys = [round(r["arrival_ms"], 3) for r, d in zip(src, depths) if pred(d)]
+        real = np.array([r["ttft_ms"] for r, d in zip(src, depths) if pred(d)])
+        replay = np.array([rep[k]["ttft_ms"] for k in keys if k in rep])
+        survival(ax, real, "real", C_SRC, 2.6)
+        survival(ax, replay, "replay", C_REP, 1.8)
+        if cold:
+            nocache = np.array([cold[k]["ttft_ms"] for k in keys if k in cold])
+            survival(ax, nocache, "no prefix cache (what-if)", C_KNB, 1.8, ls="--")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("TTFT (ms)")
+        ax.set_ylabel("P(TTFT > x)")
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    print(f"wrote {out}")
+
+
 def parse_labeled_trace(spec: str) -> tuple[str, Path]:
     label, _, path = spec.partition("=")
     if not path:
@@ -208,6 +285,15 @@ def main() -> None:
         help="repeatable; plot survival curves of several traces on shared axes "
         "(first entry is drawn as the reference)",
     )
+    p.add_argument(
+        "--cache-effect",
+        type=parse_labeled_trace,
+        action="append",
+        metavar="LABEL=PATH",
+        help="repeatable; per-turn-cohort TTFT survival from real=trace.jsonl, "
+        "replay=measured.jsonl, and optional nocache=measured.jsonl (traces "
+        "are joined on arrival_ms; real needs block_hashes)",
+    )
     p.add_argument("--out-dir", type=Path, default=Path("."))
     args = p.parse_args()
 
@@ -218,8 +304,13 @@ def main() -> None:
         mean_vs_pertoken_figure(dump, args.trace, args.out_dir / "mean-vs-pertoken.png")
     if args.compare:
         comparison_figure(args.compare, args.out_dir / "sim-comparison.png")
-    if not (args.samples and args.trace) and not args.compare:
-        p.error("nothing to do: pass --samples/--trace and/or --compare")
+    if args.cache_effect:
+        labels = {label for label, _ in args.cache_effect}
+        if not {"real", "replay"} <= labels:
+            p.error("--cache-effect needs at least real=... and replay=...")
+        cache_effect_figure(args.cache_effect, args.out_dir / "cache-effect.png")
+    if not (args.samples and args.trace) and not args.compare and not args.cache_effect:
+        p.error("nothing to do: pass --samples/--trace, --compare, and/or --cache-effect")
 
 
 if __name__ == "__main__":

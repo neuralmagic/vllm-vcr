@@ -1068,6 +1068,114 @@ pub struct ReplayArrivalsConfig<'a> {
     /// replay sim must match the capture engine's scheduler/cache config for
     /// the reactive comparison to be apples-to-apples.
     pub extra_sim_args: Vec<String>,
+    /// Replay multiturn sessions closed-loop: a turn fires when its parent
+    /// turn completes plus the recorded think gap, instead of at its recorded
+    /// wall-clock offset. Session roots still fire open-loop. This mirrors how
+    /// agentic workloads actually pace turns; pure open-loop replay of a
+    /// closed-loop-generated schedule amplifies any transient divergence
+    /// (arrivals do not back off when the replay runs momentarily slower).
+    /// Sessions are inferred from block-hash chains; requires a trace with
+    /// `block_hashes`.
+    pub session_replay: bool,
+    /// Cache-off what-if: replay every prompt as unique tokens even when the
+    /// trace carries block_hashes (the chains still drive session inference).
+    /// The TTFT delta vs a normal replay is the prefix cache's contribution.
+    pub cold_prompts: bool,
+}
+
+/// For each record (arrival-ordered), the index of its session parent: the
+/// most recent earlier record whose full hash chain is a proper prefix of this
+/// record's chain (a multiturn child's prompt extends its parent's context).
+/// Records without hashes or without such a predecessor are session roots.
+fn infer_session_parents(records: &[TraceRecord]) -> Vec<Option<usize>> {
+    use std::collections::HashMap;
+    let mut by_last_hash: HashMap<u64, usize> = HashMap::new();
+    let mut parents = Vec::with_capacity(records.len());
+    for (i, r) in records.iter().enumerate() {
+        let mut parent = None;
+        if let Some(chain) = r.block_hashes.as_deref() {
+            for k in (1..chain.len()).rev() {
+                if let Some(&p) = by_last_hash.get(&chain[k - 1])
+                    && records[p].block_hashes.as_deref().map(<[u64]>::len) == Some(k)
+                {
+                    parent = Some(p);
+                    break;
+                }
+            }
+            if let Some(&last) = chain.last() {
+                by_last_hash.insert(last, i);
+            }
+        }
+        parents.push(parent);
+    }
+    parents
+}
+
+/// When a request finished, in source-trace time (arrival + TTFT + decode).
+fn source_completion_ms(r: &TraceRecord) -> f64 {
+    r.arrival_ms.unwrap_or(0.0)
+        + r.ttft_ms
+        + r.itl_ms
+            .as_ref()
+            .map(|g| g.iter().sum::<f64>())
+            .or_else(|| r.itl_summary.as_ref().map(|s| s.mean_ms * s.count as f64))
+            .unwrap_or(0.0)
+}
+
+/// Send one replayed request and collect client-side timing. Returns
+/// (ttft_ms, gaps_ms); a None ttft means the request failed or timed out.
+async fn measure_one(
+    client: &vllm_engine_core_client::EngineCoreClient,
+    request: vllm_engine_core_client::protocol::EngineCoreRequest,
+    timeout_dur: std::time::Duration,
+) -> (Option<f64>, Vec<f64>) {
+    use std::time::Instant;
+
+    use futures::StreamExt as _;
+
+    let rid = request.request_id.clone();
+    let call_start = Instant::now();
+    let mut stream = match client.call(request).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("{rid}: call failed: {e:#}");
+            return (None, Vec::new());
+        }
+    };
+    let mut token_times: Vec<Instant> = Vec::new();
+    let result = tokio::time::timeout(timeout_dur, async {
+        while let Some(item) = stream.next().await {
+            let output = item.context("stream item error")?;
+            let now = Instant::now();
+            if !output.new_token_ids.is_empty() {
+                token_times.push(now);
+            }
+            if output.finish_reason.is_some() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("{rid}: stream error: {e:#}");
+            return (None, Vec::new());
+        }
+        Err(_) => {
+            tracing::warn!("{rid}: timed out after {timeout_dur:?}");
+            return (None, Vec::new());
+        }
+    }
+    let ttft = token_times
+        .first()
+        .map(|f| (*f - call_start).as_secs_f64() * 1000.0);
+    let gaps = token_times
+        .windows(2)
+        .map(|w| (w[1] - w[0]).as_secs_f64() * 1000.0)
+        .collect();
+    (ttft, gaps)
 }
 
 /// Outcome of an open-loop arrival replay: the calibration report plus
@@ -1109,7 +1217,6 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     use std::time::{Duration, Instant};
 
     use clap::Parser as _;
-    use futures::StreamExt as _;
     use tokio_util::sync::CancellationToken;
     use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
@@ -1208,6 +1315,38 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     let wall_start = Instant::now();
     let base = tokio::time::Instant::now();
 
+    // Session mode: a child turn fires when its parent completes plus the
+    // recorded think gap; roots (and every request, in pure arrival mode)
+    // fire at recorded offsets.
+    let parents = if cfg.session_replay {
+        infer_session_parents(&subset)
+    } else {
+        vec![None; subset.len()]
+    };
+    let mut child_txs: Vec<Vec<tokio::sync::oneshot::Sender<()>>> =
+        (0..subset.len()).map(|_| Vec::new()).collect();
+    let mut triggers: Vec<Option<(tokio::sync::oneshot::Receiver<()>, f64)>> =
+        (0..subset.len()).map(|_| None).collect();
+    if cfg.session_replay {
+        let mut roots = 0usize;
+        for (i, parent) in parents.iter().enumerate() {
+            let Some(p) = *parent else {
+                roots += 1;
+                continue;
+            };
+            let think_ms =
+                (subset[i].arrival_ms.unwrap_or(0.0) - source_completion_ms(&subset[p])).max(0.0);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            child_txs[p].push(tx);
+            triggers[i] = Some((rx, think_ms));
+        }
+        tracing::info!(
+            "session replay: {} session roots, {} chained turns",
+            roots,
+            subset.len() - roots
+        );
+    }
+
     let mut handles = Vec::with_capacity(subset.len());
     for (i, rec) in subset.iter().enumerate() {
         let offset_ms = (rec.arrival_ms.unwrap_or(first_arrival) - first_arrival).max(0.0);
@@ -1215,8 +1354,10 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         // Reconstruct prefix sharing when the capture fingerprinted it;
         // otherwise every prompt is unique (cold cache, matching the capture).
         let prompt = match rec.block_hashes.as_deref() {
-            Some(hashes) => prompt_from_block_hashes(hashes, rec.prompt_tokens, block_size, i),
-            None => synthetic_prompt(i, rec.prompt_tokens),
+            Some(hashes) if !cfg.cold_prompts => {
+                prompt_from_block_hashes(hashes, rec.prompt_tokens, block_size, i)
+            }
+            _ => synthetic_prompt(i, rec.prompt_tokens),
         };
         let max_tokens = rec.output_tokens.max(1).min(u32::MAX as usize) as u32;
         // Generous per-request timeout scaled to the source duration: open-loop
@@ -1231,15 +1372,24 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
                 .unwrap_or(0.0);
         let timeout_dur = Duration::from_secs_f64(60.0 + 5.0 * source_ms / 1000.0);
         let client = Arc::clone(&client);
+        let trigger = triggers[i].take();
+        let txs = std::mem::take(&mut child_txs[i]);
 
         handles.push(tokio::spawn(async move {
-            tokio::time::sleep_until(target).await;
-            let send_lag_ms = (tokio::time::Instant::now() - target).as_secs_f64() * 1000.0;
-            let mut measured = ReplayedRequest {
-                index: i,
-                send_lag_ms,
-                ttft_ms: None,
-                gaps_ms: Vec::new(),
+            let send_lag_ms = match trigger {
+                None => {
+                    tokio::time::sleep_until(target).await;
+                    (tokio::time::Instant::now() - target).as_secs_f64() * 1000.0
+                }
+                Some((rx, think_ms)) => {
+                    // A dead parent task drops the sender; fire immediately then.
+                    let _ = rx.await;
+                    if think_ms > 0.0 {
+                        tokio::time::sleep(Duration::from_secs_f64(think_ms / 1000.0)).await;
+                    }
+                    // Schedule lag is meaningful only for wall-clock targets.
+                    0.0
+                }
             };
 
             let request = EngineCoreRequest {
@@ -1251,50 +1401,18 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
                 }),
                 ..Default::default()
             };
-            let call_start = Instant::now();
-            let mut stream = match client.call(request).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("replay-{i}: call failed: {e:#}");
-                    return measured;
-                }
-            };
-
-            let mut token_times: Vec<Instant> = Vec::new();
-            let result = tokio::time::timeout(timeout_dur, async {
-                while let Some(item) = stream.next().await {
-                    let output = item.context("stream item error")?;
-                    let now = Instant::now();
-                    if !output.new_token_ids.is_empty() {
-                        token_times.push(now);
-                    }
-                    if output.finish_reason.is_some() {
-                        break;
-                    }
-                }
-                Ok::<(), anyhow::Error>(())
-            })
-            .await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!("replay-{i}: stream error: {e:#}");
-                    return measured;
-                }
-                Err(_) => {
-                    tracing::warn!("replay-{i}: timed out after {timeout_dur:?}");
-                    return measured;
-                }
+            let (ttft_ms, gaps_ms) = measure_one(&client, request, timeout_dur).await;
+            // Release dependent turns even when this one failed: the session
+            // must keep pacing or the replay deadlocks on errors.
+            for tx in txs {
+                let _ = tx.send(());
             }
-
-            if let Some(first) = token_times.first() {
-                measured.ttft_ms = Some((*first - call_start).as_secs_f64() * 1000.0);
+            ReplayedRequest {
+                index: i,
+                send_lag_ms,
+                ttft_ms,
+                gaps_ms,
             }
-            measured.gaps_ms = token_times
-                .windows(2)
-                .map(|w| (w[1] - w[0]).as_secs_f64() * 1000.0)
-                .collect();
-            measured
         }));
     }
 
@@ -1494,6 +1612,39 @@ mod tests {
             p99: 30.0,
         };
         assert!(a.max_relative_error(&a) < f64::EPSILON);
+    }
+
+    #[test]
+    fn session_parents_follow_hash_chains() {
+        use crate::trace::prompt_block_hashes;
+
+        let block = 4usize;
+        let rec = |tokens: &[u32], arrival: f64| TraceRecord {
+            prompt_tokens: tokens.len(),
+            cached_tokens: 0,
+            output_tokens: 2,
+            ttft_ms: 10.0,
+            itl_ms: Some(vec![5.0]),
+            itl_summary: None,
+            concurrency: 1,
+            arrival_ms: Some(arrival),
+            itl_ctx: None,
+            block_hashes: prompt_block_hashes(tokens, block),
+        };
+
+        // Two interleaved sessions; session B shares session A's first block
+        // (a shared prefix) but is not a chain extension of any A turn.
+        let a1: Vec<u32> = (0..8).collect();
+        let mut a2 = a1.clone();
+        a2.extend(100..108);
+        let mut b1: Vec<u32> = (0..4).collect();
+        b1.extend(200..208);
+        let mut b2 = b1.clone();
+        b2.extend(300..308);
+
+        let records = vec![rec(&a1, 0.0), rec(&b1, 1.0), rec(&a2, 2.0), rec(&b2, 3.0)];
+        let parents = infer_session_parents(&records);
+        assert_eq!(parents, vec![None, None, Some(0), Some(1)]);
     }
 
     #[test]
