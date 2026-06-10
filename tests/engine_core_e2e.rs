@@ -103,10 +103,6 @@ fn make_request_with_token(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test 1: token_stream_round_trip
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn token_stream_round_trip() {
     let (client, _guard) = harness("token_stream_round_trip", &[]).await;
@@ -136,10 +132,6 @@ async fn token_stream_round_trip() {
         "final output should have finish_reason Length"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Test 2: abort_terminates_stream
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn abort_terminates_stream() {
@@ -182,10 +174,6 @@ async fn abort_terminates_stream() {
         "expected an output with finish_reason Abort after calling abort"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Test 3: reset_prefix_cache_busy_vs_idle
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn reset_prefix_cache_busy_vs_idle() {
@@ -233,10 +221,6 @@ async fn reset_prefix_cache_busy_vs_idle() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Test 4: lora_load_unload_lifecycle
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn lora_load_unload_lifecycle() {
     let (client, _guard) = harness("lora_load_unload_lifecycle", &[]).await;
@@ -273,10 +257,6 @@ async fn lora_load_unload_lifecycle() {
         "second remove_lora should return false (adapter already removed)"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Test 5: pd_handoff_advertise_then_pull
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn pd_handoff_advertise_then_pull() {

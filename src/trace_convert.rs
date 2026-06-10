@@ -23,9 +23,7 @@ use serde::Deserialize;
 
 use crate::trace::{ItlSummary, TraceMeta, TraceRecord, read_trace, write_trace};
 
-// ---------------------------------------------------------------------------
 // guidellm JSON schema (minimal subset we actually use)
-// ---------------------------------------------------------------------------
 
 /// Top-level report container.
 /// Source: src/guidellm/benchmark/schemas/generative/report.py
@@ -107,10 +105,6 @@ pub struct GuidellmRequestStats {
     pub inter_token_latency_ms: Option<f64>,
 }
 
-// ---------------------------------------------------------------------------
-// Conversion options
-// ---------------------------------------------------------------------------
-
 /// Options for `from_guidellm` that override or supplement report metadata.
 #[derive(Debug, Clone, Default)]
 pub struct ConvertOptions {
@@ -118,10 +112,6 @@ pub struct ConvertOptions {
     pub gpu: Option<String>,
     pub tp: Option<u32>,
 }
-
-// ---------------------------------------------------------------------------
-// Core conversion
-// ---------------------------------------------------------------------------
 
 /// Parse a guidellm JSON report and produce trace (meta, records).
 ///
@@ -241,10 +231,6 @@ fn derive_concurrency(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Summarize
-// ---------------------------------------------------------------------------
 
 /// Per-concurrency-bucket statistics.
 #[derive(Debug)]
@@ -407,10 +393,6 @@ pub fn write_conversion(
 ) -> Result<()> {
     write_trace(writer, meta, records)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
