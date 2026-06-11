@@ -459,9 +459,14 @@ type PullCompletion = (String, Result<u64>);
 #[derive(Debug, Clone, Copy)]
 struct PrefillWindow {
     start: Instant,
+    /// Where the stream's next window may start: the prefill's full service time.
     end: Instant,
-    /// Chunk-step count: tokens due inside the window slip to chunk boundaries.
-    chunks: u32,
+    /// End of the decode-stalling span: the budget-saturated FULL chunks' share of the
+    /// service time. A token due before this slips to it (real marked gaps distribute
+    /// uniformly up to about this span, matching slip-to-end of the full chunks). The
+    /// trailing partial chunk shares its step with decodes, so it stalls nothing; a
+    /// single-chunk prefill stalls nothing at all.
+    stall_end: Instant,
     /// Whether this prefill found the engine already loaded at admission: it queued
     /// behind the stream tail, or the running batch was past the heaviest load real
     /// captures show the engine hiding chunks at (zero decode elongation up to
@@ -966,21 +971,24 @@ impl SimEngine {
                     };
                     let budget = (self.opt.max_num_batched_tokens as usize).max(1);
                     let uncached = active.prompt_len - num_local_cached;
-                    let chunks = uncached.div_ceil(budget) as u32;
+                    let full_chunk_tokens = (uncached / budget) * budget;
                     // A single-chunk prefill shares its step with whatever else
                     // is pending, so it never waits behind the stream tail;
                     // only multi-chunk prefills own their steps and serialize
                     // behind each other.
                     let start = match self.prefill_busy.back() {
-                        Some(w) if chunks > 1 && w.end > now => w.end,
+                        Some(w) if full_chunk_tokens > 0 && w.end > now => w.end,
                         _ => now,
                     };
-                    let end = start + active.prefill_service.div_f64(time_scale);
+                    let service = active.prefill_service.div_f64(time_scale);
+                    let end = start + service;
+                    let stall_end =
+                        start + service.mul_f64(full_chunk_tokens as f64 / uncached as f64);
                     active.next_at += start.saturating_duration_since(now);
                     self.prefill_busy.push_back(PrefillWindow {
                         start,
                         end,
-                        chunks,
+                        stall_end,
                         stalls_decodes: start > now || num_running > CHUNK_HIDING_MAX_RUNNING,
                     });
                 }
@@ -1184,12 +1192,12 @@ impl SimEngine {
                 } else {
                     1.0
                 };
-                // A token due inside a QUEUED prefill window rides that
-                // window's mixed chunk steps: it emits at the next chunk-step
-                // boundary, so one prefill stretches several consecutive gaps
-                // to about a chunk each instead of one gap to the whole
-                // window. Windows from isolated light-load admissions stall
-                // nothing (the engine hides those chunks entirely).
+                // A token due during a QUEUED prefill's full chunks waits
+                // them out: those steps pack the whole token budget, so the
+                // decode's token emits when they finish (real marked gaps
+                // spread uniformly up to about one full-chunk span). Windows
+                // from isolated light-load admissions stall nothing (the
+                // engine hides those chunks entirely).
                 //
                 // The next deadline builds on the PREVIOUS deadline, not on
                 // `now`: the step loop wakes a little after each deadline, and
@@ -1198,18 +1206,14 @@ impl SimEngine {
                 let due = request.next_at + gap.div_f64(time_scale);
                 let mut next = due;
                 for w in &self.prefill_busy {
-                    if w.end <= due {
+                    if w.stall_end <= due {
                         continue;
                     }
                     if w.start >= due {
                         break;
                     }
                     if w.stalls_decodes {
-                        let dur = w.end.duration_since(w.start).as_secs_f64();
-                        let into = due.duration_since(w.start).as_secs_f64();
-                        let n = w.chunks.max(1) as f64;
-                        let boundary = (into / dur * n).ceil().clamp(1.0, n);
-                        next = w.start + Duration::from_secs_f64(dur * boundary / n);
+                        next = w.stall_end;
                     }
                     break;
                 }
