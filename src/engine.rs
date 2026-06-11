@@ -480,12 +480,18 @@ struct PrefillWindow {
     /// chunk only its share - which is what spreads slipped gaps the way real marked
     /// gaps spread, instead of capping them all at window/chunk-count.
     uncached: u32,
-    /// Whether this prefill's chunks stall concurrent decodes: true for multi-chunk
-    /// prefills (their budget-saturated steps exclude decode tokens) at any load or
-    /// spacing, false for single-chunk ones (they share their step; real captures show
-    /// zero decode elongation from sub-budget admissions regardless of batch size).
+    /// Whether this prefill found the engine already loaded at admission: it queued
+    /// behind the stream tail, or the running batch was past the heaviest load real
+    /// captures show the engine hiding chunks at (zero decode elongation up to
+    /// concurrency 8 at light load; full chunk-step stalls near saturation). Only
+    /// loaded windows stall decodes; an isolated prefill's chunk is hidden.
     stalls_decodes: bool,
 }
+
+/// Largest running batch at which real captures still show ZERO decode elongation from
+/// a prefill admission (held-out multiturn capture, concurrency <= 8, surcharge ~0.1ms).
+/// Past it the engine's chunk-hiding capacity is exhausted and decodes ride chunk steps.
+const CHUNK_HIDING_MAX_RUNNING: u64 = 8;
 
 pub(crate) struct SimEngine {
     engine_index: u32,
@@ -1016,21 +1022,13 @@ impl SimEngine {
                         Some(w) if chunks > 1 && w.end > now => w.end,
                         _ => now,
                     };
-                    // The window spans only the chunk COMPUTE (what concurrent
-                    // decodes ride through); the rest of the service is
-                    // per-request overhead pipelined past their steps.
-                    let occupancy = self
-                        .latency
-                        .prefill_occupancy(uncached)
-                        .unwrap_or(active.prefill_service)
-                        .min(active.prefill_service);
-                    let end = start + occupancy.div_f64(time_scale);
+                    let end = start + active.prefill_service.div_f64(time_scale);
                     active.next_at += start.saturating_duration_since(now);
                     self.prefill_busy.push_back(PrefillWindow {
                         start,
                         end,
                         uncached: uncached as u32,
-                        stalls_decodes: chunks > 1,
+                        stalls_decodes: start > now || num_running > CHUNK_HIDING_MAX_RUNNING,
                     });
                 }
                 self.active_requests.insert(request_id, active);
