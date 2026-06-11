@@ -1190,7 +1190,12 @@ impl SimEngine {
                 // to about a chunk each instead of one gap to the whole
                 // window. Windows from isolated light-load admissions stall
                 // nothing (the engine hides those chunks entirely).
-                let due = now + gap.div_f64(time_scale);
+                //
+                // The next deadline builds on the PREVIOUS deadline, not on
+                // `now`: the step loop wakes a little after each deadline, and
+                // anchoring on the wake time would compound that slop into
+                // every gap (measured ~2ms/token, +20% on real decode paces).
+                let due = request.next_at + gap.div_f64(time_scale);
                 let mut next = due;
                 for w in &self.prefill_busy {
                     if w.end <= due {
