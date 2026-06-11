@@ -455,6 +455,18 @@ struct PendingPull {
 type PullCompletion = (String, Result<u64>);
 
 /// Internal state for one engine instance, owned by the engine loop task.
+/// One prefill's chunk steps occupying the engine's serial step stream, in scaled wall time.
+#[derive(Debug, Clone, Copy)]
+struct PrefillWindow {
+    start: Instant,
+    end: Instant,
+    /// Chunk-step count: tokens due inside the window slip to chunk boundaries.
+    chunks: u32,
+    /// Whether this prefill queued behind the stream tail at admission. Only queued
+    /// windows stall decodes; an isolated prefill's chunk is hidden by the engine.
+    queued: bool,
+}
+
 pub(crate) struct SimEngine {
     engine_index: u32,
     opt: Opt,
@@ -486,13 +498,14 @@ pub(crate) struct SimEngine {
     /// is still in flight. These count toward `running_capacity` and `scheduled_token_demand`
     /// to prevent over-admission while pulls are outstanding.
     pending_pulls: BTreeMap<String, PendingPull>,
-    /// The engine's serial prefill stream as busy windows of (scaled) wall time plus the
-    /// window's chunk-step count, in order. Prefill chunks and decode steps share one step
-    /// stream, so a decode token due inside a window slips to the next chunk-step boundary
-    /// (decodes ride along in mixed batches, emitting once per chunk step, so one prefill
-    /// elongates several consecutive gaps to roughly a chunk's duration each rather than
-    /// one gap to the whole window). Drained windows are dropped at the next admission.
-    prefill_busy: VecDeque<(Instant, Instant, u32)>,
+    /// The engine's serial prefill stream, in order. Prefill chunks and decode steps share
+    /// one step stream, so a decode token due inside a QUEUED window slips to the next
+    /// chunk-step boundary (decodes ride along in mixed batches, emitting once per chunk
+    /// step). An ISOLATED prefill - admitted to an idle stream - leaves decodes untouched:
+    /// real captures show zero decode elongation from single admissions at light load (the
+    /// engine hides the chunk), with the 100ms+ stalls appearing only once prefills arrive
+    /// faster than the stream drains. Drained windows are dropped at the next admission.
+    prefill_busy: VecDeque<PrefillWindow>,
     /// Sender half for pull completion results. Cloned into each `spawn_blocking` task.
     pull_completion_tx: mpsc::UnboundedSender<PullCompletion>,
     /// Receiver half; wrapped in Option so `take_internal_rx` can hand it to the loop once.
@@ -934,11 +947,7 @@ impl SimEngine {
                 // their prefill on another node and merely join the batch;
                 // full cache hits run no chunk. Either way they occupy nothing.
                 let now = Instant::now();
-                while self
-                    .prefill_busy
-                    .front()
-                    .is_some_and(|&(_, end, _)| end <= now)
-                {
+                while self.prefill_busy.front().is_some_and(|w| w.end <= now) {
                     self.prefill_busy.pop_front();
                 }
                 if !active.remote_prefill && active.prompt_len > num_local_cached {
@@ -951,12 +960,17 @@ impl SimEngine {
                     let uncached = active.prompt_len - num_local_cached;
                     let chunks = uncached.div_ceil(budget) as u32;
                     let start = match self.prefill_busy.back() {
-                        Some(&(_, end, _)) if end > now => end,
+                        Some(w) if w.end > now => w.end,
                         _ => now,
                     };
                     let end = start + active.prefill_service.div_f64(time_scale);
                     active.next_at += start.saturating_duration_since(now);
-                    self.prefill_busy.push_back((start, end, chunks));
+                    self.prefill_busy.push_back(PrefillWindow {
+                        start,
+                        end,
+                        chunks,
+                        queued: start > now,
+                    });
                 }
                 self.active_requests.insert(request_id, active);
                 None
@@ -1158,24 +1172,27 @@ impl SimEngine {
                 } else {
                     1.0
                 };
-                // A token due inside a prefill busy window rides that window's
-                // mixed chunk steps: it emits at the next chunk-step boundary,
-                // so one prefill stretches several consecutive gaps to about a
-                // chunk each instead of one gap to the whole window.
+                // A token due inside a QUEUED prefill window rides that
+                // window's mixed chunk steps: it emits at the next chunk-step
+                // boundary, so one prefill stretches several consecutive gaps
+                // to about a chunk each instead of one gap to the whole
+                // window. Isolated (unqueued) windows stall nothing.
                 let due = now + gap.div_f64(time_scale);
                 let mut next = due;
-                for &(start, end, chunks) in &self.prefill_busy {
-                    if end <= due {
+                for w in &self.prefill_busy {
+                    if w.end <= due {
                         continue;
                     }
-                    if start >= due {
+                    if w.start >= due {
                         break;
                     }
-                    let dur = end.duration_since(start).as_secs_f64();
-                    let into = due.duration_since(start).as_secs_f64();
-                    let n = chunks.max(1) as f64;
-                    let boundary = (into / dur * n).ceil().clamp(1.0, n);
-                    next = start + Duration::from_secs_f64(dur * boundary / n);
+                    if w.queued {
+                        let dur = w.end.duration_since(w.start).as_secs_f64();
+                        let into = due.duration_since(w.start).as_secs_f64();
+                        let n = w.chunks.max(1) as f64;
+                        let boundary = (into / dur * n).ceil().clamp(1.0, n);
+                        next = w.start + Duration::from_secs_f64(dur * boundary / n);
+                    }
                     break;
                 }
                 request.next_at = next;
