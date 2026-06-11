@@ -373,11 +373,30 @@ struct ServiceFit {
     b: f64,
     c: f64,
     floor_ms: f64,
+    /// Relative spread of the lowest-concurrency observations around the
+    /// curve (trimmed standard deviation of ttft / T(u)). Real prefill
+    /// service varies a tenth or so at fixed size; a deterministic curve
+    /// makes every stall window identical and clusters the slipped decode
+    /// gaps below the real spread.
+    sigma_rel: f64,
 }
 
 impl ServiceFit {
     fn eval_ms(&self, uncached: f64) -> f64 {
         (self.a + self.b * uncached + self.c * uncached * uncached).max(self.floor_ms)
+    }
+
+    /// One sampled service time: the curve scaled by a truncated-normal
+    /// relative factor, never below the observed floor.
+    fn sample_ms(&self, rng: &mut StdRng, uncached: f64) -> f64 {
+        let z: f64 = {
+            // Box-Muller, truncated to two sigma like the knob model's draws.
+            let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+            let u2: f64 = rng.random::<f64>();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+        };
+        let factor = (1.0 + self.sigma_rel * z.clamp(-2.0, 2.0)).max(0.5);
+        (self.eval_ms(uncached) * factor).max(self.floor_ms)
     }
 }
 
@@ -430,7 +449,7 @@ fn service_windows(obs: &[(f64, f64)]) -> Vec<ServiceWindow> {
 /// the per-bucket sampling path. Negative-curvature fits that would bend the
 /// curve downward inside the observed range also fall back to linear: service
 /// time cannot shrink as prompts grow.
-fn fit_service_curve(windows: &[ServiceWindow]) -> Option<ServiceFit> {
+fn fit_service_curve(windows: &[ServiceWindow], obs: &[(f64, f64)]) -> Option<ServiceFit> {
     let floor_ms = windows
         .iter()
         .map(|w| w.p10_ms)
@@ -440,25 +459,51 @@ fn fit_service_curve(windows: &[ServiceWindow]) -> Option<ServiceFit> {
     }
     let u_max = windows.iter().map(|w| w.u).fold(0.0, f64::max);
 
-    if windows.len() >= 4
+    let mut fit = if windows.len() >= 4
         && let Some([a, b, c]) = solve_weighted_poly::<3>(windows)
         && c >= 0.0
         && b + 2.0 * c * u_max >= 0.0
     {
-        return Some(ServiceFit { a, b, c, floor_ms });
-    }
-    if windows.len() >= 2
+        ServiceFit {
+            a,
+            b,
+            c,
+            floor_ms,
+            sigma_rel: 0.0,
+        }
+    } else if windows.len() >= 2
         && let Some([a, b]) = solve_weighted_poly::<2>(windows)
         && b >= 0.0
     {
-        return Some(ServiceFit {
+        ServiceFit {
             a,
             b,
             c: 0.0,
             floor_ms,
-        });
+            sigma_rel: 0.0,
+        }
+    } else {
+        return None;
+    };
+    fit.sigma_rel = service_sigma_rel(&fit, obs);
+    Some(fit)
+}
+
+/// Trimmed relative spread of the floor observations around the fitted curve.
+/// Ratios past 1.5 are queued samples, not service variance, and are dropped;
+/// the result is capped so a noisy fit cannot inject implausible spread.
+fn service_sigma_rel(fit: &ServiceFit, obs: &[(f64, f64)]) -> f64 {
+    let ratios: Vec<f64> = obs
+        .iter()
+        .map(|&(u, ttft)| ttft / fit.eval_ms(u).max(1e-9))
+        .filter(|r| (0.5..=1.5).contains(r))
+        .collect();
+    if ratios.len() < 20 {
+        return 0.0;
     }
-    None
+    let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    let var = ratios.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>() / ratios.len() as f64;
+    var.sqrt().min(0.3)
 }
 
 /// Solve the DEG-term weighted polynomial normal equations by Gaussian
@@ -692,7 +737,7 @@ impl TraceLatency {
             })
             .collect();
         floor_obs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let service_fit = fit_service_curve(&service_windows(&floor_obs));
+        let service_fit = fit_service_curve(&service_windows(&floor_obs), &floor_obs);
 
         Ok(TraceLatency {
             service_fit,
@@ -792,7 +837,7 @@ impl LatencyModel for TraceLatency {
 
         let uncached = ctx.num_prompt_tokens.saturating_sub(ctx.num_cached_tokens);
         if let Some(fit) = &self.service_fit {
-            return Duration::from_secs_f64(fit.eval_ms(uncached.max(1) as f64) / 1000.0);
+            return Duration::from_secs_f64(fit.sample_ms(rng, uncached.max(1) as f64) / 1000.0);
         }
         let pb = prompt_bucket(uncached);
 
