@@ -47,20 +47,21 @@ pub struct DecodePacing {
     /// Prompt bucket of this request's full context, conditioning decode gaps
     /// on KV depth (attention over a long context slows every step).
     context_bucket: usize,
-    /// Whether most of this request's context was computed fresh (cached
-    /// fraction under half). Cold-context decode under load runs measurably
-    /// slower than warm (no block reuse, more distinct KV traffic), so donors
-    /// are conditioned on it.
-    cold: bool,
+    /// Whether this request decodes under big-chunk churn: frequent
+    /// budget-scale prefill admissions wipe cache residency, and decode
+    /// between the stalls runs measurably slower than in a calm batch at the
+    /// same context, concurrency and cache-coldness. Donors are conditioned
+    /// on the same property of their source records.
+    churn: bool,
 }
 
 impl DecodePacing {
     /// Pacing state for a request whose full context is `prompt_tokens` long,
-    /// of which `cached_tokens` were served from cache.
-    pub fn for_prompt(prompt_tokens: usize, cached_tokens: usize) -> Self {
+    /// decoding under big-chunk churn or not.
+    pub fn for_prompt(prompt_tokens: usize, churn: bool) -> Self {
         Self {
             context_bucket: prompt_bucket(prompt_tokens),
-            cold: cached_tokens * 2 < prompt_tokens,
+            churn,
             ..Self::default()
         }
     }
@@ -80,7 +81,7 @@ impl Default for DecodePacing {
             donors: [None; NUM_CONCURRENCY_BUCKETS],
             pending_stall: None,
             context_bucket: 0,
-            cold: true,
+            churn: false,
         }
     }
 }
@@ -235,6 +236,29 @@ use crate::trace::{TraceMeta, TraceRecord};
 /// Prompt-token bucket edges (powers of two). A value `v` falls into bucket `i` where
 /// `PROMPT_EDGES[i] <= v < PROMPT_EDGES[i+1]`. The last bucket is uncapped.
 const PROMPT_EDGES: &[usize] = &[0, 65, 129, 257, 513, 1025, 2049, 4097, 8193, 16385, 32769];
+
+/// Prefill admissions above this size mark big-chunk churn: their steps
+/// saturate the batched-token budget and wipe cache residency for the decodes
+/// riding alongside (half the capture's 8192-token budget).
+pub const BIG_CHUNK_TOKENS: u32 = 4096;
+
+/// Whether a trace record's decode ran under big-chunk churn: a few percent
+/// of its gaps carry budget-scale admission marks (sweep cells sit under 1%,
+/// churn captures around 8%).
+pub fn record_decodes_under_churn(record: &TraceRecord) -> bool {
+    record
+        .itl_ctx
+        .as_ref()
+        .map(|ctx| {
+            let big = ctx
+                .prefill_tokens
+                .iter()
+                .filter(|&&t| t > BIG_CHUNK_TOKENS)
+                .count();
+            big * 100 > ctx.prefill_tokens.len().max(1) * 3
+        })
+        .unwrap_or(false)
+}
 
 /// Number of prompt buckets (one per interval between edges, plus the uncapped tail).
 const NUM_PROMPT_BUCKETS: usize = PROMPT_EDGES.len();
@@ -542,8 +566,8 @@ impl TraceLatency {
 
         // Per uncached-prompt bucket: (concurrency bucket, uncached tokens, ttft).
         let mut ttft_obs: Vec<Vec<(usize, f64, f64)>> = vec![Vec::new(); NUM_PROMPT_BUCKETS];
-        // Donor cells double along the prompt axis: warm contexts (mostly
-        // cached) in the first half, cold (mostly computed) in the second.
+        // Donor cells double along the prompt axis: calm batches in the
+        // first half, big-chunk-churn workloads in the second.
         let mut donors_grid =
             vec![vec![DonorBucket::default(); NUM_CONCURRENCY_BUCKETS]; 2 * NUM_PROMPT_BUCKETS];
         let mut stalls_grid = vec![vec![Vec::new(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
@@ -553,11 +577,14 @@ impl TraceLatency {
             let uncached = record.prompt_tokens.saturating_sub(record.cached_tokens);
             let upb = prompt_bucket(uncached);
             // Decode cost scales with the FULL context the step attends over,
-            // cached or not - but cold contexts (computed, not reused) decode
-            // measurably slower under load, so they donate to separate cells.
-            let cold = record.cached_tokens * 2 < record.prompt_tokens;
+            // cached or not - and decode under big-chunk churn runs slower
+            // than calm decode at the same context, so churn records donate
+            // to separate cells. A record decodes under churn when a few
+            // percent of its gaps carry budget-scale admission marks (sweep
+            // cells sit under 1%, churn captures around 8%).
+            let churn = record_decodes_under_churn(record);
             let ctx_pb =
-                prompt_bucket(record.prompt_tokens) + if cold { NUM_PROMPT_BUCKETS } else { 0 };
+                prompt_bucket(record.prompt_tokens) + if churn { NUM_PROMPT_BUCKETS } else { 0 };
             let cb = concurrency_bucket(record.concurrency);
 
             ttft_obs[upb].push((cb, uncached.max(1) as f64, record.ttft_ms));
@@ -835,11 +862,11 @@ impl LatencyModel for TraceLatency {
         }
 
         // The resolved cell is deterministic for a given (context, cb), so the
-        // cached donor index below always refers to the same pool. Cold
-        // contexts index the grid's second half; the nearest-cell fallback
+        // cached donor index below always refers to the same pool. Churning
+        // requests index the grid's second half; the nearest-cell fallback
         // stays within a half unless it is entirely empty (cross-half index
         // distance exceeds any within-half distance).
-        let ctx_index = pacing.context_bucket + if pacing.cold { NUM_PROMPT_BUCKETS } else { 0 };
+        let ctx_index = pacing.context_bucket + if pacing.churn { NUM_PROMPT_BUCKETS } else { 0 };
         let Some(bucket) =
             nearest_grid_cell(&self.donors_grid, ctx_index, cb, |cell: &DonorBucket| {
                 !cell.donors.is_empty()

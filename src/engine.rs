@@ -278,20 +278,34 @@ struct ActiveRequest {
     next_at: Instant,
 }
 
+/// Admission-scoped facts about a request entering the batch, gathered by the
+/// scheduler before `ActiveRequest::new`.
+struct AdmissionCtx {
+    /// Running-request count *including* this one; scales the first-token delay under load.
+    num_running: u64,
+    /// Prompt tokens served from the local prefix cache.
+    num_local_cached_tokens: usize,
+    /// Block-pool slots pinned for the prompt.
+    block_ids: Vec<usize>,
+    /// Whether the batch is under big-chunk churn (see `DecodePacing`).
+    churn: bool,
+}
+
 impl ActiveRequest {
     /// Create a new active request, or return an immediate finish reason if invalid.
-    ///
-    /// `num_running` is the running-request count *including* this one, used to scale the
-    /// first-token delay under load.
     fn new(
         engine_index: u32,
         request: Box<EngineCoreRequest>,
         opt: &Opt,
         latency: &dyn LatencyModel,
-        num_running: u64,
-        num_local_cached_tokens: usize,
-        block_ids: Vec<usize>,
+        admission: AdmissionCtx,
     ) -> Result<Self, EngineCoreFinishReason> {
+        let AdmissionCtx {
+            num_running,
+            num_local_cached_tokens,
+            block_ids,
+            churn,
+        } = admission;
         let incoming_kv = extract_kv_params(&request);
         let prefill_advertise = incoming_kv
             .as_ref()
@@ -335,7 +349,7 @@ impl ActiveRequest {
         }
 
         let mut rng = StdRng::seed_from_u64(request_seed(opt.seed, engine_index, &request_id));
-        let mut pacing = DecodePacing::for_prompt(prompt_len, num_local_cached_tokens);
+        let mut pacing = DecodePacing::for_prompt(prompt_len, churn);
         // Prompt tokens served from the local prefix cache are not recomputed, so they
         // shorten the prefill (TTFT). The block pool measured the hit at admission.
         let first_delay = latency.first_token_delay(
@@ -518,6 +532,10 @@ pub(crate) struct SimEngine {
     /// engine hides the chunk), with the 100ms+ stalls appearing only once prefills arrive
     /// faster than the stream drains. Drained windows are dropped at the next admission.
     prefill_busy: VecDeque<PrefillWindow>,
+    /// Wall instants (scaled) of recent big-chunk admissions, pruned to the last scaled
+    /// second. A request admitted while one is recent decodes under churn: its donor
+    /// draws come from churn-conditioned pools.
+    recent_big_admissions: VecDeque<Instant>,
     /// Sender half for pull completion results. Cloned into each `spawn_blocking` task.
     pull_completion_tx: mpsc::UnboundedSender<PullCompletion>,
     /// Receiver half; wrapped in Option so `take_internal_rx` can hand it to the loop once.
@@ -941,14 +959,36 @@ impl SimEngine {
         // Count this request among the running set for its own load-factor scaling.
         // Include pending pulls in the count since they occupy batch slots.
         let num_running = (self.active_requests.len() + self.pending_pulls.len()) as u64 + 1;
+        // Prune the big-admission history to the last scaled wall second and
+        // classify this request's decode regime: joining a batch with a recent
+        // budget-scale prefill means decoding under churn.
+        let admit_now = Instant::now();
+        let churn_window = Duration::from_secs_f64(
+            1.0 / if self.opt.time_scale > 0.0 {
+                self.opt.time_scale
+            } else {
+                1.0
+            },
+        );
+        while self
+            .recent_big_admissions
+            .front()
+            .is_some_and(|&t| admit_now.duration_since(t) > churn_window)
+        {
+            self.recent_big_admissions.pop_front();
+        }
+        let churn = !self.recent_big_admissions.is_empty();
         match ActiveRequest::new(
             self.engine_index,
             request,
             &self.opt,
             &*self.latency,
-            num_running,
-            num_local_cached,
-            block_ids.clone(),
+            AdmissionCtx {
+                num_running,
+                num_local_cached_tokens: num_local_cached,
+                block_ids: block_ids.clone(),
+                churn,
+            },
         ) {
             Ok(mut active) => {
                 // This admission's prefill chunks drain through the engine's
@@ -971,6 +1011,9 @@ impl SimEngine {
                     let budget = (self.opt.max_num_batched_tokens as usize).max(1);
                     let uncached = active.prompt_len - num_local_cached;
                     let chunks = uncached.div_ceil(budget) as u32;
+                    if uncached as u32 > crate::latency::BIG_CHUNK_TOKENS {
+                        self.recent_big_admissions.push_back(admit_now);
+                    }
                     // A single-chunk prefill shares its step with whatever else
                     // is pending, so it never waits behind the stream tail;
                     // only multi-chunk prefills own their steps and serialize
@@ -1390,6 +1433,7 @@ impl SimEngine {
             waiting: VecDeque::new(),
             pending_pulls: BTreeMap::new(),
             prefill_busy: VecDeque::new(),
+            recent_big_admissions: VecDeque::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
         })
@@ -1484,6 +1528,7 @@ mod tests {
             waiting: VecDeque::new(),
             pending_pulls: BTreeMap::new(),
             prefill_busy: VecDeque::new(),
+            recent_big_admissions: VecDeque::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
             opt,
