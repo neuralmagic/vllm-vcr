@@ -767,7 +767,7 @@ fn request_total_report(
             continue;
         }
         for _ in 0..reps {
-            let mut pacing = DecodePacing::for_prompt(r.prompt_tokens);
+            let mut pacing = DecodePacing::for_prompt(r.prompt_tokens, r.cached_tokens);
             let total_ms: f64 = (0..n_gaps)
                 .map(|i| {
                     // Model-level calibration has no scheduler to generate prefill

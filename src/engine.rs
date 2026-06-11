@@ -335,7 +335,7 @@ impl ActiveRequest {
         }
 
         let mut rng = StdRng::seed_from_u64(request_seed(opt.seed, engine_index, &request_id));
-        let mut pacing = DecodePacing::for_prompt(prompt_len);
+        let mut pacing = DecodePacing::for_prompt(prompt_len, num_local_cached_tokens);
         // Prompt tokens served from the local prefix cache are not recomputed, so they
         // shorten the prefill (TTFT). The block pool measured the hit at admission.
         let first_delay = latency.first_token_delay(

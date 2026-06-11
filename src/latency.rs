@@ -47,13 +47,20 @@ pub struct DecodePacing {
     /// Prompt bucket of this request's full context, conditioning decode gaps
     /// on KV depth (attention over a long context slows every step).
     context_bucket: usize,
+    /// Whether most of this request's context was computed fresh (cached
+    /// fraction under half). Cold-context decode under load runs measurably
+    /// slower than warm (no block reuse, more distinct KV traffic), so donors
+    /// are conditioned on it.
+    cold: bool,
 }
 
 impl DecodePacing {
-    /// Pacing state for a request whose full context is `prompt_tokens` long.
-    pub fn for_prompt(prompt_tokens: usize) -> Self {
+    /// Pacing state for a request whose full context is `prompt_tokens` long,
+    /// of which `cached_tokens` were served from cache.
+    pub fn for_prompt(prompt_tokens: usize, cached_tokens: usize) -> Self {
         Self {
             context_bucket: prompt_bucket(prompt_tokens),
+            cold: cached_tokens * 2 < prompt_tokens,
             ..Self::default()
         }
     }
@@ -73,6 +80,7 @@ impl Default for DecodePacing {
             donors: [None; NUM_CONCURRENCY_BUCKETS],
             pending_stall: None,
             context_bucket: 0,
+            cold: true,
         }
     }
 }
@@ -534,8 +542,10 @@ impl TraceLatency {
 
         // Per uncached-prompt bucket: (concurrency bucket, uncached tokens, ttft).
         let mut ttft_obs: Vec<Vec<(usize, f64, f64)>> = vec![Vec::new(); NUM_PROMPT_BUCKETS];
+        // Donor cells double along the prompt axis: warm contexts (mostly
+        // cached) in the first half, cold (mostly computed) in the second.
         let mut donors_grid =
-            vec![vec![DonorBucket::default(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
+            vec![vec![DonorBucket::default(); NUM_CONCURRENCY_BUCKETS]; 2 * NUM_PROMPT_BUCKETS];
         let mut stalls_grid = vec![vec![Vec::new(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
         let mut itl_by_concurrency = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
 
@@ -543,8 +553,11 @@ impl TraceLatency {
             let uncached = record.prompt_tokens.saturating_sub(record.cached_tokens);
             let upb = prompt_bucket(uncached);
             // Decode cost scales with the FULL context the step attends over,
-            // cached or not.
-            let ctx_pb = prompt_bucket(record.prompt_tokens);
+            // cached or not - but cold contexts (computed, not reused) decode
+            // measurably slower under load, so they donate to separate cells.
+            let cold = record.cached_tokens * 2 < record.prompt_tokens;
+            let ctx_pb =
+                prompt_bucket(record.prompt_tokens) + if cold { NUM_PROMPT_BUCKETS } else { 0 };
             let cb = concurrency_bucket(record.concurrency);
 
             ttft_obs[upb].push((cb, uncached.max(1) as f64, record.ttft_ms));
@@ -822,13 +835,16 @@ impl LatencyModel for TraceLatency {
         }
 
         // The resolved cell is deterministic for a given (context, cb), so the
-        // cached donor index below always refers to the same pool.
-        let Some(bucket) = nearest_grid_cell(
-            &self.donors_grid,
-            pacing.context_bucket,
-            cb,
-            |cell: &DonorBucket| !cell.donors.is_empty(),
-        ) else {
+        // cached donor index below always refers to the same pool. Cold
+        // contexts index the grid's second half; the nearest-cell fallback
+        // stays within a half unless it is entirely empty (cross-half index
+        // distance exceeds any within-half distance).
+        let ctx_index = pacing.context_bucket + if pacing.cold { NUM_PROMPT_BUCKETS } else { 0 };
+        let Some(bucket) =
+            nearest_grid_cell(&self.donors_grid, ctx_index, cb, |cell: &DonorBucket| {
+                !cell.donors.is_empty()
+            })
+        else {
             return self.inter_token_delay(rng, num_running);
         };
         let donor_idx = match pacing.donors[cb] {
