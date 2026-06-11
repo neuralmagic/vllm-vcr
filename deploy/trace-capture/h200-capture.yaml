@@ -90,11 +90,10 @@ spec:
         - name: tap
           image: quay.io/wseaton/mock-engine-nixl:trace-capture-v5
           command: ["/usr/local/bin/inference-sim-tap"]
+          # Handshake/data addresses use the binary's defaults (frontend
+          # :5570, engine :5580, data :29560/:29561), matching the frontend
+          # and engine args below.
           args:
-            - --frontend-handshake=tcp://127.0.0.1:5570
-            - --engine-handshake=tcp://127.0.0.1:5580
-            - --input-address=tcp://127.0.0.1:29560
-            - --output-address=tcp://127.0.0.1:29561
             - --trace-out=/trace/trace.jsonl
             - --model=Qwen/Qwen3-8B
             - --gpu=H200

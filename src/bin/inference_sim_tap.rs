@@ -5,14 +5,13 @@
 //! ## Usage
 //!
 //! ```text
-//! inference-sim-tap \
-//!   --frontend-handshake ipc:///tmp/frontend.ipc \
-//!   --engine-handshake ipc:///tmp/tap-engine.ipc \
-//!   --input-address tcp://127.0.0.1:29560 \
-//!   --output-address tcp://127.0.0.1:29561 \
-//!   --trace-out /tmp/trace.jsonl \
-//!   --model my-model
+//! inference-sim-tap --trace-out /tmp/trace.jsonl --model my-model
 //! ```
+//!
+//! Addresses default to the sidecar convention (frontend handshake
+//! tcp://127.0.0.1:5570, engine handshake tcp://127.0.0.1:5580, tap-bound
+//! data sockets :29560/:29561); override with --frontend-handshake /
+//! --engine-handshake / --input-address / --output-address (ipc:// works too).
 //!
 //! ## Topology
 //!
@@ -49,12 +48,16 @@ use inference_simulator_rs::trace::TraceWriter;
     about = "Transparent recording proxy between a vLLM frontend and an engine-core."
 )]
 struct TapOpt {
-    /// Handshake address of the real frontend to connect to (the tap acts as an engine).
-    #[arg(long)]
+    /// Handshake address of the real frontend to connect to (the tap acts as
+    /// an engine). The default matches the sidecar convention: the frontend
+    /// binds its handshake on :5570 (`vllm-rs serve --handshake-port 5570`).
+    #[arg(long, default_value = "tcp://127.0.0.1:5570")]
     frontend_handshake: String,
 
-    /// Handshake address the tap binds for the real engine (the tap acts as a frontend).
-    #[arg(long)]
+    /// Handshake address the tap binds for the real engine (the tap acts as a
+    /// frontend). The engine connects here: `vllm serve --headless
+    /// --data-parallel-rpc-port 5580`.
+    #[arg(long, default_value = "tcp://127.0.0.1:5580")]
     engine_handshake: String,
 
     /// Address the tap binds for the upstream engine's input (ROUTER socket).

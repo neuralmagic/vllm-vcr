@@ -48,11 +48,10 @@ three-container pod):
 - name: tap
   image: quay.io/wseaton/mock-engine-nixl:trace-capture-v5
   command: ["/usr/local/bin/inference-sim-tap"]
+  # Defaults: --frontend-handshake tcp://127.0.0.1:5570 (frontend's
+  # --handshake-port), --engine-handshake tcp://127.0.0.1:5580 (engine's
+  # --data-parallel-rpc-port), data sockets :29560/:29561.
   args:
-    - --frontend-handshake=tcp://127.0.0.1:5570  # frontend's --handshake-port
-    - --engine-handshake=tcp://127.0.0.1:5580    # engine's --data-parallel-rpc-port
-    - --input-address=tcp://127.0.0.1:29560
-    - --output-address=tcp://127.0.0.1:29561
     - --trace-out=/trace/trace.jsonl             # .gz to compress
     - --model=Qwen/Qwen3-8B
     - --gpu=H200
