@@ -199,10 +199,13 @@ async fn calibrate_e2e_smoke() {
 
 // Test (c): open-loop arrival replay (calibrate-e2e --replay-arrivals)
 //
-// A constant trace (80ms TTFT, 7x20ms gaps) with arrivals every 100ms: every
+// A constant trace (80ms TTFT, 7x20ms gaps) with arrivals every 250ms: every
 // value the replay model can draw IS the source value, so the comparison
-// isolates the harness's own transport and scheduling overhead. Also pins the
-// open-loop property: wall time must cover the arrival schedule's span.
+// isolates the harness's own transport and scheduling overhead. Arrivals are
+// spaced past each request's 220ms duration so no prefill lands mid-decode
+// (admission blocks running decodes by the prefill's service time, which the
+// constant source values do not include). Also pins the open-loop property:
+// wall time must cover the arrival schedule's span.
 
 #[tokio::test]
 async fn replay_arrivals_constant_trace() {
@@ -218,8 +221,8 @@ async fn replay_arrivals_constant_trace() {
                 ttft_ms: 80.0,
                 itl_ms: Some(vec![20.0; 7]),
                 itl_summary: None,
-                concurrency: 3,
-                arrival_ms: Some(i as f64 * 100.0),
+                concurrency: 1,
+                arrival_ms: Some(i as f64 * 250.0),
                 itl_ctx: None,
                 block_hashes: None,
             })

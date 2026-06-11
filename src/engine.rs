@@ -268,6 +268,10 @@ struct ActiveRequest {
     /// The LoRA adapter this request runs against, if any (from `EngineCoreRequest.lora_request`).
     /// Drives the per-adapter running count and the LoRA slot cap. `None` is the base model.
     lora_name: Option<String>,
+    /// Sampled prefill service time (the first-token delay draw). Kept so admission can
+    /// block every running decode by the same amount: prefill chunks and decode steps run
+    /// in one serial engine step stream, so a prefill delays everyone, not just itself.
+    prefill_service: Duration,
     /// When the next output token is due. Set to `now + first-token delay` at admission, then
     /// advanced by the inter-token delay after each emitted token. The engine loop sleeps
     /// until the earliest deadline across all active requests, so this is the timing model.
@@ -373,6 +377,7 @@ impl ActiveRequest {
             num_local_cached_tokens,
             block_ids,
             lora_name,
+            prefill_service: first_delay,
             next_at: Instant::now() + (first_delay + step_wait).div_f64(time_scale),
         })
     }
@@ -914,19 +919,24 @@ impl SimEngine {
             block_ids.clone(),
         ) {
             Ok(active) => {
-                // This admission starts a prefill that will interfere with the
-                // requests already decoding: note it on their pacing state so
-                // their next gap draws from the stall distribution. Remote-prefill
-                // requests (P/D decode side) burned their prefill on another node
-                // and merely join the batch, so they interfere with nothing.
-                let prefill_tokens = if active.remote_prefill {
-                    0
-                } else {
-                    active.prompt_len.saturating_sub(num_local_cached) as u32
-                };
-                if prefill_tokens > 0 {
+                // This admission starts a prefill chunk in the engine's single
+                // serial step stream, so every running decode's next token is
+                // pushed out by the prefill's service time. Remote-prefill
+                // requests (P/D decode side) burned their prefill on another
+                // node and merely join the batch; full cache hits run no chunk.
+                // Either way they block nothing.
+                let blocks_engine = !active.remote_prefill
+                    && active.prompt_len > num_local_cached
+                    && !self.active_requests.is_empty();
+                if blocks_engine {
+                    let time_scale = if self.opt.time_scale > 0.0 {
+                        self.opt.time_scale
+                    } else {
+                        1.0
+                    };
+                    let block = active.prefill_service.div_f64(time_scale);
                     for running in self.active_requests.values_mut() {
-                        running.pacing.note_prefill(prefill_tokens);
+                        running.next_at += block;
                     }
                 }
                 self.active_requests.insert(request_id, active);
