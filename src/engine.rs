@@ -272,12 +272,6 @@ struct ActiveRequest {
     /// block every running decode by the same amount: prefill chunks and decode steps run
     /// in one serial engine step stream, so a prefill delays everyone, not just itself.
     prefill_service: Duration,
-    /// When this request's prefill chunks finish draining through the engine's serial
-    /// step stream. Past this instant the request stops holding prefill token budget:
-    /// its remaining first-token wait is per-request overhead off the step path, which
-    /// must not throttle the next admission. Set at admission; `Instant::now()` for
-    /// requests that run no local chunk.
-    prefill_chunks_done_at: Instant,
     /// When the next output token is due. Set to `now + first-token delay` at admission, then
     /// advanced by the inter-token delay after each emitted token. The engine loop sleeps
     /// until the earliest deadline across all active requests, so this is the timing model.
@@ -384,7 +378,6 @@ impl ActiveRequest {
             block_ids,
             lora_name,
             prefill_service: first_delay,
-            prefill_chunks_done_at: Instant::now(),
             next_at: Instant::now() + (first_delay + step_wait).div_f64(time_scale),
         })
     }
@@ -412,18 +405,8 @@ impl ActiveRequest {
     /// Per-step token demand for the batch token budget: a decoding request needs 1 token, a
     /// prefilling request (no output yet) needs its prompt chunk. Mirrors how vLLM's scheduler
     /// charges `num_new_tokens` against `max_num_batched_tokens` each step.
-    fn token_demand(
-        &self,
-        long_prefill_threshold: usize,
-        max_batched_tokens: usize,
-        now: Instant,
-    ) -> usize {
+    fn token_demand(&self, long_prefill_threshold: usize, max_batched_tokens: usize) -> usize {
         if self.generated > 0 {
-            1
-        } else if now >= self.prefill_chunks_done_at {
-            // Chunks have drained through the step stream; the remaining
-            // first-token wait is per-request overhead that holds no step
-            // budget, so the next prefill's chunks may start.
             1
         } else {
             // Cached prompt tokens are never recomputed, so they consume no
@@ -476,16 +459,9 @@ type PullCompletion = (String, Result<u64>);
 #[derive(Debug, Clone, Copy)]
 struct PrefillWindow {
     start: Instant,
-    /// End of this prefill's chunk compute in the serial step stream. The next backlogged
-    /// admission's chunks start HERE (per-request overhead runs off the step path), so
-    /// full-chunk spans become contiguous under backlog, exactly like the real engine.
     end: Instant,
-    /// End of the budget-saturated FULL chunks' span. A decode token due inside
-    /// [start, full_end) is excluded from those steps and waits the span out - chaining
-    /// into the NEXT window's full span when they touch (the real 240ms+ stacked gaps).
-    /// The trailing partial chunk [full_end, end) shares its step with decodes and
-    /// stalls nothing; a single-chunk prefill has an empty full span.
-    full_end: Instant,
+    /// Chunk-step count: tokens due inside the window slip to chunk boundaries.
+    chunks: u32,
     /// Whether this prefill found the engine already loaded at admission: it queued
     /// behind the stream tail, or the running batch was past the heaviest load real
     /// captures show the engine hiding chunks at (zero decode elongation up to
@@ -990,32 +966,21 @@ impl SimEngine {
                     };
                     let budget = (self.opt.max_num_batched_tokens as usize).max(1);
                     let uncached = active.prompt_len - num_local_cached;
-                    let full_chunk_tokens = (uncached / budget) * budget;
-                    // The chunk stream: this prefill's chunks start where the
-                    // previous admission's chunks END (the per-request overhead
-                    // runs off the step path), so backlogged admissions pack
-                    // their chunk compute back to back. A single-chunk prefill
-                    // shares its step with whatever else is pending and never
-                    // waits; its first token still carries full service.
+                    let chunks = uncached.div_ceil(budget) as u32;
+                    // A single-chunk prefill shares its step with whatever else
+                    // is pending, so it never waits behind the stream tail;
+                    // only multi-chunk prefills own their steps and serialize
+                    // behind each other.
                     let start = match self.prefill_busy.back() {
-                        Some(w) if full_chunk_tokens > 0 && w.end > now => w.end,
+                        Some(w) if chunks > 1 && w.end > now => w.end,
                         _ => now,
                     };
-                    let occupancy = self
-                        .latency
-                        .prefill_occupancy(uncached)
-                        .unwrap_or(active.prefill_service)
-                        .min(active.prefill_service)
-                        .div_f64(time_scale);
-                    let end = start + occupancy;
-                    let full_end =
-                        start + occupancy.mul_f64(full_chunk_tokens as f64 / uncached as f64);
+                    let end = start + active.prefill_service.div_f64(time_scale);
                     active.next_at += start.saturating_duration_since(now);
-                    active.prefill_chunks_done_at = end;
                     self.prefill_busy.push_back(PrefillWindow {
                         start,
                         end,
-                        full_end,
+                        chunks,
                         stalls_decodes: start > now || num_running > CHUNK_HIDING_MAX_RUNNING,
                     });
                 }
@@ -1073,11 +1038,10 @@ impl SimEngine {
     fn scheduled_token_demand(&self) -> usize {
         let threshold = self.opt.long_prefill_token_threshold as usize;
         let budget = self.opt.max_num_batched_tokens as usize;
-        let now = Instant::now();
         let active: usize = self
             .active_requests
             .values()
-            .map(|request| request.token_demand(threshold, budget, now))
+            .map(|request| request.token_demand(threshold, budget))
             .sum();
         let pending: usize = self
             .pending_pulls
@@ -1234,17 +1198,20 @@ impl SimEngine {
                 let due = request.next_at + gap.div_f64(time_scale);
                 let mut next = due;
                 for w in &self.prefill_busy {
-                    if w.full_end <= next {
+                    if w.end <= due {
                         continue;
                     }
-                    if w.start > next {
+                    if w.start >= due {
                         break;
                     }
                     if w.stalls_decodes {
-                        next = w.full_end;
-                    } else {
-                        break;
+                        let dur = w.end.duration_since(w.start).as_secs_f64();
+                        let into = due.duration_since(w.start).as_secs_f64();
+                        let n = w.chunks.max(1) as f64;
+                        let boundary = (into / dur * n).ceil().clamp(1.0, n);
+                        next = w.start + Duration::from_secs_f64(dur * boundary / n);
                     }
+                    break;
                 }
                 request.next_at = next;
             }
@@ -1996,9 +1963,6 @@ mod tests {
         let mut opt = test_opt();
         opt.max_num_seqs = 100; // plenty of seq slots; the token budget is the binding limit
         opt.max_num_batched_tokens = 20;
-        // Nonzero prefill time so chunks are still draining while we assert:
-        // budget releases at chunk completion, and instant chunks hold none.
-        opt.time_to_first_token = 1_000;
         let (mut engine, mut rx) = test_engine(opt);
 
         // Each prefilling request demands half its 10 prompt tokens (chunk
@@ -2022,11 +1986,10 @@ mod tests {
         for i in 0..5 {
             submit(&mut engine, &mut rx, request(&format!("r{i}"), 10, 50));
         }
-        // Instant chunks (zero-latency model) hold no budget, so all five admit.
-        assert_eq!(engine.active_requests.len(), 5);
+        assert_eq!(engine.active_requests.len(), 4);
 
-        // One step: the prefilling requests emit their first token (instant model) and
-        // become decoders (demand 1 each); everything keeps fitting.
+        // One step: the four prefilling requests emit their first token (instant model) and
+        // become decoders (demand 1 each), freeing budget to admit the last from the queue.
         engine.step();
         assert!(engine.active_requests.len() > 4);
         assert!(engine.waiting.is_empty());
