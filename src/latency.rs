@@ -30,10 +30,102 @@ pub struct FirstTokenCtx {
     pub num_running: u64,
 }
 
+/// Per-request decode pacing state, owned by the engine alongside the request.
+///
+/// For hierarchical models (trace replay) this pins the request to one source
+/// "donor" request per concurrency bucket, so consecutive gaps stay correlated
+/// the way real decode gaps are (a slow request is slow throughout). Stateless
+/// models ignore it.
+#[derive(Debug, Clone)]
+pub struct DecodePacing {
+    /// Chosen donor index per concurrency bucket, lazily picked on first use.
+    donors: [Option<u32>; NUM_CONCURRENCY_BUCKETS],
+    /// Prefill interference noted by the engine since this request's last gap
+    /// draw: prompt tokens of a request admitted to prefill. Consumed by the
+    /// next draw, which samples the stall distribution instead of the clean one.
+    pending_stall: Option<u32>,
+    /// Prompt bucket of this request's full context, conditioning decode gaps
+    /// on KV depth (attention over a long context slows every step).
+    context_bucket: usize,
+    /// This request's decode regime (see [`Churn`]).
+    churn: Churn,
+}
+
+impl DecodePacing {
+    /// Pacing state for a request whose full context is `prompt_tokens` long,
+    /// decoding under the given churn regime.
+    pub fn for_prompt(prompt_tokens: usize, churn: Churn) -> Self {
+        Self {
+            context_bucket: prompt_bucket(prompt_tokens),
+            churn,
+            ..Self::default()
+        }
+    }
+
+    /// Note that the engine admitted a prefill of `prompt_tokens` while this
+    /// request decodes. A real prefill blocks one engine step, spiking exactly
+    /// one gap per concurrent decode request, so the flag is consumed by a
+    /// single draw. Multiple admissions before the next draw keep the largest.
+    pub fn note_prefill(&mut self, prompt_tokens: u32) {
+        self.pending_stall = Some(self.pending_stall.unwrap_or(0).max(prompt_tokens));
+    }
+
+    /// Context bucket this request's decode gaps are conditioned on.
+    pub fn context_bucket(&self) -> usize {
+        self.context_bucket
+    }
+}
+
+impl Default for DecodePacing {
+    fn default() -> Self {
+        Self {
+            donors: [None; NUM_CONCURRENCY_BUCKETS],
+            pending_stall: None,
+            context_bucket: 0,
+            churn: Churn::Calm,
+        }
+    }
+}
+
 /// Strategy for pacing token emission (TTFT and inter-token delays).
 pub trait LatencyModel: Send {
     fn first_token_delay(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration;
     fn inter_token_delay(&self, rng: &mut StdRng, num_running: u64) -> Duration;
+
+    /// Inter-token delay with per-request pacing state. Stateless models fall
+    /// back to the marginal distribution; hierarchical models use `pacing` to
+    /// keep a request's gaps internally correlated.
+    fn paced_inter_token_delay(
+        &self,
+        rng: &mut StdRng,
+        num_running: u64,
+        _pacing: &mut DecodePacing,
+    ) -> Duration {
+        self.inter_token_delay(rng, num_running)
+    }
+
+    /// Step-time cost of `chunk_tokens` prefill tokens starting at `kv_depth`
+    /// tokens already in KV (attention makes deep chunks cost more per token).
+    /// This is what elongates co-running decodes' gaps. Zero for models that
+    /// account prefill entirely in `first_token_overhead`.
+    fn prefill_chunk_cost(&self, _chunk_tokens: usize, _kv_depth: usize) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Cost floor for steps whose chunks saturate the token budget: real
+    /// engines pay a premium past the per-token law on max-shape steps. Zero
+    /// disables the floor.
+    fn budget_full_chunk_floor(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Per-request first-token cost beyond the chunk compute that rode the
+    /// step stream. Delays the request's own emissions; never blocks the step
+    /// clock. Defaults to the full first-token delay for models whose prefill
+    /// does not touch the step stream.
+    fn first_token_overhead(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
+        self.first_token_delay(rng, ctx)
+    }
 }
 
 /// All timing knobs, in milliseconds (except the unitless `time_factor_under_load`).
@@ -126,7 +218,7 @@ fn scale(millis: u64, load: f64) -> u64 {
 
 /// Sample a normal deviate via the Box-Muller transform. Returns `mean` exactly when
 /// `stddev == 0` (matching upstream, and keeping the zero-config path deterministic).
-fn random_norm(rng: &mut StdRng, mean: f64, stddev: f64) -> f64 {
+pub(crate) fn random_norm(rng: &mut StdRng, mean: f64, stddev: f64) -> f64 {
     if stddev == 0.0 {
         return mean;
     }
@@ -163,11 +255,904 @@ impl LatencyModel for FixedLatency {
     }
 }
 
+use crate::trace::{TraceMeta, TraceRecord};
+
+/// Prompt-token bucket edges (powers of two). A value `v` falls into bucket `i` where
+/// `PROMPT_EDGES[i] <= v < PROMPT_EDGES[i+1]`. The last bucket is uncapped.
+const PROMPT_EDGES: &[usize] = &[0, 65, 129, 257, 513, 1025, 2049, 4097, 8193, 16385, 32769];
+
+/// Prefill admissions above this size mark big-chunk churn: their steps
+/// saturate the batched-token budget and wipe cache residency for the decodes
+/// riding alongside (half the capture's 8192-token budget).
+pub const BIG_CHUNK_TOKENS: u32 = 4096;
+
+/// Decode regime of a running batch or a trace record. Under big-chunk churn,
+/// frequent budget-scale prefill admissions wipe cache residency, and decode
+/// between the stalls runs measurably slower than in a calm batch at the same
+/// context, concurrency and cache-coldness. Donors are conditioned on the
+/// same property of their source records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Churn {
+    #[default]
+    Calm,
+    BigChunk,
+}
+
+impl Churn {
+    /// Donor-cell offset: churn cells occupy the upper half of the context table.
+    fn cell_offset(self) -> usize {
+        match self {
+            Churn::Calm => 0,
+            Churn::BigChunk => NUM_PROMPT_BUCKETS,
+        }
+    }
+}
+
+/// Classify a trace record's decode regime: big-chunk churn when more than 6%
+/// of its gaps carry budget-scale admission marks. Steady sweep cells reach
+/// 3-5% with a calm decode baseline, so the cut sits above them.
+pub fn record_churn(record: &TraceRecord) -> Churn {
+    let under_churn = record
+        .itl_ctx
+        .as_ref()
+        .map(|ctx| {
+            let big = ctx
+                .prefill_tokens
+                .iter()
+                .filter(|&&t| t > BIG_CHUNK_TOKENS)
+                .count();
+            big * 100 > ctx.prefill_tokens.len().max(1) * 6
+        })
+        .unwrap_or(false);
+    if under_churn {
+        Churn::BigChunk
+    } else {
+        Churn::Calm
+    }
+}
+
+/// Number of prompt buckets (one per interval between edges, plus the uncapped tail).
+const NUM_PROMPT_BUCKETS: usize = PROMPT_EDGES.len();
+
+/// Map an uncached prompt token count to a bucket index.
+pub fn prompt_bucket(uncached_prompt_tokens: usize) -> usize {
+    // Find the last edge the value is >= to.
+    let mut bucket = 0;
+    for (i, &edge) in PROMPT_EDGES.iter().enumerate() {
+        if uncached_prompt_tokens >= edge {
+            bucket = i;
+        } else {
+            break;
+        }
+    }
+    bucket
+}
+
+/// Concurrency bucket boundaries. A concurrency value maps to the first range it fits in.
+/// 5-8 splits at 6|7 so a c8 constant-load capture cell does not donate decode gaps to
+/// 5-6-concurrency replay draws: one extra running request is a visible step-cost change
+/// at small batch sizes, and blended donors land between the two regimes' distributions.
+pub const CONCURRENCY_RANGES: &[(u64, u64)] = &[
+    (1, 1),
+    (2, 4),
+    (5, 6),
+    (7, 8),
+    (9, 16),
+    (17, 32),
+    (33, 64),
+    (65, u64::MAX),
+];
+
+pub const NUM_CONCURRENCY_BUCKETS: usize = 8;
+
+pub fn concurrency_bucket(concurrency: u64) -> usize {
+    for (i, &(lo, hi)) in CONCURRENCY_RANGES.iter().enumerate() {
+        if concurrency >= lo && concurrency <= hi {
+            return i;
+        }
+    }
+    NUM_CONCURRENCY_BUCKETS - 1
+}
+
+/// Human-readable label for a concurrency bucket index: "1", "2-4", "65+".
+pub fn concurrency_label(bucket: usize) -> String {
+    match CONCURRENCY_RANGES.get(bucket) {
+        Some(&(lo, hi)) if hi == u64::MAX => format!("{lo}+"),
+        Some(&(lo, hi)) if lo == hi => format!("{lo}"),
+        Some(&(lo, hi)) => format!("{lo}-{hi}"),
+        None => format!("bucket-{bucket}"),
+    }
+}
+
+/// One source request's gap distribution, used as a pacing donor.
+#[derive(Debug, Clone)]
+struct Donor {
+    /// The request's own ITL gaps, sorted for inverse-CDF sampling. Summary-only
+    /// records collapse to a single repeated mean.
+    gaps: Vec<f64>,
+}
+
+/// Donor pool with token-count weighting, so the marginal per-token
+/// distribution of hierarchical sampling matches the pooled samples.
+#[derive(Debug, Clone, Default)]
+struct DonorBucket {
+    donors: Vec<Donor>,
+    /// Cumulative token-count weights aligned with `donors`.
+    cum_weights: Vec<f64>,
+}
+
+impl DonorBucket {
+    fn push(&mut self, donor: Donor, weight: f64) {
+        let total = self.cum_weights.last().copied().unwrap_or(0.0);
+        self.donors.push(donor);
+        self.cum_weights.push(total + weight);
+    }
+
+    /// Pick a donor index, weighted by token count.
+    fn pick(&self, rng: &mut StdRng) -> usize {
+        debug_assert!(!self.donors.is_empty());
+        let total = self.cum_weights.last().copied().unwrap_or(0.0);
+        let u: f64 = rng.random::<f64>() * total;
+        self.cum_weights
+            .partition_point(|&w| w <= u)
+            .min(self.donors.len() - 1)
+    }
+}
+
+/// First-token service-time samples for one uncached-prompt bucket: the
+/// observations from the bucket's lowest captured concurrency, where the queue
+/// behind them was empty (or as close to it as the capture got).
+#[derive(Debug, Clone)]
+struct ServiceCell {
+    /// Sorted TTFT samples (ms) from the lowest-concurrency observations.
+    samples: Vec<f64>,
+    /// Median uncached prompt tokens behind those samples, the anchor for
+    /// linear-in-tokens scaling when another bucket borrows them.
+    median_uncached: f64,
+}
+
+/// Parametric prefill service curve `T(u) = a + b*u + c*u^2` (ms, u = uncached
+/// prompt tokens), least-squares fitted to p10-TTFT floors of sliding token
+/// windows over the trace's lowest-concurrency records. The low percentile
+/// approximates pure service (a request that never queued); the quadratic term
+/// carries the attention cost that a linear token ratio misses. `floor_ms`
+/// (the smallest window floor seen) clamps the curve so extrapolation below
+/// the captured range cannot dip under the kernel-launch + sampling floor.
+#[derive(Debug, Clone, Copy)]
+struct ServiceFit {
+    a: f64,
+    b: f64,
+    c: f64,
+    floor_ms: f64,
+}
+
+impl ServiceFit {
+    fn eval_ms(&self, uncached: f64) -> f64 {
+        (self.a + self.b * uncached + self.c * uncached * uncached).max(self.floor_ms)
+    }
+}
+
+/// p10 floor and median token count of one sliding window of (uncached, ttft)
+/// observations, plus its sample count for weighting.
+struct ServiceWindow {
+    u: f64,
+    p10_ms: f64,
+    count: usize,
+}
+
+/// Slice lowest-concurrency observations into sliding token windows and take
+/// each window's p10 TTFT as a service-floor point.
+fn service_windows(obs: &[(f64, f64)]) -> Vec<ServiceWindow> {
+    const WIDTH: f64 = 600.0;
+    const STRIDE: f64 = 400.0;
+    const MIN_OBS: usize = 5;
+    let mut windows = Vec::new();
+    let Some(&(first_u, _)) = obs.first() else {
+        return windows;
+    };
+    let Some(&(last_u, _)) = obs.last() else {
+        return windows;
+    };
+    let mut lo = first_u;
+    while lo <= last_u {
+        let hi = lo + WIDTH;
+        let start = obs.partition_point(|&(u, _)| u < lo);
+        let end = obs.partition_point(|&(u, _)| u < hi);
+        let slice = &obs[start..end];
+        if slice.len() >= MIN_OBS {
+            let mut ttfts: Vec<f64> = slice.iter().map(|&(_, t)| t).collect();
+            ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p10 = ttfts[ttfts.len() / 10];
+            windows.push(ServiceWindow {
+                u: slice[slice.len() / 2].0,
+                p10_ms: p10,
+                count: slice.len(),
+            });
+        }
+        lo += STRIDE;
+    }
+    windows
+}
+
+/// Weighted least squares for `y = a + b*u + c*u^2` over window floors
+/// (weight = sqrt(count)). Falls back to the linear fit when the quadratic
+/// normal equations are degenerate (fewer than 4 windows or a singular
+/// system), and to `None` when even a line is unsupported; callers then keep
+/// the per-bucket sampling path. Negative-curvature fits that would bend the
+/// curve downward inside the observed range also fall back to linear: service
+/// time cannot shrink as prompts grow.
+fn fit_service_curve(windows: &[ServiceWindow]) -> Option<ServiceFit> {
+    let floor_ms = windows
+        .iter()
+        .map(|w| w.p10_ms)
+        .fold(f64::INFINITY, f64::min);
+    if !floor_ms.is_finite() {
+        return None;
+    }
+    let u_max = windows.iter().map(|w| w.u).fold(0.0, f64::max);
+
+    if windows.len() >= 4
+        && let Some([a, b, c]) = solve_weighted_poly::<3>(windows)
+        && c >= 0.0
+        && b + 2.0 * c * u_max >= 0.0
+    {
+        return Some(ServiceFit { a, b, c, floor_ms });
+    }
+    if windows.len() >= 2
+        && let Some([a, b]) = solve_weighted_poly::<2>(windows)
+        && b >= 0.0
+    {
+        return Some(ServiceFit {
+            a,
+            b,
+            c: 0.0,
+            floor_ms,
+        });
+    }
+    None
+}
+
+/// Solve the DEG-term weighted polynomial normal equations by Gaussian
+/// elimination with partial pivoting. Returns `None` on a singular system.
+fn solve_weighted_poly<const DEG: usize>(windows: &[ServiceWindow]) -> Option<[f64; DEG]> {
+    let mut a = [[0.0f64; DEG]; DEG];
+    let mut rhs = [0.0f64; DEG];
+    for w in windows {
+        let weight = (w.count as f64).sqrt();
+        let mut powers = [1.0f64; DEG];
+        for k in 1..DEG {
+            powers[k] = powers[k - 1] * w.u;
+        }
+        for i in 0..DEG {
+            for j in 0..DEG {
+                a[i][j] += weight * powers[i] * powers[j];
+            }
+            rhs[i] += weight * powers[i] * w.p10_ms;
+        }
+    }
+    // Gaussian elimination with partial pivoting.
+    for col in 0..DEG {
+        let pivot = (col..DEG).max_by(|&x, &y| {
+            a[x][col]
+                .abs()
+                .partial_cmp(&a[y][col].abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        if a[pivot][col].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(col, pivot);
+        rhs.swap(col, pivot);
+        let pivot_row = a[col];
+        for row in (col + 1)..DEG {
+            let factor = a[row][col] / pivot_row[col];
+            for (k, &p) in pivot_row.iter().enumerate().skip(col) {
+                a[row][k] -= factor * p;
+            }
+            rhs[row] -= factor * rhs[col];
+        }
+    }
+    let mut out = [0.0f64; DEG];
+    for col in (0..DEG).rev() {
+        let mut acc = rhs[col];
+        for k in (col + 1)..DEG {
+            acc -= a[col][k] * out[k];
+        }
+        out[col] = acc / a[col][col];
+    }
+    Some(out)
+}
+
+/// Depth-dependent chunk step cost `c0*tokens + c1*(d1^2 - d0^2)/2` (ms) for
+/// a chunk computing prompt positions `d0..d1`. Drives `prefill_chunk_cost`.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChunkCostFit {
+    /// Per-token compute (ms/token).
+    c0: f64,
+    /// Per-token-per-KV-depth attention cost (ms/token/position).
+    c1: f64,
+}
+
+impl ChunkCostFit {
+    fn eval_ms(&self, chunk_tokens: usize, kv_depth: usize) -> f64 {
+        let t = chunk_tokens as f64;
+        let d0 = kv_depth as f64;
+        let d1 = d0 + t;
+        self.c0 * t + self.c1 * (d1 * d1 - d0 * d0) / 2.0
+    }
+}
+
+/// Fit `ChunkCostFit` from prefill-admission marks. The tap marks the step
+/// that emitted a request's first token, i.e. the prompt's FINAL chunk
+/// (tap.rs `step_prefill_tokens`). Only isolated marks count (another mark
+/// within two gaps means stacked chunks), and an iteratively trimmed least
+/// squares rejects residual stacking. Zero fit when the trace is too sparse;
+/// `first_token_overhead` then carries the whole first-token delay.
+fn fit_chunk_cost(records: &[TraceRecord], budget: usize) -> ChunkCostFit {
+    let budget = budget.max(1);
+    // (tokens, depth_integral, surcharge_ms)
+    let mut obs: Vec<(f64, f64, f64)> = Vec::new();
+    for record in records {
+        let (Some(itls), Some(ctx)) = (&record.itl_ms, &record.itl_ctx) else {
+            continue;
+        };
+        let marks = &ctx.prefill_tokens;
+        if marks.len() != itls.len() {
+            continue;
+        }
+        let mut clean: Vec<f64> = itls
+            .iter()
+            .zip(marks)
+            .filter(|&(_, &m)| m == 0)
+            .map(|(&g, _)| g)
+            .collect();
+        if clean.len() < 5 {
+            continue;
+        }
+        clean.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let base = clean[clean.len() / 2];
+        for (i, (&gap, &mark)) in itls.iter().zip(marks).enumerate() {
+            let prompt = mark as usize;
+            if prompt == 0 {
+                continue;
+            }
+            let final_chunk = ((prompt - 1) % budget) + 1;
+            if final_chunk < 256 {
+                continue;
+            }
+            let lo = i.saturating_sub(2);
+            let hi = (i + 3).min(marks.len());
+            if (lo..hi).any(|j| j != i && marks[j] > 0) {
+                continue;
+            }
+            let d1 = prompt as f64;
+            let d0 = (prompt - final_chunk) as f64;
+            obs.push((
+                final_chunk as f64,
+                (d1 * d1 - d0 * d0) / 2.0,
+                (gap - base).max(0.0),
+            ));
+        }
+    }
+
+    const MIN_OBS: usize = 30;
+    let lstsq2 = |obs: &[(f64, f64, f64)]| -> Option<(f64, f64)> {
+        let (mut saa, mut sab, mut sbb, mut say, mut sby) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for &(a, b, y) in obs {
+            saa += a * a;
+            sab += a * b;
+            sbb += b * b;
+            say += a * y;
+            sby += b * y;
+        }
+        let det = saa * sbb - sab * sab;
+        if det.abs() < 1e-9 {
+            return None;
+        }
+        Some(((sbb * say - sab * sby) / det, (saa * sby - sab * say) / det))
+    };
+
+    let mut kept = obs;
+    let mut fit = (0.0, 0.0);
+    for _ in 0..4 {
+        if kept.len() < MIN_OBS {
+            return ChunkCostFit::default();
+        }
+        let Some(round) = lstsq2(&kept) else {
+            return ChunkCostFit::default();
+        };
+        fit = round;
+        let mut scored: Vec<(f64, (f64, f64, f64))> = kept
+            .into_iter()
+            .map(|o| ((fit.0 * o.0 + fit.1 * o.1 - o.2).abs(), o))
+            .collect();
+        scored.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(scored.len() * 4 / 5);
+        kept = scored.into_iter().map(|(_, o)| o).collect();
+    }
+    let (c0, c1) = fit;
+    if c0 < 0.0 || c1 < 0.0 {
+        // A negative term means the mark mixture defeated the trim; refuse
+        // rather than model chunks that speed steps up.
+        return ChunkCostFit::default();
+    }
+    ChunkCostFit { c0, c1 }
+}
+
+/// Median surcharge of unmarked gaps within 0.8x-2.5x of the law's own
+/// full-budget prediction: the budget-saturated chunk steps the tap never
+/// marks. The window anchors to the law, not the decode base, so it stays
+/// valid across models. 0.0 with too few observations or no chunk fit.
+fn fit_full_step_floor(records: &[TraceRecord], chunk_cost: &ChunkCostFit, budget: usize) -> f64 {
+    let law_full = chunk_cost.eval_ms(budget.max(1), 0);
+    if law_full <= 0.0 {
+        return 0.0;
+    }
+    let (lo, hi) = (0.8 * law_full, 2.5 * law_full);
+    let mut obs: Vec<f64> = Vec::new();
+    for record in records {
+        let (Some(itls), Some(ctx)) = (&record.itl_ms, &record.itl_ctx) else {
+            continue;
+        };
+        let marks = &ctx.prefill_tokens;
+        if marks.len() != itls.len() {
+            continue;
+        }
+        let mut clean: Vec<f64> = itls
+            .iter()
+            .zip(marks)
+            .filter(|&(_, &m)| m == 0)
+            .map(|(&g, _)| g)
+            .collect();
+        if clean.len() < 5 {
+            continue;
+        }
+        clean.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let base = clean[clean.len() / 2];
+        obs.extend(
+            itls.iter()
+                .zip(marks)
+                .filter(|&(&g, &m)| m == 0 && (lo..=hi).contains(&(g - base)))
+                .map(|(&g, _)| g - base),
+        );
+    }
+    if obs.len() < 30 {
+        return 0.0;
+    }
+    obs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    obs[obs.len() / 2]
+}
+
+/// Replay latency model fit from recorded observations.
+///
+/// The decomposition matters: `first_token_delay` is prefill SERVICE time
+/// (fit from each prompt bucket's lowest-concurrency captures, where TTFT
+/// carries no queueing), and all waiting comes from the simulated scheduler
+/// (admission against the batched-token budget, prefill stalls on concurrent
+/// decodes). Fitting raw loaded TTFTs as the park time double-counts the
+/// queue: the sample embeds the capture's queueing and the sim queues again
+/// on top, which is exactly how the H200 counterfactual validation failed.
+///
+/// Decode gaps are conditioned on (context bucket, concurrency bucket):
+/// attention over a long context slows every step, so an 11k-context decode
+/// must not draw gaps captured at 800 tokens. Prefill-interference stalls are
+/// conditioned on the admitted chunk's size bucket for the same reason.
+pub struct TraceLatency {
+    /// Parametric service curve fitted across all prompt sizes; the primary
+    /// first-token model when the trace supports it (see `ServiceFit`).
+    service_fit: Option<ServiceFit>,
+    /// First-token service time per uncached-prompt bucket. Fallback when the
+    /// trace is too sparse to fit a service curve.
+    service_by_prompt: Vec<Option<ServiceCell>>,
+    /// Pooled ITL samples per concurrency bucket (marginal fallback for
+    /// un-paced callers).
+    itl_by_concurrency: Vec<Vec<f64>>,
+    /// Per-request donor pools, indexed by [context bucket][concurrency bucket].
+    /// When the trace carries `itl_ctx`, donors hold only CLEAN gaps; the
+    /// prefill-interfered gaps feed `stalls_grid`.
+    donors_grid: Vec<Vec<DonorBucket>>,
+    /// Sorted prefill-interfered gap samples, indexed by
+    /// [prefill-size bucket][concurrency bucket], drawn when the engine notes
+    /// a prefill admission on the request's pacing state. Empty for traces
+    /// without `itl_ctx`.
+    stalls_grid: Vec<Vec<Vec<f64>>>,
+    /// Fallback for do_remote_prefill KV-transfer timing (the trace does not record
+    /// transfer latencies from disaggregated decode pulls).
+    kv_transfer_fallback: KnobLatency,
+    /// Depth-dependent chunk step cost; see `fit_chunk_cost`.
+    chunk_cost: ChunkCostFit,
+    /// Budget-saturated step premium; see `fit_full_step_floor`.
+    full_step_floor_ms: f64,
+    /// The capture's per-step token budget; chunk-step charging in
+    /// `first_token_overhead` mirrors the engine's chunking against it.
+    budget_tokens: usize,
+    #[allow(dead_code)]
+    meta: TraceMeta,
+}
+
+impl TraceLatency {
+    /// Build from parsed trace records. `max_batched_tokens` must match the
+    /// capture's per-step token budget (chunk sizes are derived from it).
+    /// Returns an error if the trace has no records or no decode-pacing data.
+    pub fn from_records(
+        meta: TraceMeta,
+        records: &[TraceRecord],
+        kv_transfer_fallback: KnobLatency,
+        max_batched_tokens: usize,
+    ) -> anyhow::Result<Self> {
+        if records.is_empty() {
+            anyhow::bail!("trace has no records; cannot build a replay latency model");
+        }
+
+        // Per uncached-prompt bucket: (concurrency bucket, uncached tokens, ttft).
+        let mut ttft_obs: Vec<Vec<(usize, f64, f64)>> = vec![Vec::new(); NUM_PROMPT_BUCKETS];
+        // Donor cells double along the prompt axis: calm batches in the
+        // first half, big-chunk-churn workloads in the second.
+        let mut donors_grid =
+            vec![vec![DonorBucket::default(); NUM_CONCURRENCY_BUCKETS]; 2 * NUM_PROMPT_BUCKETS];
+        let mut stalls_grid = vec![vec![Vec::new(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
+        let mut itl_by_concurrency = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
+
+        for record in records {
+            let uncached = record.prompt_tokens.saturating_sub(record.cached_tokens);
+            let upb = prompt_bucket(uncached);
+            // Decode cost scales with the FULL context the step attends over,
+            // cached or not - and decode under big-chunk churn runs slower
+            // than calm decode at the same context, so churn records donate
+            // to separate cells. A record decodes under churn when a few
+            // percent of its gaps carry budget-scale admission marks (sweep
+            // cells sit under 1%, churn captures around 8%).
+            let churn = record_churn(record);
+            let ctx_pb = prompt_bucket(record.prompt_tokens) + churn.cell_offset();
+            let cb = concurrency_bucket(record.concurrency);
+
+            ttft_obs[upb].push((cb, uncached.max(1) as f64, record.ttft_ms));
+
+            if let Some(itls) = &record.itl_ms {
+                if !itls.is_empty() {
+                    itl_by_concurrency[cb].extend(itls.iter().copied());
+                    let mut gaps: Vec<f64> = match &record.itl_ctx {
+                        Some(ctx) => {
+                            let (stalled, clean): (Vec<usize>, Vec<usize>) =
+                                (0..itls.len()).partition(|&i| ctx.prefill_tokens[i] > 0);
+                            for &i in &stalled {
+                                let ppb = prompt_bucket(ctx.prefill_tokens[i] as usize);
+                                stalls_grid[ppb][cb].push(itls[i]);
+                            }
+                            clean.iter().map(|&i| itls[i]).collect()
+                        }
+                        None => itls.clone(),
+                    };
+                    if !gaps.is_empty() {
+                        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        if record.itl_ctx.is_some() {
+                            // The tap marks only the FIRST gap of a chunked
+                            // prefill, so later chunk steps of the same prefill
+                            // leak into the clean set as huge "clean" gaps.
+                            // Admission now blocks the engine for the prefill's
+                            // service time, so donors must hold genuine decode
+                            // steps only: gaps far past the record's own median
+                            // are mislabeled chunk steps, not decode.
+                            let median = gaps[gaps.len() / 2];
+                            let cut = gaps.partition_point(|&g| g <= 4.0 * median);
+                            gaps.truncate(cut);
+                        }
+                        let weight = gaps.len() as f64;
+                        donors_grid[ctx_pb][cb].push(Donor { gaps }, weight);
+                    }
+                }
+            } else if let Some(summary) = &record.itl_summary
+                && summary.count > 0
+            {
+                for _ in 0..summary.count {
+                    itl_by_concurrency[cb].push(summary.mean_ms);
+                }
+                donors_grid[ctx_pb][cb].push(
+                    Donor {
+                        gaps: vec![summary.mean_ms],
+                    },
+                    summary.count as f64,
+                );
+            }
+        }
+
+        for row in &mut stalls_grid {
+            for cell in row.iter_mut() {
+                cell.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
+        for samples in &mut itl_by_concurrency {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // Service time per bucket: keep only the lowest-concurrency observations.
+        let service_by_prompt: Vec<Option<ServiceCell>> = ttft_obs
+            .into_iter()
+            .map(|obs| {
+                let min_cb = obs.iter().map(|(cb, _, _)| *cb).min()?;
+                let mut samples: Vec<f64> = obs
+                    .iter()
+                    .filter(|(cb, _, _)| *cb == min_cb)
+                    .map(|(_, _, ttft)| *ttft)
+                    .collect();
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mut uncached: Vec<f64> = obs
+                    .iter()
+                    .filter(|(cb, _, _)| *cb == min_cb)
+                    .map(|(_, u, _)| *u)
+                    .collect();
+                uncached.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let median_uncached = uncached[uncached.len() / 2];
+                Some(ServiceCell {
+                    samples,
+                    median_uncached,
+                })
+            })
+            .collect();
+
+        // A trace where every record is a single-token output carries no decode pacing
+        // information; refuse it up front rather than replaying instant inter-token times.
+        if itl_by_concurrency.iter().all(|samples| samples.is_empty()) {
+            anyhow::bail!(
+                "trace contains no inter-token latency data (all records are single-token \
+                 outputs); cannot pace decode from it"
+            );
+        }
+
+        // Service curve: p10 floors of the lowest-concurrency records, all
+        // prompt sizes pooled into one weighted quadratic fit.
+        let min_concurrency = records.iter().map(|r| r.concurrency).min().unwrap_or(0);
+        let mut floor_obs: Vec<(f64, f64)> = records
+            .iter()
+            .filter(|r| r.concurrency == min_concurrency)
+            .map(|r| {
+                let uncached = r.prompt_tokens.saturating_sub(r.cached_tokens);
+                (uncached.max(1) as f64, r.ttft_ms)
+            })
+            .collect();
+        floor_obs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let service_fit = fit_service_curve(&service_windows(&floor_obs));
+
+        let chunk_cost = fit_chunk_cost(records, max_batched_tokens);
+
+        Ok(TraceLatency {
+            service_fit,
+            service_by_prompt,
+            itl_by_concurrency,
+            donors_grid,
+            stalls_grid,
+            kv_transfer_fallback,
+            chunk_cost,
+            full_step_floor_ms: fit_full_step_floor(records, &chunk_cost, max_batched_tokens),
+            budget_tokens: max_batched_tokens.max(1),
+            meta,
+        })
+    }
+}
+
+/// Sample from sorted samples using inverse CDF: draw u in [0,1), interpolate.
+pub(crate) fn sample_inverse_cdf(rng: &mut StdRng, samples: &[f64]) -> f64 {
+    debug_assert!(!samples.is_empty());
+    if samples.len() == 1 {
+        return samples[0];
+    }
+    let u: f64 = rng.random::<f64>();
+    let pos = u * (samples.len() - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = (lo + 1).min(samples.len() - 1);
+    let frac = pos - lo as f64;
+    samples[lo] * (1.0 - frac) + samples[hi] * frac
+}
+
+/// Find the nearest cell with data by Manhattan distance on (prompt bucket,
+/// concurrency bucket) indices, preferring the same prompt bucket on ties.
+/// Returns None only when the whole grid is empty.
+fn nearest_grid_cell<T>(
+    grid: &[Vec<T>],
+    pb: usize,
+    cb: usize,
+    has_data: impl Fn(&T) -> bool,
+) -> Option<&T> {
+    if let Some(cell) = grid.get(pb).and_then(|row| row.get(cb))
+        && has_data(cell)
+    {
+        return Some(cell);
+    }
+    let mut best: Option<(usize, usize, &T)> = None; // (distance, prompt_dist, cell)
+    for (pi, row) in grid.iter().enumerate() {
+        for (ci, cell) in row.iter().enumerate() {
+            if !has_data(cell) {
+                continue;
+            }
+            let pd = pi.abs_diff(pb);
+            let cd = ci.abs_diff(cb);
+            let dist = pd + cd;
+            match best {
+                None => best = Some((dist, pd, cell)),
+                Some((bd, bpd, _)) => {
+                    if dist < bd || (dist == bd && pd < bpd) {
+                        best = Some((dist, pd, cell));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, _, cell)| cell)
+}
+
+/// Find nearest non-empty ITL concurrency bucket.
+fn nearest_itl(itl_by_concurrency: &[Vec<f64>], cb: usize) -> Option<&[f64]> {
+    if !itl_by_concurrency[cb].is_empty() {
+        return Some(&itl_by_concurrency[cb]);
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for (ci, samples) in itl_by_concurrency.iter().enumerate() {
+        if samples.is_empty() {
+            continue;
+        }
+        let dist = ci.abs_diff(cb);
+        match best {
+            None => best = Some((dist, ci)),
+            Some((bd, _)) if dist < bd => best = Some((dist, ci)),
+            _ => {}
+        }
+    }
+    best.map(|(_, ci)| itl_by_concurrency[ci].as_slice())
+}
+
+impl LatencyModel for TraceLatency {
+    /// Prefill SERVICE time only: queueing is the simulated scheduler's job.
+    /// The fitted curve `T(u) = a + b*u + c*u^2` over lowest-concurrency p10
+    /// floors is the primary model (the quadratic term carries the attention
+    /// cost; the floor clamp the kernel-launch minimum). Traces too sparse to
+    /// fit fall back to per-bucket sampling from the nearest prompt bucket's
+    /// lowest-concurrency observations, scaled by the token ratio when
+    /// borrowed across buckets; the clamp keeps a sparse fit from exploding a
+    /// sample.
+    fn first_token_delay(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
+        if ctx.do_remote_prefill {
+            return self.kv_transfer_fallback.first_token_delay(rng, ctx);
+        }
+
+        let uncached = ctx.num_prompt_tokens.saturating_sub(ctx.num_cached_tokens);
+        if let Some(fit) = &self.service_fit {
+            return Duration::from_secs_f64(fit.eval_ms(uncached.max(1) as f64) / 1000.0);
+        }
+        let pb = prompt_bucket(uncached);
+
+        let mut best: Option<(usize, &ServiceCell)> = None;
+        for (pi, cell) in self.service_by_prompt.iter().enumerate() {
+            let Some(cell) = cell else { continue };
+            let dist = pi.abs_diff(pb);
+            match best {
+                None => best = Some((dist, cell)),
+                Some((bd, _)) if dist < bd => best = Some((dist, cell)),
+                _ => {}
+            }
+        }
+        // from_records rejects empty traces, so some bucket has service data.
+        let Some((dist, cell)) = best else {
+            return Duration::ZERO;
+        };
+        // Within the request's own bucket, draw verbatim (reproduces the
+        // capture exactly); only borrowed buckets get the token-ratio scaling.
+        let ms = sample_inverse_cdf(rng, &cell.samples);
+        let scale = if dist > 0 && cell.median_uncached > 0.0 {
+            ((uncached.max(1) as f64) / cell.median_uncached).clamp(0.25, 8.0)
+        } else {
+            1.0
+        };
+        Duration::from_secs_f64(ms * scale / 1000.0)
+    }
+
+    fn inter_token_delay(&self, rng: &mut StdRng, num_running: u64) -> Duration {
+        let cb = concurrency_bucket(num_running);
+        // from_records rejects traces with no ITL data, so some bucket is non-empty.
+        let Some(samples) = nearest_itl(&self.itl_by_concurrency, cb) else {
+            return Duration::ZERO;
+        };
+        let ms = sample_inverse_cdf(rng, samples);
+        Duration::from_secs_f64(ms / 1000.0)
+    }
+
+    /// Hierarchical sampling conditioned on (context bucket, concurrency
+    /// bucket): pin the request to one source request ("donor") per
+    /// concurrency bucket, picked token-count-weighted on first use, then draw
+    /// gaps from that donor's own distribution. Within-request correlation
+    /// matches the source (a slow request stays slow), so per-request decode
+    /// totals reproduce instead of concentrating around the grand mean.
+    fn paced_inter_token_delay(
+        &self,
+        rng: &mut StdRng,
+        num_running: u64,
+        pacing: &mut DecodePacing,
+    ) -> Duration {
+        let cb = concurrency_bucket(num_running);
+
+        // A prefill admission noted by the engine spikes exactly one gap: draw
+        // it from the recorded stall distribution nearest the admitted chunk's
+        // size bucket. Without itl_ctx data the flag falls through to the clean
+        // path, whose donor gaps still contain the stalls.
+        if let Some(prefill_tokens) = pacing.pending_stall.take() {
+            let ppb = prompt_bucket(prefill_tokens as usize);
+            if let Some(stalls) =
+                nearest_grid_cell(&self.stalls_grid, ppb, cb, |cell: &Vec<f64>| {
+                    !cell.is_empty()
+                })
+            {
+                let ms = sample_inverse_cdf(rng, stalls);
+                return Duration::from_secs_f64(ms / 1000.0);
+            }
+        }
+
+        // The resolved cell is deterministic for a given (context, cb), so the
+        // cached donor index below always refers to the same pool. Churning
+        // requests index the grid's second half; the nearest-cell fallback
+        // stays within a half unless it is entirely empty (cross-half index
+        // distance exceeds any within-half distance).
+        let ctx_index = pacing.context_bucket + pacing.churn.cell_offset();
+        let Some(bucket) =
+            nearest_grid_cell(&self.donors_grid, ctx_index, cb, |cell: &DonorBucket| {
+                !cell.donors.is_empty()
+            })
+        else {
+            return self.inter_token_delay(rng, num_running);
+        };
+        let donor_idx = match pacing.donors[cb] {
+            Some(idx) => idx as usize,
+            None => {
+                let idx = bucket.pick(rng);
+                pacing.donors[cb] = Some(idx as u32);
+                idx
+            }
+        };
+        let ms = sample_inverse_cdf(rng, &bucket.donors[donor_idx].gaps);
+        Duration::from_secs_f64(ms / 1000.0)
+    }
+
+    fn budget_full_chunk_floor(&self) -> Duration {
+        Duration::from_secs_f64(self.full_step_floor_ms / 1000.0)
+    }
+
+    fn prefill_chunk_cost(&self, chunk_tokens: usize, kv_depth: usize) -> Duration {
+        Duration::from_secs_f64(self.chunk_cost.eval_ms(chunk_tokens, kv_depth).max(0.0) / 1000.0)
+    }
+
+    /// The fitted service curve minus what the step stream charges an
+    /// isolated request (full chunks pay the saturated-step premium, the
+    /// final partial pays the law) - the chunking `T(u)` was fitted under,
+    /// so isolated TTFT == T(u) by construction. A loaded drain step charging
+    /// the decode base instead is real added latency, not double-counted.
+    fn first_token_overhead(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
+        let total = self.first_token_delay(rng, ctx);
+        if ctx.do_remote_prefill {
+            return total;
+        }
+        let mut left = ctx
+            .num_prompt_tokens
+            .saturating_sub(ctx.num_cached_tokens)
+            .max(1);
+        let mut depth = ctx.num_cached_tokens;
+        let mut charged = Duration::ZERO;
+        while left > self.budget_tokens {
+            charged += self
+                .prefill_chunk_cost(self.budget_tokens, depth)
+                .max(self.budget_full_chunk_floor());
+            depth += self.budget_tokens;
+            left -= self.budget_tokens;
+        }
+        charged += self.prefill_chunk_cost(left, depth);
+        total.saturating_sub(charged)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng as _;
 
-    use crate::latency::{FirstTokenCtx, KnobLatency, LatencyModel, random_norm_truncated};
+    use crate::latency::{
+        DecodePacing, FirstTokenCtx, KnobLatency, LatencyModel, random_norm_truncated,
+    };
 
     fn model() -> KnobLatency {
         KnobLatency {
@@ -326,5 +1311,525 @@ mod tests {
                 std::time::Duration::from_millis(7),
             );
         }
+    }
+
+    // TraceLatency tests
+
+    use crate::latency::TraceLatency;
+    use crate::trace::{ItlSummary, TraceMeta, TraceRecord};
+
+    /// The synthetic service law used by the curve-fit tests.
+    fn quad_ms(u: f64) -> f64 {
+        20.0 + 0.02 * u + 1.0e-6 * u * u
+    }
+
+    /// Clustered lowest-concurrency records along `quad_ms`: 6 identical
+    /// observations every 700 tokens, so each sliding window holds exactly one
+    /// cluster and the window floor IS the curve value.
+    fn quad_floor_records() -> Vec<TraceRecord> {
+        let mut records = Vec::new();
+        for i in 0..12 {
+            let u = 100 + 700 * i;
+            for _ in 0..6 {
+                records.push(make_record(u, 2, quad_ms(u as f64), vec![10.0], 1));
+            }
+        }
+        records
+    }
+
+    #[test]
+    fn trace_service_fit_recovers_quadratic() {
+        let trace = TraceLatency::from_records(
+            TraceMeta::default(),
+            &quad_floor_records(),
+            zero_knob(),
+            8192,
+        )
+        .unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        // Interpolated and extrapolated points; the fit is deterministic.
+        for u in [500usize, 2_000, 5_000, 7_800, 11_000] {
+            let got = trace
+                .first_token_delay(&mut rng, &ctx(u, 0, false, 1))
+                .as_secs_f64()
+                * 1000.0;
+            let want = quad_ms(u as f64);
+            assert!(
+                (got - want).abs() / want < 0.05,
+                "T({u}) = {got:.1}ms, want ~{want:.1}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_service_fit_ignores_loaded_records() {
+        // Queued observations at higher concurrency must not bend the floor.
+        let mut records = quad_floor_records();
+        for i in 0..12 {
+            let u = 100 + 700 * i;
+            for _ in 0..6 {
+                records.push(make_record(u, 2, quad_ms(u as f64) + 400.0, vec![10.0], 9));
+            }
+        }
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let got = trace
+            .first_token_delay(&mut rng, &ctx(5_000, 0, false, 1))
+            .as_secs_f64()
+            * 1000.0;
+        let want = quad_ms(5_000.0);
+        assert!(
+            (got - want).abs() / want < 0.05,
+            "loaded records leaked into the fit: T(5000) = {got:.1}ms, want ~{want:.1}ms"
+        );
+    }
+
+    #[test]
+    fn trace_service_fit_clamps_to_floor() {
+        let trace = TraceLatency::from_records(
+            TraceMeta::default(),
+            &quad_floor_records(),
+            zero_knob(),
+            8192,
+        )
+        .unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        // u=1: the raw curve sits near its intercept; the clamp keeps the
+        // result at or above the smallest observed window floor.
+        let got = trace
+            .first_token_delay(&mut rng, &ctx(1, 0, false, 1))
+            .as_secs_f64()
+            * 1000.0;
+        let floor = quad_ms(100.0);
+        assert!(
+            got >= floor - 1e-9,
+            "T(1) = {got:.1}ms dipped under the observed floor {floor:.1}ms"
+        );
+    }
+
+    fn zero_knob() -> KnobLatency {
+        model()
+    }
+
+    fn make_record(
+        prompt: usize,
+        output: usize,
+        ttft: f64,
+        itl: Vec<f64>,
+        conc: u64,
+    ) -> TraceRecord {
+        TraceRecord {
+            prompt_tokens: prompt,
+            cached_tokens: 0,
+            output_tokens: output,
+            ttft_ms: ttft,
+            itl_ms: if itl.is_empty() { None } else { Some(itl) },
+            itl_summary: None,
+            concurrency: conc,
+            arrival_ms: None,
+            itl_ctx: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trace_empty_records_is_error() {
+        let result = TraceLatency::from_records(TraceMeta::default(), &[], zero_knob(), 8192);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn trace_constant_ttft_reproduces_exactly() {
+        // All records in the same bucket have the same TTFT; sampling must return it exactly.
+        let records = vec![
+            make_record(50, 2, 42.0, vec![9.0], 1),
+            make_record(60, 1, 42.0, vec![], 1),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        for _ in 0..100 {
+            let d = trace.first_token_delay(&mut rng, &ctx(55, 0, false, 1));
+            assert_eq!(d, std::time::Duration::from_secs_f64(0.042));
+        }
+    }
+
+    #[test]
+    fn trace_samples_stay_within_min_max() {
+        let records = vec![
+            make_record(50, 3, 10.0, vec![5.0, 15.0], 1),
+            make_record(60, 3, 20.0, vec![8.0, 12.0], 1),
+            make_record(40, 3, 15.0, vec![6.0, 10.0], 1),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..1000 {
+            let ttft = trace.first_token_delay(&mut rng, &ctx(50, 0, false, 1));
+            let ms = ttft.as_secs_f64() * 1000.0;
+            assert!(
+                (10.0 - 0.001..=20.0 + 0.001).contains(&ms),
+                "ttft out of range: {ms}"
+            );
+
+            let itl = trace.inter_token_delay(&mut rng, 1);
+            let ms = itl.as_secs_f64() * 1000.0;
+            assert!(
+                (5.0 - 0.001..=15.0 + 0.001).contains(&ms),
+                "itl out of range: {ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_determinism_same_seed() {
+        let records = vec![
+            make_record(100, 5, 25.0, vec![3.0, 4.0, 5.0, 6.0], 2),
+            make_record(120, 3, 35.0, vec![7.0, 8.0], 2),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+
+        let run = |seed: u64| {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut results = Vec::new();
+            for _ in 0..20 {
+                results.push(trace.first_token_delay(&mut rng, &ctx(110, 0, false, 2)));
+                results.push(trace.inter_token_delay(&mut rng, 2));
+            }
+            results
+        };
+
+        assert_eq!(
+            run(42),
+            run(42),
+            "same seed must produce identical sequence"
+        );
+        assert_ne!(
+            run(42),
+            run(99),
+            "different seeds should produce different sequences"
+        );
+    }
+
+    #[test]
+    fn trace_fallback_to_nearest_bucket() {
+        // Only populate a single cell: prompt 30 tokens, concurrency 1.
+        let records = vec![make_record(30, 2, 77.0, vec![11.0], 1)];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+
+        // A much larger prompt borrows the only populated bucket's service
+        // samples, scaled by the token ratio and clamped at 8x (10000/30 would
+        // otherwise be 333x).
+        let d = trace.first_token_delay(&mut rng, &ctx(10000, 0, false, 50));
+        assert_eq!(d, std::time::Duration::from_secs_f64(0.077 * 8.0));
+
+        // A prompt in the same bucket reproduces the sample verbatim.
+        let d = trace.first_token_delay(&mut rng, &ctx(40, 0, false, 50));
+        assert_eq!(d, std::time::Duration::from_secs_f64(0.077));
+
+        let itl = trace.inter_token_delay(&mut rng, 50);
+        assert_eq!(itl, std::time::Duration::from_secs_f64(0.011));
+    }
+
+    #[test]
+    fn trace_itl_summary_expansion() {
+        // Use itl_summary instead of itl_ms; verify it expands correctly.
+        let records = vec![TraceRecord {
+            prompt_tokens: 50,
+            cached_tokens: 0,
+            output_tokens: 6,
+            ttft_ms: 20.0,
+            itl_ms: None,
+            itl_summary: Some(ItlSummary {
+                mean_ms: 9.0,
+                count: 5,
+            }),
+            concurrency: 1,
+            arrival_ms: None,
+            itl_ctx: None,
+            ..Default::default()
+        }];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+
+        // All ITL samples are 9.0, so sampling always returns 9.0.
+        for _ in 0..50 {
+            let itl = trace.inter_token_delay(&mut rng, 1);
+            assert_eq!(itl, std::time::Duration::from_secs_f64(0.009));
+        }
+    }
+
+    #[test]
+    fn stall_conditioning_draws_from_interfered_gaps_once() {
+        // One source request whose trace marks gaps 3 and 7 as prefill-interfered
+        // (150ms) among clean 10ms gaps.
+        let gaps = vec![10.0, 10.0, 10.0, 150.0, 10.0, 10.0, 10.0, 150.0, 10.0];
+        let prefill = vec![0u32, 0, 0, 800, 0, 0, 0, 800, 0];
+        let records = vec![TraceRecord {
+            prompt_tokens: 100,
+            cached_tokens: 0,
+            output_tokens: 10,
+            ttft_ms: 40.0,
+            itl_ms: Some(gaps),
+            itl_summary: None,
+            concurrency: 4,
+            arrival_ms: None,
+            itl_ctx: Some(crate::trace::ItlContext {
+                num_running: vec![4; 9],
+                prefill_tokens: prefill,
+            }),
+            ..Default::default()
+        }];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut pacing = DecodePacing::default();
+
+        let draw = |rng: &mut rand::rngs::StdRng, pacing: &mut DecodePacing| -> f64 {
+            trace.paced_inter_token_delay(rng, 4, pacing).as_secs_f64() * 1000.0
+        };
+
+        // Clean draws never produce stall gaps: those left the donor pool.
+        for _ in 0..30 {
+            let ms = draw(&mut rng, &mut pacing);
+            assert!(
+                (ms - 10.0).abs() < 1e-9,
+                "clean draw should be 10ms, got {ms}"
+            );
+        }
+
+        // A noted prefill spikes exactly the next draw, then the flag is spent.
+        pacing.note_prefill(800);
+        let stalled = draw(&mut rng, &mut pacing);
+        assert!(
+            (stalled - 150.0).abs() < 1e-9,
+            "stall draw should come from interfered gaps, got {stalled}"
+        );
+        let after = draw(&mut rng, &mut pacing);
+        assert!(
+            (after - 10.0).abs() < 1e-9,
+            "flag must be consumed, got {after}"
+        );
+    }
+
+    #[test]
+    fn paced_sampling_sticks_to_one_donor_per_request() {
+        // Two donor requests with disjoint gap levels. A single request's paced
+        // draws must all come from ONE donor (within-request correlation), while
+        // many requests must hit both donors (across-request variation).
+        let records = vec![
+            make_record(100, 10, 40.0, vec![5.0; 9], 4),
+            make_record(100, 10, 40.0, vec![50.0; 9], 4),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+
+        let mut seen_fast_request = false;
+        let mut seen_slow_request = false;
+        for _ in 0..50 {
+            let mut pacing = DecodePacing::default();
+            let draws: Vec<f64> = (0..20)
+                .map(|_| {
+                    trace
+                        .paced_inter_token_delay(&mut rng, 4, &mut pacing)
+                        .as_secs_f64()
+                        * 1000.0
+                })
+                .collect();
+            let all_fast = draws.iter().all(|&d| (d - 5.0).abs() < 1e-9);
+            let all_slow = draws.iter().all(|&d| (d - 50.0).abs() < 1e-9);
+            assert!(
+                all_fast || all_slow,
+                "one request's draws must stay at one donor's level, got {draws:?}"
+            );
+            seen_fast_request |= all_fast;
+            seen_slow_request |= all_slow;
+        }
+        assert!(
+            seen_fast_request && seen_slow_request,
+            "across requests both donors must be picked"
+        );
+
+        // The stateless marginal path still mixes both levels.
+        let mut seen_fast_gap = false;
+        let mut seen_slow_gap = false;
+        for _ in 0..100 {
+            let ms = trace.inter_token_delay(&mut rng, 4).as_secs_f64() * 1000.0;
+            seen_fast_gap |= (ms - 5.0).abs() < 1.0;
+            seen_slow_gap |= (ms - 50.0).abs() < 1.0;
+        }
+        assert!(seen_fast_gap && seen_slow_gap);
+    }
+
+    #[test]
+    fn trace_without_itl_data_is_rejected() {
+        // Single-token outputs carry no decode pacing data; the model must refuse to build
+        // rather than silently replay instant inter-token times.
+        let records = vec![
+            make_record(50, 1, 42.0, vec![], 1),
+            make_record(60, 1, 42.0, vec![], 1),
+        ];
+        let result = TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192);
+        let error = result.err().expect("ITL-less trace must be rejected");
+        assert!(error.to_string().contains("inter-token"), "got: {error}");
+    }
+
+    #[test]
+    fn trace_remote_prefill_delegates_to_knob() {
+        let records = vec![make_record(50, 2, 10.0, vec![1.0], 1)];
+        let mut knob = zero_knob();
+        knob.kv_cache_transfer_latency = 500;
+        let trace = TraceLatency::from_records(TraceMeta::default(), &records, knob, 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+
+        let d = trace.first_token_delay(&mut rng, &ctx(50, 0, true, 1));
+        assert_eq!(d, std::time::Duration::from_millis(500));
+    }
+
+    /// Records with 10ms clean gaps and isolated FINAL-CHUNK admission marks:
+    /// each mark carries the admitted prompt's full token count, and the
+    /// marked gap costs `10 + c0*uf + c1*(d1^2-d0^2)/2` for that prompt's
+    /// final chunk at an 8192-token budget. Prompt sizes cycle so the fit
+    /// sees distinct (tokens, depth) points.
+    fn marked_records(n_records: usize, c0: f64, c1: f64, positions: &[usize]) -> Vec<TraceRecord> {
+        const PROMPTS: [usize; 4] = [2048, 4096, 16384, 11008];
+        (0..n_records)
+            .map(|_| {
+                let mut itl = vec![10.0; 40];
+                let mut marks = vec![0u32; 40];
+                for (k, &i) in positions.iter().enumerate() {
+                    let prompt = PROMPTS[k % PROMPTS.len()];
+                    let uf = ((prompt - 1) % 8192) + 1;
+                    let (d0, d1) = ((prompt - uf) as f64, prompt as f64);
+                    itl[i] = 10.0 + c0 * uf as f64 + c1 * (d1 * d1 - d0 * d0) / 2.0;
+                    marks[i] = prompt as u32;
+                }
+                TraceRecord {
+                    prompt_tokens: 16384,
+                    cached_tokens: 0,
+                    output_tokens: 41,
+                    ttft_ms: 300.0,
+                    itl_ms: Some(itl),
+                    itl_summary: None,
+                    concurrency: 4,
+                    arrival_ms: None,
+                    itl_ctx: Some(crate::trace::ItlContext {
+                        num_running: vec![4; 40],
+                        prefill_tokens: marks,
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chunk_cost_fit_recovers_isolated_marks() {
+        let (c0, c1) = (0.012, 2.0e-6);
+        let records = marked_records(20, c0, c1, &[5, 15, 25, 35]);
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+
+        // A full budget chunk at depth 0.
+        let cost = trace.prefill_chunk_cost(8192, 0).as_secs_f64() * 1000.0;
+        let want = c0 * 8192.0 + c1 * (8192.0f64 * 8192.0) / 2.0;
+        assert!(
+            (cost - want).abs() < 1.0,
+            "chunk(8192@0) {cost:.1}ms, want ~{want:.1}ms"
+        );
+
+        // The same tokens deep in a prompt cost more (attention over the KV).
+        let deep = trace.prefill_chunk_cost(2816, 8192).as_secs_f64() * 1000.0;
+        let want_deep = c0 * 2816.0 + c1 * (11008.0f64 * 11008.0 - 8192.0f64 * 8192.0) / 2.0;
+        assert!(
+            (deep - want_deep).abs() < 1.0,
+            "chunk(2816@8192) {deep:.1}ms, want ~{want_deep:.1}ms"
+        );
+        assert!(deep > trace.prefill_chunk_cost(2816, 0).as_secs_f64() * 1000.0);
+
+        // Zero tokens ride for free.
+        assert_eq!(trace.prefill_chunk_cost(0, 0), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn chunk_cost_fit_rejects_stacked_marks() {
+        // Adjacent marks mean two admissions' chunks share measured gaps; with
+        // no isolated marks left the fit must refuse rather than double-count.
+        let records = marked_records(10, 0.024, 4.0e-6, &[5, 6, 15, 16]);
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        assert_eq!(trace.prefill_chunk_cost(8192, 0), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn prefill_overhead_subtracts_chunk_compute() {
+        // Quadratic service records pin T(u); marked records pin the chunk fit.
+        let (c0, c1) = (0.012, 2.0e-6);
+        let mut records = quad_floor_records();
+        records.extend(marked_records(20, c0, c1, &[5, 15, 25, 35]));
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let u = 5_000usize;
+        let total = trace
+            .first_token_delay(&mut rng, &ctx(u, 0, false, 1))
+            .as_secs_f64()
+            * 1000.0;
+        let overhead = trace
+            .first_token_overhead(&mut rng, &ctx(u, 0, false, 1))
+            .as_secs_f64()
+            * 1000.0;
+        let want = total - (c0 * u as f64 + c1 * (u as f64 * u as f64) / 2.0);
+        assert!(
+            (overhead - want).abs() < 1.0,
+            "overhead {overhead:.1}ms, want ~{want:.1}ms (T(u) {total:.1}ms)"
+        );
+    }
+
+    #[test]
+    fn knob_model_prefill_stays_off_the_step_stream() {
+        // Knob-style models account the whole prefill in the overhead; chunk
+        // steps cost nothing.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let mut m = model();
+        m.prefill_overhead = 100;
+        m.prefill_time_per_token = 2;
+        assert_eq!(m.prefill_chunk_cost(8192, 0), std::time::Duration::ZERO);
+        assert_eq!(
+            m.first_token_overhead(&mut rng, &ctx(50, 10, false, 1)),
+            std::time::Duration::from_millis(180)
+        );
+    }
+
+    #[test]
+    fn prompt_bucket_edges() {
+        use crate::latency::prompt_bucket;
+        assert_eq!(prompt_bucket(0), 0);
+        assert_eq!(prompt_bucket(64), 0);
+        assert_eq!(prompt_bucket(65), 1);
+        assert_eq!(prompt_bucket(128), 1);
+        assert_eq!(prompt_bucket(129), 2);
+        assert_eq!(prompt_bucket(50000), 10); // last bucket
+    }
+
+    #[test]
+    fn concurrency_bucket_edges() {
+        use crate::latency::concurrency_bucket;
+        assert_eq!(concurrency_bucket(1), 0);
+        assert_eq!(concurrency_bucket(2), 1);
+        assert_eq!(concurrency_bucket(4), 1);
+        assert_eq!(concurrency_bucket(5), 2);
+        assert_eq!(concurrency_bucket(6), 2);
+        assert_eq!(concurrency_bucket(7), 3);
+        assert_eq!(concurrency_bucket(8), 3);
+        assert_eq!(concurrency_bucket(9), 4);
+        assert_eq!(concurrency_bucket(65), 7);
+        assert_eq!(concurrency_bucket(1000), 7);
     }
 }

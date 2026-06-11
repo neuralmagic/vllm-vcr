@@ -9,6 +9,14 @@ description = "A mock vLLM V1 engine-core backend that speaks the real ZMQ/msgpa
 name = "inference-sim"
 path = "src/main.rs"
 
+[[bin]]
+name = "inference-sim-trace"
+path = "src/bin/inference_sim_trace.rs"
+
+[[bin]]
+name = "inference-sim-tap"
+path = "src/bin/inference_sim_tap.rs"
+
 [features]
 default = []
 # Real NIXL KV data plane. Needs libnixl + UCX installed (Linux, RDMA or shared-memory).
@@ -20,7 +28,7 @@ nixl-stub = ["nixl", "nixl-sys/stub-api"]
 [dependencies]
 # The real vLLM engine-core protocol + reusable mock-engine handshake harness,
 # pulled straight from the in-tree Rust frontend so the wire format never drifts.
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "ba94a3b9989666f950e1f784d18f2033c63c6cad" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "c9340e6f350a009cf835878abad2a0e379b9e6a4" }
 
 # NIXL bindings, pinned to the same nixl source the container builds libnixl from, so the
 # crate resolves identically on macOS (stub) and in the image (real). Optional: only
@@ -41,3 +49,4 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 # Must match the engine-core-client's zeromq so socket types unify across the git dep.
 zeromq = { version = "0.6.0", default-features = false, features = ["tokio-runtime", "all-transport"] }
+flate2 = "1.1.9"

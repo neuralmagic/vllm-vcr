@@ -17,11 +17,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::mock_engine::{
-    MockEngineConfig, MockEngineSockets, connect_to_frontend,
+    MockEngineConfig, MockEngineSockets, connect_to_frontend, default_ready_response,
 };
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
 pub mod blockpool;
+pub mod calibrate;
 pub mod dataplane;
 mod engine;
 mod engine_core;
@@ -30,7 +31,10 @@ pub mod kvevents;
 pub mod latency;
 pub mod lora;
 mod sched;
+pub mod tap;
 mod tokens;
+pub mod trace;
+pub mod trace_convert;
 
 use dataplane::PdRole;
 use latency::KnobLatency;
@@ -94,6 +98,16 @@ pub struct Opt {
     #[arg(long, default_value_t = 32_000)]
     pub vocab_size: u32,
 
+    /// Path to a JSONL trace whose recorded output token ids (tap
+    /// `--record-tokens`) are served verbatim instead of random tokens, making
+    /// replayed streams content-identical to the capture. A request resolves
+    /// to its record through the trailing `-<index>` of its request id, where
+    /// the index is the record's position in the arrival-ordered subset (the
+    /// arrival-replay harness names them `replay-{i}`). Unmatched requests
+    /// fall back to random tokens.
+    #[arg(long, default_value = "")]
+    pub replay_tokens: String,
+
     /// Base seed for deterministic random token generation.
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
@@ -127,6 +141,15 @@ pub struct Opt {
     // === Latency model (all milliseconds; 0 = instant, the default) ===
     // Ported from llm-d-inference-sim. The real frontend measures TTFT/ITL from when we
     // emit tokens, so these knobs drive both response timing and the vllm:* latency metrics.
+    /// Path to a JSONL trace file for replay-based latency. Mutually exclusive with the
+    /// timing knobs below (time_to_first_token, inter_token_latency, prefill_*). When set,
+    /// first-token and inter-token delays are sampled from recorded observations rather
+    /// than synthesized from knob parameters. KV-transfer timing for do_remote_prefill
+    /// requests still uses the kv_cache_transfer_* knobs (the trace does not cover P/D
+    /// transfer latencies).
+    #[arg(long, default_value = "")]
+    pub latency_trace: String,
+
     /// Fixed time-to-first-token. When this and its std-dev are 0, the token-count prefill
     /// model (`--prefill-overhead` + `--prefill-time-per-token`) is used instead.
     #[arg(long, default_value_t = 0)]
@@ -250,9 +273,23 @@ pub struct Opt {
     #[arg(long, default_value_t = 0.0)]
     pub failure_injection_rate: f64,
 
+    /// Divide every model delay by this factor (time compression for fast
+    /// calibration loops). Wire-level measurements must be re-multiplied by
+    /// the same factor; timer granularity and transport jitter do not scale,
+    /// so fidelity degrades as the factor grows. `1.0` is real time.
+    #[arg(long, default_value_t = 1.0)]
+    pub time_scale: f64,
+
     /// Failure kinds to inject (one is chosen uniformly per injected failure).
     #[arg(long, value_enum, value_delimiter = ',', default_value = "error")]
     pub failure_types: Vec<FailureType>,
+
+    /// Graceful-shutdown grace period in seconds (vLLM `shutdown_timeout`). On
+    /// SIGTERM/SIGINT the engine rejects new requests and lets in-flight ones finish for
+    /// up to this long; whatever remains is then aborted. `0` (vLLM's default) aborts
+    /// every in-flight request immediately.
+    #[arg(long, default_value_t = 0)]
+    pub shutdown_timeout: u64,
 }
 
 /// Offset the port of a `tcp://host:port` endpoint by `n` (no-op for `n == 0` or non-tcp),
@@ -293,7 +330,7 @@ impl Opt {
         }
     }
 
-    /// Build the latency model from the configured timing knobs.
+    /// Build the knob-based latency model from the configured timing knobs.
     pub fn latency_model(&self) -> KnobLatency {
         KnobLatency {
             time_to_first_token: self.time_to_first_token,
@@ -311,61 +348,172 @@ impl Opt {
             max_num_seqs: self.max_num_seqs,
         }
     }
+
+    /// Build the token source: replay recorded output ids (from `--replay-tokens`) or
+    /// random draws. Returns an error if the trace is unreadable or carries no tokens.
+    pub(crate) fn build_token_source(&self) -> Result<Box<dyn tokens::TokenSource>> {
+        if self.replay_tokens.is_empty() {
+            return Ok(Box::new(tokens::RandomTokens {
+                vocab_size: self.vocab_size,
+            }));
+        }
+        let (_, records) = trace::read_trace_file(std::path::Path::new(&self.replay_tokens))?;
+        let subset = trace::replay_subset(records);
+        if subset.is_empty() {
+            bail!(
+                "--replay-tokens trace {} has no records with arrival_ms (nothing to map \
+                 request indices onto)",
+                self.replay_tokens
+            );
+        }
+        if !subset.iter().any(|r| r.output_token_ids.is_some()) {
+            bail!(
+                "--replay-tokens trace {} has no output_token_ids; capture it with the \
+                 tap's --record-tokens",
+                self.replay_tokens
+            );
+        }
+        Ok(Box::new(tokens::ReplayTokens::from_records(
+            &subset,
+            self.vocab_size,
+        )))
+    }
+
+    /// Whether any of the timing knobs that are mutually exclusive with `--latency-trace`
+    /// have been set to a nonzero value.
+    fn has_timing_knobs(&self) -> bool {
+        self.time_to_first_token != 0
+            || self.time_to_first_token_std_dev != 0
+            || self.inter_token_latency != 0
+            || self.inter_token_latency_std_dev != 0
+            || self.prefill_overhead != 0
+            || self.prefill_time_per_token != 0
+            || self.prefill_time_std_dev != 0
+    }
+
+    /// Build the latency model: either trace-replay (from `--latency-trace`) or
+    /// knob-based. Returns an error if both are configured or if the trace file is
+    /// unreadable.
+    pub fn build_latency(&self) -> Result<Box<dyn latency::LatencyModel>> {
+        if self.latency_trace.is_empty() {
+            return Ok(Box::new(self.latency_model()));
+        }
+
+        if self.has_timing_knobs() {
+            bail!(
+                "--latency-trace is mutually exclusive with timing knobs \
+                 (time_to_first_token, inter_token_latency, prefill_*). \
+                 Remove the knobs or the trace path."
+            );
+        }
+
+        let (meta, records) = trace::read_trace_file(std::path::Path::new(&self.latency_trace))?;
+
+        // The KV-transfer knobs are NOT mutually exclusive: the trace does not cover
+        // P/D transfer timing, so the knob model handles do_remote_prefill requests.
+        let kv_fallback = self.latency_model();
+        let trace_model = latency::TraceLatency::from_records(
+            meta,
+            &records,
+            kv_fallback,
+            self.max_num_batched_tokens as usize,
+        )
+        .with_context(|| format!("building trace latency model from: {}", self.latency_trace))?;
+
+        Ok(Box::new(trace_model))
+    }
 }
 
-/// Run one mock engine until shutdown or transport failure.
+/// Run one mock engine until shutdown completes or the transport fails. Shutdown is
+/// graceful: the engine loop drains or aborts in-flight requests per `--shutdown-timeout`
+/// (mirroring vLLM's engine core), and the IO loop flushes the final outputs before exit.
 async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) -> Result<()> {
-    let MockEngineSockets { data_sockets, .. } = connect_to_frontend(
+    // Advertise the sim's actual configured limits in the registration ready
+    // response so the frontend validates against what this engine enforces.
+    let mut ready_response = default_ready_response();
+    ready_response.num_gpu_blocks = opt.kv_cache_size;
+    if opt.max_model_len > 0 {
+        ready_response.max_model_len = opt.max_model_len;
+    }
+    let config = MockEngineConfig {
+        ready_response,
+        ..MockEngineConfig::default()
+    };
+
+    // A shutdown signal during the handshake means there is nothing to drain; just leave.
+    let connect = connect_to_frontend(
         &opt.handshake_address,
         EngineId::from_engine_index(engine_index),
-        MockEngineConfig::default(),
-    )
-    .await
-    .with_context(|| format!("engine {engine_index} failed to connect to frontend"))?;
+        config,
+    );
+    let MockEngineSockets { data_sockets, .. } = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            info!(engine_index, "shutdown requested before frontend handshake completed");
+            return Ok(());
+        }
+        result = connect => result
+            .with_context(|| format!("engine {engine_index} failed to connect to frontend"))?,
+    };
 
     info!(engine_index, role = ?opt.pd_role, "engine connected to frontend");
 
     let (input_tx, input_rx) = mpsc::unbounded_channel();
-    let (output_tx, output_rx) = mpsc::channel(64);
+    let (output_tx, output_rx) = mpsc::unbounded_channel();
 
-    let mut io_loop = tokio::spawn(io::run_io_loop(
-        data_sockets,
-        input_tx,
-        output_rx,
-        shutdown.clone(),
-    ));
-    let events = kvevents::spawn(opt.kv_events_config(engine_index), shutdown.clone())
+    let mut io_loop = tokio::spawn(io::run_io_loop(data_sockets, input_tx, output_rx));
+    // The publisher's token is cancelled only after the engine loop exits, so KV events
+    // keep flowing while in-flight requests drain (the publisher also exits on its own
+    // once the engine drops its KvEventTx).
+    let engine_done = CancellationToken::new();
+    let events = kvevents::spawn(opt.kv_events_config(engine_index), engine_done.clone())
         .await
         .unwrap_or_else(|error| {
             tracing::warn!(%error, "kv-event publisher failed to start; continuing without events");
             None
         });
-    let sim_engine = engine::SimEngine::new(engine_index, opt, events).await;
+    let shutdown_timeout = std::time::Duration::from_secs(opt.shutdown_timeout);
+    let sim_engine = engine::SimEngine::new(engine_index, opt, events).await?;
     let mut engine_loop = tokio::spawn(engine_core::run_loop(
         sim_engine,
         input_rx,
         output_tx,
         shutdown.clone(),
+        shutdown_timeout,
     ));
 
     tokio::select! {
         biased;
-        _ = shutdown.cancelled() => {
-            io_loop.abort();
-            engine_loop.abort();
-            io_loop.await.ok();
-            engine_loop.await.ok();
+        result = &mut engine_loop => {
+            engine_done.cancel();
+            if !shutdown.is_cancelled() {
+                error!(engine_index, "engine loop exited unexpectedly");
+            }
+            // The engine loop dropped its output sender; the IO loop exits on its own
+            // after flushing the remaining outputs (final tokens and abort notices).
+            // Bound the flush so a wedged peer socket cannot hold up process exit.
+            let flushed = tokio::time::timeout(std::time::Duration::from_secs(5), &mut io_loop).await;
+            match flushed {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(engine_index, %error, "IO loop errored while flushing final outputs");
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(engine_index, %error, "IO loop task join failed during flush");
+                }
+                Err(_) => {
+                    error!(engine_index, "IO loop failed to flush within 5s; aborting it");
+                    io_loop.abort();
+                    io_loop.await.ok();
+                }
+            }
+            result??;
         }
         result = &mut io_loop => {
             error!(engine_index, "engine IO loop exited unexpectedly");
+            engine_done.cancel();
             engine_loop.abort();
             engine_loop.await.ok();
-            result??;
-        }
-        result = &mut engine_loop => {
-            error!(engine_index, "engine loop exited unexpectedly");
-            io_loop.abort();
-            io_loop.await.ok();
             result??;
         }
     }
@@ -376,6 +524,11 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
 
 /// Run all requested mock engines until cancellation or one engine task fails.
 pub async fn run(opt: Opt, shutdown: CancellationToken) -> Result<()> {
+    // Validate the latency configuration (knob/trace conflict, trace parse) before any
+    // transport setup, so a bad config fails immediately instead of after the 30s
+    // frontend handshake timeout. Engines rebuild their own copy in SimEngine::new.
+    opt.build_latency()?;
+
     info!(?opt, "starting mock engine");
 
     let mut engines = JoinSet::new();
@@ -387,20 +540,20 @@ pub async fn run(opt: Opt, shutdown: CancellationToken) -> Result<()> {
         ));
     }
 
-    tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => {
-            engines.abort_all();
-            while engines.join_next().await.is_some() {}
-            Ok(())
-        }
-        joined = engines.join_next() => {
-            match joined {
-                Some(Ok(Ok(()))) => bail!("engine exited unexpectedly"),
-                Some(Ok(Err(error))) => Err(error),
-                Some(Err(error)) => Err(error).context("engine task join failed"),
-                None => Ok(()),
+    // No abort-on-shutdown here: each engine loop observes `shutdown` itself and drains
+    // or aborts its in-flight requests per `--shutdown-timeout`, so this just waits for
+    // every engine to finish. An engine failing (or exiting without a shutdown request)
+    // is an error; returning early drops the JoinSet, which aborts the survivors.
+    while let Some(joined) = engines.join_next().await {
+        match joined {
+            Ok(Ok(())) => {
+                if !shutdown.is_cancelled() {
+                    bail!("engine exited unexpectedly");
+                }
             }
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(error).context("engine task join failed"),
         }
     }
+    Ok(())
 }

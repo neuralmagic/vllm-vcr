@@ -5,9 +5,9 @@
 //! Everything wire-facing comes from the `vllm-engine-core-client` crate, so this
 //! stays correct as the protocol evolves upstream.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use rand::rngs::StdRng;
@@ -32,27 +32,11 @@ use vllm_engine_core_client::protocol::{
 use crate::blockpool::BlockPool;
 use crate::dataplane::{KvDataPlane, NixlConfig, RemoteKv, RequestKv, make_data_plane};
 use crate::kvevents::KvEventTx;
-use crate::latency::{FirstTokenCtx, LatencyModel};
+use crate::latency::{Churn, DecodePacing, FirstTokenCtx, LatencyModel};
 use crate::lora::LoraRegistry;
 use crate::sched::{self, Scheduler};
 use crate::tokens::{RandomTokens, TokenCtx, TokenSource};
 use crate::{Opt, SchedulingPolicy};
-
-/// Per-step token demand of a single prefilling request: a (possibly chunked) slice of its
-/// prompt, capped by the chunked-prefill threshold and the overall token budget. At least 1
-/// so a request always makes progress.
-fn prefill_token_demand(
-    prompt_len: usize,
-    long_prefill_threshold: usize,
-    max_batched_tokens: usize,
-) -> usize {
-    let chunk = if long_prefill_threshold > 0 {
-        prompt_len.min(long_prefill_threshold)
-    } else {
-        prompt_len
-    };
-    chunk.min(max_batched_tokens).max(1)
-}
 
 /// Derive a stable per-request seed from the CLI seed, engine, and request id.
 fn request_seed(base_seed: u64, engine_index: u32, request_id: &str) -> u64 {
@@ -169,7 +153,7 @@ fn utility_response(
 /// (mirroring Python vLLM), so that is where the P/D intent (`do_remote_prefill` /
 /// `do_remote_decode` / `remote_*`) arrives. In real vLLM the produce/consume logic
 /// lives in the NixlConnector inside the engine; here our data plane plays that role.
-fn extract_kv_params(request: &EngineCoreRequest) -> Option<JsonValue> {
+pub(crate) fn extract_kv_params(request: &EngineCoreRequest) -> Option<JsonValue> {
     request
         .sampling_params
         .as_ref()?
@@ -180,7 +164,7 @@ fn extract_kv_params(request: &EngineCoreRequest) -> Option<JsonValue> {
 }
 
 /// Read a boolean flag out of a `kv_transfer_params` object.
-fn kv_flag(kv: &JsonValue, key: &str) -> bool {
+pub(crate) fn kv_flag(kv: &JsonValue, key: &str) -> bool {
     kv.get(key).and_then(JsonValue::as_bool).unwrap_or(false)
 }
 
@@ -235,6 +219,28 @@ fn build_prefill_kv_params(
 
 use crate::engine_core::{EngineCore, EngineInput, EngineOutput};
 
+/// Where a request stands on the engine step clock.
+#[derive(Debug)]
+enum ReqPhase {
+    /// Prefill chunks still draining through engine steps: uncached prompt
+    /// tokens not yet computed. The step that computes the last one also
+    /// generates the first output token, mirroring vLLM.
+    Prefill { remaining: usize },
+    /// Generating one output chunk per engine step.
+    Decode,
+}
+
+/// One generated-but-not-yet-emitted output chunk: tokens leave the engine at
+/// `due` (the generating step's end plus the request's emission offset).
+/// `seq` is the engine-wide generation order, breaking emission ties (e.g.
+/// under time compression) so clients see tokens in step order.
+#[derive(Debug)]
+struct PendingEmit {
+    due: Instant,
+    seq: u64,
+    tokens: Vec<u32>,
+}
+
 /// Per-request decode state owned by one engine.
 #[derive(Debug)]
 struct ActiveRequest {
@@ -246,6 +252,9 @@ struct ActiveRequest {
     max_tokens: usize,
     generated: usize,
     rng: StdRng,
+    /// Per-request decode pacing state (hierarchical latency models pin a request
+    /// to one source request's gap distribution; stateless models ignore it).
+    pacing: DecodePacing,
     /// This request asked us to prefill for a remote decoder (`do_remote_decode`), so on
     /// finish we register its KV and stamp the `remote_*` descriptor onto its output.
     prefill_advertise: bool,
@@ -261,26 +270,47 @@ struct ActiveRequest {
     /// The LoRA adapter this request runs against, if any (from `EngineCoreRequest.lora_request`).
     /// Drives the per-adapter running count and the LoRA slot cap. `None` is the base model.
     lora_name: Option<String>,
-    /// When the next output token is due. Set to `now + first-token delay` at admission, then
-    /// advanced by the inter-token delay after each emitted token. The engine loop sleeps
-    /// until the earliest deadline across all active requests, so this is the timing model.
-    next_at: Instant,
+    /// Lifecycle phase on the engine step clock.
+    phase: ReqPhase,
+    /// Tokens already emitted to the frontend; trails `generated` by the
+    /// emission queue. The request finishes when this reaches `max_tokens`.
+    emitted: usize,
+    /// Emission delay behind each generating step's end (the pipelined
+    /// `first_token_overhead`). Constant per request, so TTFT carries it
+    /// while inter-token gaps stay pure step durations.
+    emit_offset: Duration,
+    /// Generated output chunks awaiting their emission deadlines, in step order.
+    pending_emits: VecDeque<PendingEmit>,
+}
+
+/// Admission-scoped facts about a request entering the batch, gathered by the
+/// scheduler before `ActiveRequest::new`.
+struct AdmissionCtx {
+    /// Running-request count *including* this one; scales the first-token delay under load.
+    num_running: u64,
+    /// Prompt tokens served from the local prefix cache.
+    num_local_cached_tokens: usize,
+    /// Block-pool slots pinned for the prompt.
+    block_ids: Vec<usize>,
+    /// The batch's decode regime at admission (see `latency::Churn`).
+    churn: Churn,
 }
 
 impl ActiveRequest {
     /// Create a new active request, or return an immediate finish reason if invalid.
-    ///
-    /// `num_running` is the running-request count *including* this one, used to scale the
-    /// first-token delay under load.
     fn new(
         engine_index: u32,
         request: Box<EngineCoreRequest>,
         opt: &Opt,
         latency: &dyn LatencyModel,
-        num_running: u64,
-        num_local_cached_tokens: usize,
-        block_ids: Vec<usize>,
+        admission: AdmissionCtx,
     ) -> Result<Self, EngineCoreFinishReason> {
+        let AdmissionCtx {
+            num_running,
+            num_local_cached_tokens,
+            block_ids,
+            churn,
+        } = admission;
         let incoming_kv = extract_kv_params(&request);
         let prefill_advertise = incoming_kv
             .as_ref()
@@ -324,20 +354,31 @@ impl ActiveRequest {
         }
 
         let mut rng = StdRng::seed_from_u64(request_seed(opt.seed, engine_index, &request_id));
-        // Prompt tokens served from the local prefix cache are not recomputed, so they
-        // shorten the prefill (TTFT). The block pool measured the hit at admission.
-        let first_delay = latency.first_token_delay(
-            &mut rng,
-            &FirstTokenCtx {
-                num_prompt_tokens: prompt_len,
-                num_cached_tokens: num_local_cached_tokens,
-                do_remote_prefill: remote_prefill,
-                num_running,
-            },
-        );
+        let pacing = DecodePacing::for_prompt(prompt_len, churn);
+
+        // A remote-prefill request (P/D decode side) runs no local chunks;
+        // its first token costs the KV-transfer delay. Everything else chunks
+        // its uncached prompt through engine steps (at least one token: vLLM
+        // always computes the last prompt token).
+        let (phase, emit_offset) = if remote_prefill {
+            let offset = latency.first_token_overhead(
+                &mut rng,
+                &FirstTokenCtx {
+                    num_prompt_tokens: prompt_len,
+                    num_cached_tokens: num_local_cached_tokens,
+                    do_remote_prefill: true,
+                    num_running,
+                },
+            );
+            (ReqPhase::Decode, offset)
+        } else {
+            let remaining = prompt_len.saturating_sub(num_local_cached_tokens).max(1);
+            (ReqPhase::Prefill { remaining }, Duration::ZERO)
+        };
 
         Ok(ActiveRequest {
             rng,
+            pacing,
             request_id,
             client_index,
             prompt_len,
@@ -349,39 +390,52 @@ impl ActiveRequest {
             num_local_cached_tokens,
             block_ids,
             lora_name,
-            next_at: Instant::now() + first_delay,
+            phase,
+            emitted: 0,
+            emit_offset,
+            pending_emits: VecDeque::new(),
         })
     }
 
-    /// The number of tokens this request should emit on the next step.
+    /// The number of tokens this request generates in one engine step.
     fn chunk_len(&self, output_token_chunk_size: usize) -> usize {
         let remaining = self.max_tokens - self.generated;
         remaining.min(output_token_chunk_size)
     }
 
-    /// Advance this request by one engine step, using externally-generated tokens.
-    /// The caller is responsible for drawing tokens from the `TokenSource` (using
-    /// `self.rng`) before calling this, so the rng draw order is preserved.
-    fn step(&mut self, new_token_ids: Vec<u32>) -> EngineCoreOutput {
-        self.generated += new_token_ids.len();
-
-        let finished = self.generated >= self.max_tokens;
-        request_output(
-            self.request_id.clone(),
-            new_token_ids,
-            finished.then_some(EngineCoreFinishReason::Length),
-        )
+    /// Whether this request still generates tokens (occupies a batch slot).
+    /// A finished request may linger in the batch map while its trailing
+    /// emissions drain, but it no longer claims budget or seq slots.
+    fn is_generating(&self) -> bool {
+        self.generated < self.max_tokens
     }
 
-    /// Per-step token demand for the batch token budget: a decoding request needs 1 token, a
-    /// prefilling request (no output yet) needs its prompt chunk. Mirrors how vLLM's scheduler
-    /// charges `num_new_tokens` against `max_num_batched_tokens` each step.
-    fn token_demand(&self, long_prefill_threshold: usize, max_batched_tokens: usize) -> usize {
-        if self.generated > 0 {
-            1
-        } else {
-            prefill_token_demand(self.prompt_len, long_prefill_threshold, max_batched_tokens)
+    /// Generate one output chunk at a completed step's end: draw the token ids
+    /// and queue their emission at `step_end + emit_offset`.
+    fn generate(
+        &mut self,
+        token_source: &mut dyn TokenSource,
+        step_end: Instant,
+        output_token_chunk_size: usize,
+        time_scale: f64,
+        seq: u64,
+    ) {
+        let chunk_len = self.chunk_len(output_token_chunk_size);
+        if chunk_len == 0 {
+            return;
         }
+        let ctx = TokenCtx {
+            request_id: &self.request_id,
+            prompt_token_ids: &self.prompt_token_ids,
+            num_generated: self.generated,
+        };
+        let tokens = token_source.next_tokens(&ctx, chunk_len, &mut self.rng);
+        self.generated += tokens.len();
+        self.pending_emits.push_back(PendingEmit {
+            due: step_end + self.emit_offset.div_f64(time_scale),
+            seq,
+            tokens,
+        });
     }
 
     /// Prefill breakdown for this request's first output, feeding the prefix-cache and
@@ -415,14 +469,24 @@ struct PendingPull {
     block_ids: Vec<usize>,
     num_local_cached_tokens: usize,
     client_index: u32,
-    prompt_len: usize,
     lora_name: Option<String>,
 }
 
 /// Result sent from a `spawn_blocking` pull task back to the engine loop.
 type PullCompletion = (String, Result<u64>);
 
-/// Internal state for one engine instance, owned by the engine loop task.
+/// One composed engine step, frozen at the previous step's end. At `end`,
+/// every listed decoder generates one output chunk and every chunk entry
+/// advances its prefill - chunk serialization, budget-gated admission, and
+/// decode elongation all fall out of this one composer.
+struct EngineStep {
+    end: Instant,
+    /// Requests generating one output chunk in this step.
+    decoders: Vec<String>,
+    /// Per-prefill chunk assignments (request id, chunk tokens) for this step.
+    chunks: Vec<(String, usize)>,
+}
+
 pub(crate) struct SimEngine {
     engine_index: u32,
     opt: Opt,
@@ -446,14 +510,27 @@ pub(crate) struct SimEngine {
     /// utility calls; per-request usage drives the `running/waiting_lora_adapters` stats.
     loras: LoraRegistry,
     /// The running batch: requests being actively decoded. Capped at `max_num_seqs`.
-    active_requests: HashMap<String, ActiveRequest>,
+    active_requests: BTreeMap<String, ActiveRequest>,
     /// Admitted-but-not-yet-running requests, in arrival order. Drained into `active_requests`
     /// as slots free up; its length is `vllm:num_requests_waiting`.
     waiting: VecDeque<Box<EngineCoreRequest>>,
     /// Requests whose blocks are pinned and batch slot reserved, but whose remote KV pull
-    /// is still in flight. These count toward `running_capacity` and `scheduled_token_demand`
-    /// to prevent over-admission while pulls are outstanding.
-    pending_pulls: HashMap<String, PendingPull>,
+    /// is still in flight. These count toward the seq cap and the step token
+    /// backlog to prevent over-admission while pulls are outstanding.
+    pending_pulls: BTreeMap<String, PendingPull>,
+    /// The in-flight engine step, composed at the previous step's end. `None`
+    /// when nothing is generating or prefilling (the step clock idles;
+    /// trailing emissions drain on their own deadlines).
+    current_step: Option<EngineStep>,
+    /// Prefilling requests in the order they claim per-step budget (admission
+    /// order, mirroring vLLM's running-queue order). Pruned as they drain.
+    prefill_order: VecDeque<String>,
+    /// Engine-wide generation counter stamping `PendingEmit::seq`.
+    emit_seq: u64,
+    /// Wall instants (scaled) of recent big-chunk admissions, pruned to the last scaled
+    /// second. A request admitted while one is recent decodes under churn: its donor
+    /// draws come from churn-conditioned pools.
+    recent_big_admissions: VecDeque<Instant>,
     /// Sender half for pull completion results. Cloned into each `spawn_blocking` task.
     pull_completion_tx: mpsc::UnboundedSender<PullCompletion>,
     /// Receiver half; wrapped in Option so `take_internal_rx` can hand it to the loop once.
@@ -563,31 +640,6 @@ impl SimEngine {
         )))
     }
 
-    /// Count running requests per LoRA adapter (from the batch) and waiting requests per
-    /// adapter (from the queue) for the `running_lora_adapters`/`waiting_lora_adapters`
-    /// scheduler stats. Base-model requests carry no adapter and are not counted.
-    fn lora_counts(&self) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
-        let mut running = BTreeMap::new();
-        for request in self.active_requests.values() {
-            if let Some(name) = &request.lora_name {
-                *running.entry(name.clone()).or_insert(0) += 1;
-            }
-        }
-        // Pending pulls hold batch slots and count as running for LoRA accounting.
-        for pending in self.pending_pulls.values() {
-            if let Some(name) = &pending.lora_name {
-                *running.entry(name.clone()).or_insert(0) += 1;
-            }
-        }
-        let mut waiting = BTreeMap::new();
-        for request in &self.waiting {
-            if let Some(lora) = &request.lora_request {
-                *waiting.entry(lora.lora_name.clone()).or_insert(0) += 1;
-            }
-        }
-        (running, waiting)
-    }
-
     /// Whether the LoRA slot cap lets this request join the running batch right now (see
     /// `LoraRegistry::admits`). The running batch's distinct adapters are read live.
     fn lora_admits(&self, request: &EngineCoreRequest) -> bool {
@@ -649,6 +701,7 @@ impl SimEngine {
                 // admit into the batch if the seq cap and token budget allow; else it waits.
                 self.waiting.push_back(request);
                 outputs.extend(self.schedule());
+                self.ensure_step(Instant::now());
                 if self.opt.log_requests && self.waiting.iter().any(|r| r.request_id == request_id)
                 {
                     info!(
@@ -660,62 +713,7 @@ impl SimEngine {
             }
 
             EngineInput::Abort(request_ids) => {
-                let mut by_client =
-                    BTreeMap::<u32, (Vec<EngineCoreOutput>, BTreeSet<String>)>::new();
-                for request_id in request_ids {
-                    // Release is cheap (a memset or no-op), lock inline.
-                    if let Ok(mut plane) = self.data_plane.lock() {
-                        plane.release(&request_id);
-                    }
-                    // A request is running, pending-pull, or waiting; abort whichever.
-                    let client_index =
-                        if let Some(request) = self.active_requests.remove(&request_id) {
-                            self.pool.unpin(&request.block_ids);
-                            self.token_source.on_request_finished(&request.request_id);
-                            Some(request.client_index)
-                        } else if let Some(pending) = self.pending_pulls.remove(&request_id) {
-                            // Pull is in flight on a background thread; unpin blocks and let
-                            // the orphaned task's completion be dropped in finish_pull.
-                            self.pool.unpin(&pending.block_ids);
-                            Some(pending.client_index)
-                        } else if let Some(pos) =
-                            self.waiting.iter().position(|r| r.request_id == request_id)
-                        {
-                            self.waiting.remove(pos).map(|r| r.client_index)
-                        } else {
-                            None
-                        };
-
-                    if let Some(client_index) = client_index {
-                        let output = request_output(
-                            request_id.clone(),
-                            Vec::new(),
-                            Some(EngineCoreFinishReason::Abort),
-                        );
-                        let (outs, finished) = by_client
-                            .entry(client_index)
-                            .or_insert_with(|| (Vec::new(), BTreeSet::new()));
-                        outs.push(output);
-                        finished.insert(request_id.clone());
-                        if self.opt.log_requests {
-                            info!(request_id, finish_reason = "abort", "request aborted");
-                        }
-                    }
-                }
-                for (client_index, (client_outputs, finished_requests)) in by_client {
-                    outputs.push(EngineOutput {
-                        client_index,
-                        outputs: EngineCoreOutputs {
-                            engine_index: self.engine_index,
-                            outputs: client_outputs,
-                            timestamp: now_secs(),
-                            finished_requests: Some(finished_requests),
-                            ..Default::default()
-                        },
-                    });
-                }
-                // Aborting running requests frees batch slots; admit any waiting requests.
-                outputs.extend(self.schedule());
+                outputs.extend(self.abort_requests(request_ids));
             }
 
             EngineInput::Utility(request) => {
@@ -747,6 +745,68 @@ impl SimEngine {
         }
 
         Ok(outputs)
+    }
+
+    /// Abort the given requests wherever they stand (running, pending-pull, or waiting),
+    /// releasing their data-plane and block-pool resources and producing one Abort output
+    /// per request, batched per client. Unknown ids are ignored. Used by the frontend's
+    /// abort message and by the graceful-shutdown abort path.
+    fn abort_requests(&mut self, request_ids: Vec<String>) -> Vec<EngineOutput> {
+        let mut outputs = Vec::new();
+        let mut by_client = BTreeMap::<u32, (Vec<EngineCoreOutput>, BTreeSet<String>)>::new();
+        for request_id in request_ids {
+            // Release is cheap (a memset or no-op), lock inline.
+            if let Ok(mut plane) = self.data_plane.lock() {
+                plane.release(&request_id);
+            }
+            // A request is running, pending-pull, or waiting; abort whichever.
+            let client_index = if let Some(request) = self.active_requests.remove(&request_id) {
+                self.pool.unpin(&request.block_ids);
+                self.token_source.on_request_finished(&request.request_id);
+                Some(request.client_index)
+            } else if let Some(pending) = self.pending_pulls.remove(&request_id) {
+                // Pull is in flight on a background thread; unpin blocks and let
+                // the orphaned task's completion be dropped in finish_pull.
+                self.pool.unpin(&pending.block_ids);
+                Some(pending.client_index)
+            } else if let Some(pos) = self.waiting.iter().position(|r| r.request_id == request_id) {
+                self.waiting.remove(pos).map(|r| r.client_index)
+            } else {
+                None
+            };
+
+            if let Some(client_index) = client_index {
+                let output = request_output(
+                    request_id.clone(),
+                    Vec::new(),
+                    Some(EngineCoreFinishReason::Abort),
+                );
+                let (outs, finished) = by_client
+                    .entry(client_index)
+                    .or_insert_with(|| (Vec::new(), BTreeSet::new()));
+                outs.push(output);
+                finished.insert(request_id.clone());
+                if self.opt.log_requests {
+                    info!(request_id, finish_reason = "abort", "request aborted");
+                }
+            }
+        }
+        for (client_index, (client_outputs, finished_requests)) in by_client {
+            outputs.push(EngineOutput {
+                client_index,
+                outputs: EngineCoreOutputs {
+                    engine_index: self.engine_index,
+                    outputs: client_outputs,
+                    timestamp: now_secs(),
+                    finished_requests: Some(finished_requests),
+                    ..Default::default()
+                },
+            });
+        }
+        // Aborting running requests frees batch slots; admit any waiting requests.
+        outputs.extend(self.schedule());
+        self.ensure_step(Instant::now());
+        outputs
     }
 
     /// Maximum requests allowed in the running batch. Clamped to at least 1 so a misconfigured
@@ -807,7 +867,6 @@ impl SimEngine {
                     block_ids: block_ids.clone(),
                     num_local_cached_tokens: num_local_cached,
                     client_index,
-                    prompt_len,
                     lora_name: lora_name_owned,
                 },
             );
@@ -877,16 +936,50 @@ impl SimEngine {
         // Count this request among the running set for its own load-factor scaling.
         // Include pending pulls in the count since they occupy batch slots.
         let num_running = (self.active_requests.len() + self.pending_pulls.len()) as u64 + 1;
+        // Prune the big-admission history to the last scaled wall second and
+        // classify this request's decode regime: joining a batch with a recent
+        // budget-scale prefill means decoding under churn.
+        let admit_now = Instant::now();
+        let churn_window = Duration::from_secs_f64(
+            1.0 / if self.opt.time_scale > 0.0 {
+                self.opt.time_scale
+            } else {
+                1.0
+            },
+        );
+        while self
+            .recent_big_admissions
+            .front()
+            .is_some_and(|&t| admit_now.duration_since(t) > churn_window)
+        {
+            self.recent_big_admissions.pop_front();
+        }
+        let churn = if self.recent_big_admissions.is_empty() {
+            Churn::Calm
+        } else {
+            Churn::BigChunk
+        };
         match ActiveRequest::new(
             self.engine_index,
             request,
             &self.opt,
             &*self.latency,
-            num_running,
-            num_local_cached,
-            block_ids.clone(),
+            AdmissionCtx {
+                num_running,
+                num_local_cached_tokens: num_local_cached,
+                block_ids: block_ids.clone(),
+                churn,
+            },
         ) {
             Ok(active) => {
+                if let ReqPhase::Prefill { remaining } = &active.phase {
+                    // Budget-scale admissions mark the batch as churning for
+                    // the donor conditioning (see `DecodePacing`).
+                    if *remaining > crate::latency::BIG_CHUNK_TOKENS as usize {
+                        self.recent_big_admissions.push_back(admit_now);
+                    }
+                    self.prefill_order.push_back(request_id.clone());
+                }
                 self.active_requests.insert(request_id, active);
                 None
             }
@@ -932,26 +1025,33 @@ impl SimEngine {
         }
         // Completing a pull may free budget if the request was invalid; try to admit more.
         outputs.extend(self.schedule());
+        self.ensure_step(Instant::now());
         outputs
     }
 
-    /// Current per-step token demand of the running batch plus pending pulls, charged against
-    /// `max_num_batched_tokens`. Pending pulls count as prefilling requests (their prompt chunk)
-    /// so the scheduler cannot over-admit while pulls are in flight.
-    fn scheduled_token_demand(&self) -> usize {
-        let threshold = self.opt.long_prefill_token_threshold as usize;
-        let budget = self.opt.max_num_batched_tokens as usize;
+    /// Requests still generating tokens (occupying batch seq slots). Finished
+    /// requests draining trailing emissions are excluded.
+    fn num_generating(&self) -> usize {
+        self.active_requests
+            .values()
+            .filter(|r| r.is_generating())
+            .count()
+    }
+
+    /// Token demand on the next step: one per decoding request plus every
+    /// prefill's remaining backlog. A waiting request admits while this sits
+    /// under the budget (vLLM's waiting-to-running condition). Pending pulls
+    /// count one each: they join as decoders.
+    fn step_token_backlog(&self) -> usize {
         let active: usize = self
             .active_requests
             .values()
-            .map(|request| request.token_demand(threshold, budget))
+            .map(|request| match request.phase {
+                ReqPhase::Prefill { remaining } => remaining,
+                ReqPhase::Decode => usize::from(request.is_generating()),
+            })
             .sum();
-        let pending: usize = self
-            .pending_pulls
-            .values()
-            .map(|p| prefill_token_demand(p.prompt_len, threshold, budget))
-            .sum();
-        active + pending
+        active + self.pending_pulls.len()
     }
 
     /// Index of the next waiting request to admit, delegating to the plugged `Scheduler`
@@ -975,16 +1075,15 @@ impl SimEngine {
     /// Returns any immediate-finish outputs produced during admission.
     fn schedule(&mut self) -> Vec<EngineOutput> {
         let mut outputs = Vec::new();
-        let budget = self.opt.max_num_batched_tokens as usize;
-        let threshold = self.opt.long_prefill_token_threshold as usize;
-        let mut demand = self.scheduled_token_demand();
+        let budget = (self.opt.max_num_batched_tokens as usize).max(1);
 
-        // The `demand < budget` check admits the last request even when its prefill chunk
-        // would overshoot. This matches vLLM's chunked-prefill semantics: vLLM admits that
-        // request too and simply shrinks its chunk to the remaining budget. The admission
-        // COUNT is identical; only per-step token accounting differs.
-        while self.active_requests.len() + self.pending_pulls.len() < self.running_capacity()
-            && demand < budget
+        // `backlog < budget` means the next step has at least one budget token
+        // left after the running requests' claims, so the newcomer's first
+        // chunk (shrunk to fit) can ride it - vLLM admits on the same check.
+        while self.num_generating() + self.pending_pulls.len() < self.running_capacity()
+            // Recomputed each admission: the freshly admitted request's demand
+            // depends on its prefix-cache hit, which only admit() can measure.
+            && self.step_token_backlog() < budget
         {
             // Next admissible request in policy order, skipping any the LoRA slot cap blocks.
             // The index comes from a scan of `waiting` under the same borrow, so remove()
@@ -995,33 +1094,229 @@ impl SimEngine {
             else {
                 break;
             };
-            // The token demand this request adds once admitted (it starts by prefilling).
-            let prompt_len = request
-                .prompt_token_ids
-                .as_ref()
-                .map(Vec::len)
-                .unwrap_or_default();
-            match self.admit(request) {
-                // Admitted and now prefilling: it occupies budget until its first token.
-                None => demand += prefill_token_demand(prompt_len, threshold, budget),
-                // Invalid request finished immediately; it never entered the batch.
-                Some(output) => outputs.push(output),
+            // Invalid requests finish immediately and never enter the batch;
+            // admitted ones occupy budget (via the step token backlog) until
+            // their prefill drains.
+            if let Some(output) = self.admit(request) {
+                outputs.push(output);
             }
         }
         outputs
     }
 
-    /// Advance every request whose token is due, returning one batched engine output per
-    /// client. Each emitted token reschedules the request by the inter-token delay; the
-    /// engine loop sleeps until the earliest deadline, so this is paced by the latency model.
-    fn step(&mut self) -> Vec<EngineOutput> {
-        if self.active_requests.is_empty() {
-            return Vec::new();
+    /// Effective time-compression factor (`--time-scale`), guarding zero.
+    fn time_scale(&self) -> f64 {
+        if self.opt.time_scale > 0.0 {
+            self.opt.time_scale
+        } else {
+            1.0
+        }
+    }
+
+    /// Compose the next engine step, anchored at the previous step's end.
+    /// Decodes claim one budget token each, then prefills chunk to
+    /// `min(remaining, budget left)` in admission order (vLLM's schedule).
+    /// One decode-base draw paces the whole batch: real batches step
+    /// together, and the pacer is the largest-context decoder, whose donor
+    /// gaps were captured in exactly such batches.
+    fn compose_step(&mut self, anchor: Instant) {
+        let decoders: Vec<String> = self
+            .active_requests
+            .values()
+            .filter(|r| matches!(r.phase, ReqPhase::Decode) && r.is_generating())
+            .map(|r| r.request_id.clone())
+            .collect();
+
+        let budget = (self.opt.max_num_batched_tokens as usize).max(1);
+        let threshold = self.opt.long_prefill_token_threshold as usize;
+        let mut left = budget.saturating_sub(decoders.len());
+        let mut chunks = Vec::new();
+        self.prefill_order.retain(|rid| {
+            self.active_requests
+                .get(rid)
+                .is_some_and(|r| matches!(r.phase, ReqPhase::Prefill { .. }))
+        });
+        let mut chunk_cost = Duration::ZERO;
+        for rid in &self.prefill_order {
+            if left == 0 {
+                break;
+            }
+            let Some(request) = self.active_requests.get(rid) else {
+                continue;
+            };
+            let ReqPhase::Prefill { remaining } = request.phase else {
+                continue;
+            };
+            let mut take = remaining.min(left);
+            if threshold > 0 {
+                take = take.min(threshold);
+            }
+            left -= take;
+            // The chunk computes prompt positions depth..depth+take, attending
+            // over everything before it (cached prefix included).
+            let depth = request.prompt_len.saturating_sub(remaining);
+            chunk_cost += self.latency.prefill_chunk_cost(take, depth);
+            chunks.push((rid.clone(), take));
         }
 
+        if decoders.is_empty() && chunks.is_empty() {
+            return;
+        }
+        // Budget-saturated steps pay the max-shape premium.
+        if left == 0 && !chunks.is_empty() {
+            chunk_cost = chunk_cost.max(self.latency.budget_full_chunk_floor());
+        }
+
+        let mut decode_base = Duration::ZERO;
+        if !decoders.is_empty() {
+            let num_running = (self.active_requests.len() + self.pending_pulls.len()) as u64;
+            let mut pacer: Option<&String> = None;
+            let mut deepest = 0;
+            for rid in &decoders {
+                if let Some(request) = self.active_requests.get(rid) {
+                    let bucket = request.pacing.context_bucket();
+                    if pacer.is_none() || bucket > deepest {
+                        pacer = Some(rid);
+                        deepest = bucket;
+                    }
+                }
+            }
+            if let Some(rid) = pacer
+                && let Some(request) = self.active_requests.get_mut(rid)
+            {
+                decode_base = self.latency.paced_inter_token_delay(
+                    &mut request.rng,
+                    num_running,
+                    &mut request.pacing,
+                );
+            }
+        }
+        // The chunk hides under the batch's decode compute until it
+        // dominates; small chunks elongate nothing.
+        let duration = decode_base.max(chunk_cost);
+
+        if std::env::var_os("STEP_DEBUG").is_some() {
+            let chunk_tokens: usize = chunks.iter().map(|(_, t)| *t).sum();
+            eprintln!(
+                "STEP dur_ms={:.2} base_ms={:.2} chunk_ms={:.2} decoders={} chunk_tokens={} saturated={}",
+                duration.as_secs_f64() * 1000.0,
+                decode_base.as_secs_f64() * 1000.0,
+                chunk_cost.as_secs_f64() * 1000.0,
+                decoders.len(),
+                chunk_tokens,
+                left == 0 && !chunks.is_empty(),
+            );
+        }
+        self.current_step = Some(EngineStep {
+            end: anchor + duration.div_f64(self.time_scale()),
+            decoders,
+            chunks,
+        });
+    }
+
+    /// (Re)start the step clock if it idles while step work exists.
+    fn ensure_step(&mut self, anchor: Instant) {
+        if self.current_step.is_none() {
+            self.compose_step(anchor);
+        }
+    }
+
+    /// Finish a due step: decoders generate, prefill chunks drain, and a
+    /// prefill computing its last prompt token generates its first output in
+    /// the same step (as vLLM does). Freed budget admits waiting requests,
+    /// then the next step composes anchored at this one's end, so the clock
+    /// never drifts on wake latency.
+    fn complete_step(&mut self, step: EngineStep) -> Vec<EngineOutput> {
+        let EngineStep {
+            end,
+            decoders,
+            chunks,
+        } = step;
+        let num_running = (self.active_requests.len() + self.pending_pulls.len()) as u64;
+        let chunk_size = self.opt.output_token_chunk_size;
+        let time_scale = self.time_scale();
+
+        // Split the token_source out of self so requests can draw tokens while
+        // active_requests is mutably borrowed. Swapped back after the loops.
+        let mut token_source = std::mem::replace(
+            &mut self.token_source,
+            Box::new(RandomTokens { vocab_size: 0 }),
+        );
+
+        for rid in &decoders {
+            let Some(request) = self.active_requests.get_mut(rid) else {
+                continue;
+            };
+            request.generate(
+                token_source.as_mut(),
+                end,
+                chunk_size,
+                time_scale,
+                self.emit_seq,
+            );
+            self.emit_seq += 1;
+        }
+
+        for (rid, take) in &chunks {
+            let Some(request) = self.active_requests.get_mut(rid) else {
+                continue;
+            };
+            let ReqPhase::Prefill { remaining } = &mut request.phase else {
+                continue;
+            };
+            *remaining = remaining.saturating_sub(*take);
+            if *remaining > 0 {
+                continue;
+            }
+            // Last prompt token computed: the pipelined remainder beyond the
+            // chunks' step time delays this request's emissions from here on.
+            request.emit_offset = self.latency.first_token_overhead(
+                &mut request.rng,
+                &FirstTokenCtx {
+                    num_prompt_tokens: request.prompt_len,
+                    num_cached_tokens: request.num_local_cached_tokens,
+                    do_remote_prefill: false,
+                    num_running,
+                },
+            );
+            request.phase = ReqPhase::Decode;
+            request.generate(
+                token_source.as_mut(),
+                end,
+                chunk_size,
+                time_scale,
+                self.emit_seq,
+            );
+            self.emit_seq += 1;
+        }
+
+        self.token_source = token_source;
+
+        // Drained prefills freed budget; admit and recompose from this end.
+        let outputs = self.schedule();
+        self.ensure_step(end);
+        outputs
+    }
+
+    /// Advance the engine clock: complete every due step (token generation),
+    /// then emit every output chunk whose deadline has passed, batched per
+    /// client. The engine loop sleeps until `earliest_deadline` between calls.
+    fn step(&mut self) -> Vec<EngineOutput> {
         let now = Instant::now();
-        // Running-request count drives the inter-token load factor; snapshot before the loop.
-        let num_running = self.active_requests.len() as u64;
+        let mut admit_outputs = Vec::new();
+
+        // Complete due steps; each completion composes the next one anchored
+        // at its end, so a lagging loop catches up within one call.
+        while self
+            .current_step
+            .as_ref()
+            .is_some_and(|step| step.end <= now)
+        {
+            let Some(step) = self.current_step.take() else {
+                break;
+            };
+            admit_outputs.extend(self.complete_step(step));
+        }
 
         let mut by_client = BTreeMap::<u32, (Vec<EngineCoreOutput>, BTreeSet<String>)>::new();
         let mut finished_ids = BTreeSet::new();
@@ -1030,76 +1325,70 @@ impl SimEngine {
         // requests so we can advertise their KV after the borrow on active_requests ends.
         let mut to_advertise: Vec<(u32, String, usize, Vec<usize>)> = Vec::new();
 
-        // Split the token_source out of self so we can borrow active_requests mutably
-        // while also calling the source. Swapped back after the loop.
-        let mut token_source = std::mem::replace(
-            &mut self.token_source,
-            Box::new(RandomTokens { vocab_size: 0 }),
-        );
+        // One call can flush several steps' worth (catch-up); order by
+        // emission deadline so clients see tokens in clock order.
+        let mut due_emits: Vec<(Instant, u64, u32, bool, EngineCoreOutput)> = Vec::new();
 
         for request in self.active_requests.values_mut() {
-            if request.next_at > now {
-                continue;
-            }
-            let client_index = request.client_index;
-            let is_first = request.generated == 0;
+            while request
+                .pending_emits
+                .front()
+                .is_some_and(|emit| emit.due <= now)
+            {
+                let Some(emit) = request.pending_emits.pop_front() else {
+                    break;
+                };
+                let is_first = request.emitted == 0;
+                request.emitted += emit.tokens.len();
+                let finished = request.emitted >= request.max_tokens;
+                // A replayed request ends with its recorded finish reason; the
+                // sim's own stop condition is always max_tokens (Length).
+                let finish_reason = finished.then(|| {
+                    self.token_source
+                        .finish_reason(&request.request_id)
+                        .unwrap_or(EngineCoreFinishReason::Length)
+                });
 
-            // Token generation: draw from the request rng via the token source FIRST,
-            // then draw the inter-token delay from the same rng. This preserves the
-            // original rng draw order exactly.
-            let chunk_len = request.chunk_len(self.opt.output_token_chunk_size);
-            let ctx = TokenCtx {
-                request_id: &request.request_id,
-                prompt_token_ids: &request.prompt_token_ids,
-                num_generated: request.generated,
-            };
-            let new_token_ids = token_source.next_tokens(&ctx, chunk_len, &mut request.rng);
-
-            let mut output = request.step(new_token_ids);
-            let request_id = request.request_id.clone();
-            let finished = output.finished();
-
-            if is_first {
-                output.prefill_stats = Some(request.prefill_stats());
-            }
-
-            if finished {
-                finished_ids.insert(request_id.clone());
-                if request.prefill_advertise {
-                    to_advertise.push((
-                        client_index,
-                        request_id.clone(),
-                        request.prompt_len,
-                        request.block_ids.clone(),
-                    ));
+                let mut output =
+                    request_output(request.request_id.clone(), emit.tokens, finish_reason);
+                if is_first {
+                    output.prefill_stats = Some(request.prefill_stats());
                 }
-                if self.opt.log_requests {
-                    info!(
-                        request_id,
-                        prompt_len = request.prompt_len,
-                        output_tokens = request.generated,
-                        finish_reason = "length",
-                        "request finished"
-                    );
+                if finished {
+                    finished_ids.insert(request.request_id.clone());
+                    if request.prefill_advertise {
+                        to_advertise.push((
+                            request.client_index,
+                            request.request_id.clone(),
+                            request.prompt_len,
+                            request.block_ids.clone(),
+                        ));
+                    }
+                    if self.opt.log_requests {
+                        info!(
+                            request_id = %request.request_id,
+                            prompt_len = request.prompt_len,
+                            output_tokens = request.generated,
+                            finish_reason =
+                                ?finish_reason.unwrap_or(EngineCoreFinishReason::Length),
+                            "request finished"
+                        );
+                    }
                 }
-            } else {
-                request.next_at = now
-                    + self
-                        .latency
-                        .inter_token_delay(&mut request.rng, num_running);
+                due_emits.push((emit.due, emit.seq, request.client_index, finished, output));
             }
+        }
 
+        due_emits.sort_by_key(|&(due, seq, _, _, _)| (due, seq));
+        for (_, _, client_index, finished, output) in due_emits {
             let (outs, finished_set) = by_client
                 .entry(client_index)
                 .or_insert_with(|| (Vec::new(), BTreeSet::new()));
             if finished {
-                finished_set.insert(request_id);
+                finished_set.insert(output.request_id.clone());
             }
-            outs.push(std::mem::take(&mut output));
+            outs.push(output);
         }
-
-        // Swap the token source back.
-        self.token_source = token_source;
 
         for request_id in &finished_ids {
             if let Some(request) = self.active_requests.remove(request_id) {
@@ -1124,8 +1413,12 @@ impl SimEngine {
             };
             match adv_result {
                 Ok(remote) => {
+                    // One flush can carry several outputs for the request
+                    // (catch-up); the descriptor rides the finishing one.
                     if let Some((outs, _)) = by_client.get_mut(&client_index)
-                        && let Some(out) = outs.iter_mut().find(|o| o.request_id == request_id)
+                        && let Some(out) = outs
+                            .iter_mut()
+                            .find(|o| o.request_id == request_id && o.finish_reason.is_some())
                     {
                         out.kv_transfer_params =
                             Some(build_prefill_kv_params(&remote, &request_id, num_tokens));
@@ -1135,9 +1428,10 @@ impl SimEngine {
             }
         }
 
-        // Refill freed batch slots from the waiting queue before snapshotting stats, so the
-        // gauges reflect the post-step batch and queue depth.
-        let admit_outputs = self.schedule();
+        // Finishing requests may free LoRA slots for waiting requests; refill
+        // before snapshotting stats so the gauges reflect the post-step state.
+        admit_outputs.extend(self.schedule());
+        self.ensure_step(now);
 
         // Computed after removals and admission so the gauges reflect post-step state (e.g.
         // the batch that finishes the last request reports num_running = 0). Cloned per client.
@@ -1172,7 +1466,6 @@ impl SimEngine {
     /// does `inc_by` on them), so each snapshot drains them.
     fn scheduler_stats(&mut self) -> SchedulerStats {
         let prefix = self.pool.take_stats();
-        let (running_lora_adapters, waiting_lora_adapters) = self.lora_counts();
         // Pending pulls count as running: the request has left the waiting queue, holds pinned
         // blocks, and occupies a batch slot. This matches vLLM's WAITING_FOR_REMOTE_KVS
         // accounting, which is grouped under num_running_reqs in the stats surface.
@@ -1190,26 +1483,35 @@ impl SimEngine {
                 },
                 ..Default::default()
             },
-            running_lora_adapters,
-            waiting_lora_adapters,
             ..Default::default()
         }
     }
 
-    /// The soonest a token is due across all active requests; `None` when idle. The engine
-    /// loop sleeps until this instant before calling `step`.
+    /// The next engine wake-up: the in-flight step's end or the earliest
+    /// pending emission, whichever comes first. `None` when fully idle. The
+    /// engine loop sleeps until this instant before calling `step`.
     fn earliest_deadline(&self) -> Option<Instant> {
-        self.active_requests
+        let step_end = self.current_step.as_ref().map(|step| step.end);
+        let emit = self
+            .active_requests
             .values()
-            .map(|request| request.next_at)
-            .min()
+            .filter_map(|request| request.pending_emits.front().map(|emit| emit.due))
+            .min();
+        match (step_end, emit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 }
 
 impl SimEngine {
     /// Build a fully-initialized engine. KV-event publishing is async (ZMQ bind), so
     /// construction is async too. The caller owns the loop; see `core::run_loop`.
-    pub(crate) async fn new(engine_index: u32, opt: Opt, events: Option<KvEventTx>) -> SimEngine {
+    pub(crate) async fn new(
+        engine_index: u32,
+        opt: Opt,
+        events: Option<KvEventTx>,
+    ) -> Result<SimEngine> {
         let role = opt.pd_role;
         let cfg = NixlConfig {
             kv_block_bytes: opt.kv_block_bytes,
@@ -1219,10 +1521,8 @@ impl SimEngine {
             side_channel_host: opt.side_channel_host.clone(),
             side_channel_port: opt.side_channel_port + engine_index,
         };
-        let latency: Box<dyn LatencyModel> = Box::new(opt.latency_model());
-        let token_source: Box<dyn TokenSource> = Box::new(RandomTokens {
-            vocab_size: opt.vocab_size,
-        });
+        let latency: Box<dyn LatencyModel> = opt.build_latency()?;
+        let token_source: Box<dyn TokenSource> = opt.build_token_source()?;
         let scheduler: Box<dyn Scheduler> = match opt.scheduling_policy {
             SchedulingPolicy::Fcfs => Box::new(sched::Fcfs),
             SchedulingPolicy::Priority => Box::new(sched::Priority),
@@ -1235,7 +1535,7 @@ impl SimEngine {
             opt.kv_cache_none_seed,
         );
         let (pull_completion_tx, pull_completion_rx) = mpsc::unbounded_channel();
-        SimEngine {
+        Ok(SimEngine {
             engine_index,
             opt,
             latency,
@@ -1248,12 +1548,16 @@ impl SimEngine {
                 opt_seed ^ (engine_index as u64).wrapping_mul(0x9e3779b9),
             ),
             loras: LoraRegistry::new(max_loras),
-            active_requests: HashMap::new(),
+            active_requests: BTreeMap::new(),
             waiting: VecDeque::new(),
-            pending_pulls: HashMap::new(),
+            pending_pulls: BTreeMap::new(),
+            current_step: None,
+            prefill_order: VecDeque::new(),
+            emit_seq: 0,
+            recent_big_admissions: VecDeque::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
-        }
+        })
     }
 }
 
@@ -1285,6 +1589,39 @@ impl EngineCore for SimEngine {
 
     fn step(&mut self) -> Vec<EngineOutput> {
         SimEngine::step(self)
+    }
+
+    fn num_unfinished_requests(&self) -> usize {
+        // Active requests include finished ones still flushing trailing emissions;
+        // those still owe the client tokens, so they count.
+        self.active_requests.len() + self.pending_pulls.len() + self.waiting.len()
+    }
+
+    fn abort_all_requests(&mut self) -> Vec<EngineOutput> {
+        let request_ids: Vec<String> = self
+            .active_requests
+            .keys()
+            .cloned()
+            .chain(self.pending_pulls.keys().cloned())
+            .chain(self.waiting.iter().map(|r| r.request_id.clone()))
+            .collect();
+        self.abort_requests(request_ids)
+    }
+
+    fn reject_request(&self, request: Box<EngineCoreRequest>) -> EngineOutput {
+        debug!(
+            engine_index = self.engine_index,
+            request_id = request.request_id,
+            "rejecting new request during shutdown"
+        );
+        EngineOutput {
+            client_index: request.client_index,
+            outputs: empty_finish_outputs(
+                self.engine_index,
+                request.request_id,
+                EngineCoreFinishReason::Abort,
+            ),
+        }
     }
 }
 
@@ -1321,11 +1658,8 @@ mod tests {
             opt.kv_cache_size as usize,
             opt.kv_cache_none_seed,
         );
-        let latency: Box<dyn crate::latency::LatencyModel> = Box::new(opt.latency_model());
-        let token_source: Box<dyn crate::tokens::TokenSource> =
-            Box::new(crate::tokens::RandomTokens {
-                vocab_size: opt.vocab_size,
-            });
+        let latency: Box<dyn crate::latency::LatencyModel> = opt.build_latency().unwrap();
+        let token_source: Box<dyn crate::tokens::TokenSource> = opt.build_token_source().unwrap();
         let scheduler: Box<dyn crate::sched::Scheduler> = match opt.scheduling_policy {
             SchedulingPolicy::Fcfs => Box::new(crate::sched::Fcfs),
             SchedulingPolicy::Priority => Box::new(crate::sched::Priority),
@@ -1341,9 +1675,13 @@ mod tests {
             events: None,
             failure_rng: StdRng::seed_from_u64(opt.seed),
             loras: LoraRegistry::new(opt.max_loras as usize),
-            active_requests: HashMap::new(),
+            active_requests: BTreeMap::new(),
             waiting: VecDeque::new(),
-            pending_pulls: HashMap::new(),
+            pending_pulls: BTreeMap::new(),
+            current_step: None,
+            prefill_order: VecDeque::new(),
+            emit_seq: 0,
+            recent_big_admissions: VecDeque::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
             opt,
@@ -1439,12 +1777,13 @@ mod tests {
 
         let before = Instant::now();
         add(&mut engine, &mut rx, request("r1", 4, 2));
-        let deadline = engine.earliest_deadline().expect("a deadline");
-        assert!(deadline >= before + Duration::from_millis(9_000));
-
-        // The token is not due yet, so a step right now produces nothing and keeps the request.
+        // The prefill chunk rides an instant step; the 10s first-token delay
+        // becomes the emission offset when it drains, so stepping emits
+        // nothing and the next deadline sits ~10s out.
         assert!(engine.step().is_empty());
         assert_eq!(engine.active_requests.len(), 1);
+        let deadline = engine.earliest_deadline().expect("a deadline");
+        assert!(deadline >= before + Duration::from_millis(9_000));
     }
 
     #[test]
@@ -1832,8 +2171,9 @@ mod tests {
         opt.max_num_batched_tokens = 20;
         let (mut engine, mut rx) = test_engine(opt);
 
-        // Each prefilling request demands its 10 prompt tokens. Budget 20 admits two (demand
-        // 0 -> 10 -> 20), then 20 < 20 is false so the rest wait, despite 98 free seq slots.
+        // Each prefilling request backlogs its full 10 uncached prompt tokens.
+        // Budget 20 admits two (backlog 0 -> 10 -> 20), then 20 < 20 is false
+        // so the rest wait, despite 98 free seq slots.
         for i in 0..5 {
             submit(&mut engine, &mut rx, request(&format!("r{i}"), 10, 50));
         }
@@ -1853,12 +2193,93 @@ mod tests {
             submit(&mut engine, &mut rx, request(&format!("r{i}"), 10, 50));
         }
         assert_eq!(engine.active_requests.len(), 2);
+        assert_eq!(engine.waiting.len(), 3);
 
-        // One step: the two prefilling requests emit their first token (instant model) and
-        // become decoders (demand 1 each), freeing budget to admit more from the queue.
+        // As prefills drain into decoders (backlog 10 -> 1 each), budget frees
+        // and the queue empties; every request runs to completion.
+        let outputs = drain(&mut engine, &mut rx);
+        assert_eq!(outputs.iter().filter(|o| o.finished()).count(), 5);
+        assert!(engine.waiting.is_empty());
+        assert!(engine.active_requests.is_empty());
+    }
+
+    #[test]
+    fn big_prefill_serializes_admissions_until_budget_frees() {
+        let mut opt = test_opt();
+        opt.max_num_seqs = 100;
+        opt.max_num_batched_tokens = 8;
+        let (mut engine, mut rx) = test_engine(opt);
+
+        // r1's 16-token prompt backlogs two full budgets, so r2 waits until
+        // r1's chunks drain below the budget - chunk serialization.
+        submit(&mut engine, &mut rx, request("r1", 16, 1));
+        submit(&mut engine, &mut rx, request("r2", 8, 1));
+        assert_eq!(engine.active_requests.len(), 1);
+        assert_eq!(engine.waiting.len(), 1);
+
+        let finished: Vec<String> = drain(&mut engine, &mut rx)
+            .into_iter()
+            .filter(|o| o.finished())
+            .map(|o| o.request_id)
+            .collect();
+        assert_eq!(finished, vec!["r1", "r2"]);
+    }
+
+    /// Deterministic step-cost model: 10ms decode steps, 0.01ms per chunk
+    /// token, 1ms total first-token service.
+    struct StepCostLatency;
+
+    impl crate::latency::LatencyModel for StepCostLatency {
+        fn first_token_delay(&self, _rng: &mut StdRng, _ctx: &FirstTokenCtx) -> Duration {
+            Duration::from_millis(1)
+        }
+
+        fn inter_token_delay(&self, _rng: &mut StdRng, _num_running: u64) -> Duration {
+            Duration::from_millis(10)
+        }
+
+        fn prefill_chunk_cost(&self, chunk_tokens: usize, _kv_depth: usize) -> Duration {
+            Duration::from_micros(10 * chunk_tokens as u64)
+        }
+
+        fn first_token_overhead(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
+            let uncached = ctx
+                .num_prompt_tokens
+                .saturating_sub(ctx.num_cached_tokens)
+                .max(1);
+            self.first_token_delay(rng, ctx)
+                .saturating_sub(self.prefill_chunk_cost(uncached, ctx.num_cached_tokens))
+        }
+    }
+
+    #[test]
+    fn chunk_compute_stretches_the_shared_step() {
+        let mut opt = test_opt();
+        opt.max_num_batched_tokens = 8192;
+        let (mut engine, mut rx) = test_engine(opt);
+        engine.latency = Box::new(StepCostLatency);
+
+        // r1 becomes a decoder pacing 10ms steps.
+        add(&mut engine, &mut rx, request("r1", 4, 100));
+        std::thread::sleep(Duration::from_millis(2));
         engine.step();
-        assert!(engine.active_requests.len() > 2);
-        assert!(engine.waiting.len() < 3);
+        let d1 = engine.earliest_deadline().expect("decode step in flight");
+
+        // An 8192-token admission rides the NEXT step: 1 decode token claims
+        // budget first, and the 8191-token chunk dominates the step -
+        // max(10ms decode base, 81.91ms chunk) - the decode gap every
+        // co-running request sees.
+        add(&mut engine, &mut rx, request("r2", 8192, 1));
+        let now = Instant::now();
+        std::thread::sleep(d1.saturating_duration_since(now) + Duration::from_millis(2));
+        engine.step();
+        let d2 = engine.earliest_deadline().expect("mixed step in flight");
+
+        let gap = d2.duration_since(d1);
+        assert!(
+            (Duration::from_millis(78)..=Duration::from_millis(86)).contains(&gap),
+            "mixed step should run ~81.9ms, got {gap:?}"
+        );
     }
 
     /// Build a request bound to a LoRA adapter (as the frontend would after the model name
@@ -1912,38 +2333,6 @@ mod tests {
             "remove_lora",
             (7u64,)
         ));
-    }
-
-    #[test]
-    fn running_request_counts_into_lora_adapters() {
-        let (mut engine, mut rx) = test_engine(test_opt());
-        add(&mut engine, &mut rx, lora_request("r1", "adapterA", 1));
-        let stats = engine.scheduler_stats();
-        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
-        assert!(stats.waiting_lora_adapters.is_empty());
-        // A base-model request adds nothing to the adapter maps.
-        add(&mut engine, &mut rx, request("base", 4, 50));
-        let stats = engine.scheduler_stats();
-        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
-        assert_eq!(stats.running_lora_adapters.len(), 1);
-    }
-
-    #[test]
-    fn waiting_requests_count_into_waiting_lora_adapters() {
-        let mut opt = test_opt();
-        opt.max_num_seqs = 1; // one slot, so the rest queue behind it
-        let (mut engine, mut rx) = test_engine(opt);
-
-        add(&mut engine, &mut rx, lora_request("run", "adapterA", 1));
-        add(&mut engine, &mut rx, lora_request("wait1", "adapterB", 2));
-        add(&mut engine, &mut rx, lora_request("wait2", "adapterB", 2));
-        let stats = engine.scheduler_stats();
-        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
-        assert_eq!(
-            stats.waiting_lora_adapters.get("adapterB"),
-            Some(&2),
-            "both queued requests for adapterB counted"
-        );
     }
 
     #[test]
@@ -2189,6 +2578,47 @@ mod tests {
         assert_eq!(
             all_tokens, prompt,
             "engine with EchoTokens echoes prompt ids exactly"
+        );
+    }
+
+    #[test]
+    fn replay_tokens_at_engine_level_reproduces_ids_and_finish_reason() {
+        use crate::trace::{TraceFinishReason, TraceRecord};
+
+        let recorded = vec![500u32, 501, 502, 503];
+        let records = vec![TraceRecord {
+            prompt_tokens: 4,
+            output_tokens: recorded.len(),
+            ttft_ms: 1.0,
+            itl_ms: Some(vec![1.0; recorded.len() - 1]),
+            output_token_ids: Some(recorded.clone()),
+            finish_reason: Some(TraceFinishReason::Stop),
+            ..Default::default()
+        }];
+
+        let (mut engine, mut rx) = test_engine(test_opt());
+        engine.token_source = Box::new(crate::tokens::ReplayTokens::from_records(&records, 100));
+
+        let req = EngineCoreRequest {
+            request_id: "replay-0".to_string(),
+            prompt_token_ids: Some(vec![1, 2, 3, 4]),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens: recorded.len() as u32,
+                ..EngineCoreSamplingParams::for_test()
+            }),
+            ..Default::default()
+        };
+        add(&mut engine, &mut rx, req);
+        let outputs = drain(&mut engine, &mut rx);
+        let all_tokens: Vec<u32> = outputs
+            .iter()
+            .flat_map(|o| o.new_token_ids.clone())
+            .collect();
+        assert_eq!(all_tokens, recorded, "stream is content-identical");
+        assert_eq!(
+            outputs.last().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Stop),
+            "stream ends with the recorded finish reason, not Length"
         );
     }
 

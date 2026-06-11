@@ -1,0 +1,292 @@
+{
+    "metadata": {
+        "version": 1,
+        "guidellm_version": "0.6.0",
+        "python_version": "3.11.9",
+        "platform": "Linux-6.5.0-x86_64"
+    },
+    "args": {
+        "target": "http://localhost:8000/v1",
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "profile": "sweep",
+        "rate": null
+    },
+    "benchmarks": [
+        {
+            "type_": "generative_benchmark",
+            "config": {
+                "id_": "bench-001",
+                "run_id": "run-001",
+                "run_index": 0,
+                "strategy": {
+                    "type_": "concurrent",
+                    "streams": 4,
+                    "rampup_duration": 0.0
+                },
+                "constraints": {},
+                "sample_requests": null
+            },
+            "scheduler_state": {
+                "start_time": 1700000000.0,
+                "end_time": 1700000060.0
+            },
+            "scheduler_metrics": {
+                "start_time": 1700000000.0,
+                "request_start_time": 1700000001.0,
+                "measure_start_time": 1700000005.0,
+                "measure_end_time": 1700000055.0,
+                "request_end_time": 1700000058.0,
+                "end_time": 1700000060.0,
+                "requests_made": {"successful": 3, "incomplete": 0, "errored": 0, "total": 3},
+                "queued_time_avg": 0.001,
+                "resolve_start_delay_avg": 0.0,
+                "resolve_targeted_start_delay_avg": 0.0,
+                "request_start_delay_avg": 0.0,
+                "request_targeted_start_delay_avg": 0.0,
+                "request_time_avg": 1.5,
+                "resolve_end_delay_avg": 0.0,
+                "resolve_time_avg": 1.5,
+                "finalized_delay_avg": 0.0,
+                "processed_delay_avg": 0.0
+            },
+            "metrics": {
+                "request_totals": {"successful": 3, "incomplete": 0, "errored": 0, "total": 3},
+                "requests_per_second": {"total_count": 3, "total_sum": 3.0},
+                "request_concurrency": {"total_count": 3, "total_sum": 12.0},
+                "request_latency": {"total_count": 3, "total_sum": 4.5},
+                "request_streaming_iterations_count": {"total_count": 3, "total_sum": 180.0},
+                "prompt_token_count": {"total_count": 3, "total_sum": 512.0},
+                "output_token_count": {"total_count": 3, "total_sum": 180.0},
+                "total_token_count": {"total_count": 3, "total_sum": 692.0},
+                "time_to_first_token_ms": {"total_count": 3, "total_sum": 155.2},
+                "time_per_output_token_ms": {"total_count": 3, "total_sum": 36.0},
+                "inter_token_latency_ms": {"total_count": 3, "total_sum": 30.0},
+                "prompt_tokens_per_second": {"total_count": 3, "total_sum": 300.0},
+                "output_tokens_per_second": {"total_count": 3, "total_sum": 150.0},
+                "tokens_per_second": {"total_count": 3, "total_sum": 450.0},
+                "output_tokens_per_iteration": {"total_count": 3, "total_sum": 3.0},
+                "iter_tokens_per_iteration": {"total_count": 3, "total_sum": 3.0},
+                "text": {"tokens": null, "words": null, "characters": null},
+                "image": {"tokens": null, "images": null, "pixels": null, "bytes": null},
+                "video": {"tokens": null, "frames": null, "seconds": null, "bytes": null},
+                "audio": {"tokens": null, "samples": null, "seconds": null, "bytes": null}
+            },
+            "requests": {
+                "successful": [
+                    {
+                        "type_": "generative_request_stats",
+                        "request_id": "req-001",
+                        "response_id": null,
+                        "request_args": null,
+                        "output": null,
+                        "info": {
+                            "request_id": "req-001",
+                            "status": "completed",
+                            "timings": {
+                                "request_start": 1700000005.0,
+                                "first_token_iteration": 1700000005.0452,
+                                "last_token_iteration": 1700000006.5,
+                                "token_iterations": 100,
+                                "request_iterations": 100,
+                                "request_end": 1700000006.5
+                            }
+                        },
+                        "input_metrics": {
+                            "text_tokens": 128
+                        },
+                        "output_metrics": {
+                            "text_tokens": 100
+                        },
+                        "prompt_tokens": 128,
+                        "output_tokens": 100,
+                        "total_tokens": 228,
+                        "time_to_first_token_ms": 45.2,
+                        "time_per_output_token_ms": 15.0,
+                        "inter_token_latency_ms": 14.7,
+                        "request_start_time": 1700000005.0,
+                        "request_end_time": 1700000006.5,
+                        "request_latency": 1.5,
+                        "tokens_per_second": 152.0,
+                        "output_tokens_per_second": 66.7
+                    },
+                    {
+                        "type_": "generative_request_stats",
+                        "request_id": "req-002",
+                        "response_id": null,
+                        "request_args": null,
+                        "output": null,
+                        "info": {
+                            "request_id": "req-002",
+                            "status": "completed",
+                            "timings": {
+                                "request_start": 1700000006.0,
+                                "first_token_iteration": 1700000006.08,
+                                "last_token_iteration": 1700000007.5,
+                                "token_iterations": 50,
+                                "request_iterations": 50,
+                                "request_end": 1700000007.5
+                            }
+                        },
+                        "input_metrics": {
+                            "text_tokens": 256
+                        },
+                        "output_metrics": {
+                            "text_tokens": 50
+                        },
+                        "prompt_tokens": 256,
+                        "output_tokens": 50,
+                        "total_tokens": 306,
+                        "time_to_first_token_ms": 80.0,
+                        "time_per_output_token_ms": 30.0,
+                        "inter_token_latency_ms": 29.0,
+                        "request_start_time": 1700000006.0,
+                        "request_end_time": 1700000007.5,
+                        "request_latency": 1.5,
+                        "tokens_per_second": 204.0,
+                        "output_tokens_per_second": 33.3
+                    },
+                    {
+                        "type_": "generative_request_stats",
+                        "request_id": "req-003",
+                        "response_id": null,
+                        "request_args": null,
+                        "output": null,
+                        "info": {
+                            "request_id": "req-003",
+                            "status": "completed",
+                            "timings": {
+                                "request_start": 1700000007.0,
+                                "first_token_iteration": 1700000007.03,
+                                "last_token_iteration": 1700000008.5,
+                                "token_iterations": 30,
+                                "request_iterations": 30,
+                                "request_end": 1700000008.5
+                            }
+                        },
+                        "input_metrics": {
+                            "text_tokens": 128
+                        },
+                        "output_metrics": {
+                            "text_tokens": 30
+                        },
+                        "prompt_tokens": 128,
+                        "output_tokens": 30,
+                        "total_tokens": 158,
+                        "time_to_first_token_ms": 30.0,
+                        "time_per_output_token_ms": 50.0,
+                        "inter_token_latency_ms": 50.7,
+                        "request_start_time": 1700000007.0,
+                        "request_end_time": 1700000008.5,
+                        "request_latency": 1.5,
+                        "tokens_per_second": 105.3,
+                        "output_tokens_per_second": 20.0
+                    }
+                ],
+                "incomplete": [],
+                "errored": [],
+                "total": null
+            }
+        },
+        {
+            "type_": "generative_benchmark",
+            "config": {
+                "id_": "bench-002",
+                "run_id": "run-001",
+                "run_index": 1,
+                "strategy": {
+                    "type_": "synchronous"
+                },
+                "constraints": {},
+                "sample_requests": null
+            },
+            "scheduler_state": {
+                "start_time": 1700000060.0,
+                "end_time": 1700000120.0
+            },
+            "scheduler_metrics": {
+                "start_time": 1700000060.0,
+                "request_start_time": 1700000061.0,
+                "measure_start_time": 1700000065.0,
+                "measure_end_time": 1700000115.0,
+                "request_end_time": 1700000118.0,
+                "end_time": 1700000120.0,
+                "requests_made": {"successful": 1, "incomplete": 0, "errored": 0, "total": 1},
+                "queued_time_avg": 0.0,
+                "resolve_start_delay_avg": 0.0,
+                "resolve_targeted_start_delay_avg": 0.0,
+                "request_start_delay_avg": 0.0,
+                "request_targeted_start_delay_avg": 0.0,
+                "request_time_avg": 2.0,
+                "resolve_end_delay_avg": 0.0,
+                "resolve_time_avg": 2.0,
+                "finalized_delay_avg": 0.0,
+                "processed_delay_avg": 0.0
+            },
+            "metrics": {
+                "request_totals": {"successful": 1, "incomplete": 0, "errored": 0, "total": 1},
+                "requests_per_second": {"total_count": 1, "total_sum": 1.0},
+                "request_concurrency": {"total_count": 1, "total_sum": 1.0},
+                "request_latency": {"total_count": 1, "total_sum": 2.0},
+                "request_streaming_iterations_count": {"total_count": 1, "total_sum": 10.0},
+                "prompt_token_count": {"total_count": 1, "total_sum": 64.0},
+                "output_token_count": {"total_count": 1, "total_sum": 10.0},
+                "total_token_count": {"total_count": 1, "total_sum": 74.0},
+                "time_to_first_token_ms": {"total_count": 1, "total_sum": 25.0},
+                "time_per_output_token_ms": {"total_count": 1, "total_sum": 200.0},
+                "inter_token_latency_ms": {"total_count": 1, "total_sum": 10.0},
+                "prompt_tokens_per_second": {"total_count": 1, "total_sum": 32.0},
+                "output_tokens_per_second": {"total_count": 1, "total_sum": 5.0},
+                "tokens_per_second": {"total_count": 1, "total_sum": 37.0},
+                "output_tokens_per_iteration": {"total_count": 1, "total_sum": 1.0},
+                "iter_tokens_per_iteration": {"total_count": 1, "total_sum": 1.0},
+                "text": {"tokens": null, "words": null, "characters": null},
+                "image": {"tokens": null, "images": null, "pixels": null, "bytes": null},
+                "video": {"tokens": null, "frames": null, "seconds": null, "bytes": null},
+                "audio": {"tokens": null, "samples": null, "seconds": null, "bytes": null}
+            },
+            "requests": {
+                "successful": [
+                    {
+                        "type_": "generative_request_stats",
+                        "request_id": "req-004",
+                        "response_id": null,
+                        "request_args": null,
+                        "output": null,
+                        "info": {
+                            "request_id": "req-004",
+                            "status": "completed",
+                            "timings": {
+                                "request_start": 1700000065.0,
+                                "first_token_iteration": 1700000065.025,
+                                "last_token_iteration": 1700000067.0,
+                                "token_iterations": 10,
+                                "request_iterations": 10,
+                                "request_end": 1700000067.0
+                            }
+                        },
+                        "input_metrics": {
+                            "text_tokens": 64
+                        },
+                        "output_metrics": {
+                            "text_tokens": 10
+                        },
+                        "prompt_tokens": 64,
+                        "output_tokens": 10,
+                        "total_tokens": 74,
+                        "time_to_first_token_ms": 25.0,
+                        "time_per_output_token_ms": 200.0,
+                        "inter_token_latency_ms": 219.4,
+                        "request_start_time": 1700000065.0,
+                        "request_end_time": 1700000067.0,
+                        "request_latency": 2.0,
+                        "tokens_per_second": 37.0,
+                        "output_tokens_per_second": 5.0
+                    }
+                ],
+                "incomplete": [],
+                "errored": [],
+                "total": null
+            }
+        }
+    ]
+}

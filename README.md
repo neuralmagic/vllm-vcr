@@ -83,17 +83,17 @@ Needs the `vllm-rs` frontend built once (`cargo build --bin vllm-rs` in the vLLM
 `rust/` workspace); override its path with `FRONTEND_BIN=...`. First run fetches the
 tokenizer from HF.
 
-`e2e_lora.sh` needs a `vllm-rs` built from the LoRA-gauge fork (`wseaton/vllm@lora-info-gauge`):
-the upstream Rust frontend at `ba94a3b` does not export `vllm:lora_requests_info`, though the
-engine and the Python frontend both speak it. The container image already builds `vllm-rs` from
-that fork by default (`VLLM_REPO`/`VLLM_REF` Docker build args); point them back at
-`vllm-project/vllm` once the gauge is upstream.
+`e2e_lora.sh` needs a `vllm-rs` at or past vLLM #45030, which exports
+`vllm:lora_requests_info` from the frontend (derived from per-request LoRA tracking;
+the engine no longer reports per-adapter maps in `SchedulerStats`). The pinned commit
+in `Cargo.toml`/`Dockerfile` qualifies.
 
 ### LoRA simulation
 
-The engine tracks LoRA adapters the frontend loads (`add_lora`/`remove_lora`), counts per-adapter
-running/waiting requests for `vllm:lora_requests_info`, and honors `--max-loras` (distinct
-adapters allowed in the running batch; `0` = no cap). In the image, set `MOCK_MAX_LORAS`.
+The engine tracks LoRA adapters the frontend loads (`add_lora`/`remove_lora`) and honors
+`--max-loras` (distinct adapters allowed in the running batch; `0` = no cap). In the
+image, set `MOCK_MAX_LORAS`. The `vllm:lora_requests_info` gauge itself is frontend-derived
+as of vLLM #45030.
 
 ## Build & run
 
@@ -167,3 +167,305 @@ Unit tests in `src/engine.rs` cover engine internals at a finer grain.
   (stub) and in the container (real lib).
 
 The binary is `inference-sim`; the k8s deployment lives in `deploy/llm-d-pd/`.
+
+## Trace replay and calibration
+
+Captured traces live under `traces/` (gitignored; see
+[traces/README.md](traces/README.md) for the inventory, which captures are
+fitting vs gate seeds, and the known-anomalous ones).
+
+The `inference-sim-trace` binary includes a calibration harness that proves two
+claims about the latency models:
+
+1. **TraceLatency replay reproduces source trace quantiles** within tolerance.
+2. **KnobLatency structurally cannot reproduce heavy tails**: its `[0.3*mean, 1.7*mean]`
+   clamp caps p99/p50 at roughly 1.7x for any knob settings.
+
+Three-command demo:
+
+```bash
+# 1. Generate a synthetic heavy-tailed trace (lognormal TTFT/ITL).
+cargo run --bin inference-sim-trace -- gen-demo -o /tmp/demo.jsonl
+
+# 2. Model-level calibration (no transport, fast, exact).
+cargo run --bin inference-sim-trace -- calibrate /tmp/demo.jsonl
+
+# 3. Wire-level proof: spin the real simulator and measure client-side.
+cargo run --bin inference-sim-trace -- calibrate-e2e /tmp/demo.jsonl --requests 60
+```
+
+Example verdict from the demo trace (seed 0, 200 records, 100k samples):
+
+```
+=== Verdict ===
+Pooled p99/p50 ratios:
+  source   TTFT=11.507  ITL=6.299
+  replay   TTFT=11.997  ITL=6.308
+  knob-fit TTFT=1.700  ITL=1.700
+
+Replay max relative error: TTFT=0.0419  ITL=0.0046
+Replay PASS (tolerance 0.10): PASS
+Knob-fit tail capped at ~1.7x by construction (source TTFT ratio 11.507 > 1.75, knob-fit 1.700 <= 1.75)
+```
+
+Use `--fast` on `gen-demo` to produce a small-magnitude trace suitable for
+quick e2e testing (TTFT ~15-40ms, ITL ~3-10ms). All subcommands accept `--json`
+for machine-readable output and `--seed` for determinism.
+
+### Calibration against a real engine
+
+Both figures below come from one capture: the recording tap (`inference-sim-tap`,
+sidecar deployment and component docs in
+[deploy/trace-capture/README.md](deploy/trace-capture/README.md))
+sitting between the vLLM Rust frontend and a real headless vLLM engine
+(Qwen3-8B, TP=1, H200), recording per-token inter-token gaps server-side over
+in-pod localhost ZMQ. 1230 requests at concurrency 1 and 16, 118k token gaps.
+
+Source vs `TraceLatency` replay vs best-fit `KnobLatency`, as survival curves
+and Q-Q plots. Replay max relative error on this trace: TTFT 0.47%, ITL 0.21%.
+The knob model's `[0.3*mean, 1.7*mean]` clamp is visible as a vertical cutoff
+in both survival plots.
+
+![Source vs replay vs knob-fit](docs/images/replay-fidelity.png)
+
+The same trace viewed two ways: pooled per-token ITLs against per-request mean
+ITLs (what client-side benchmark reports expose, e.g. guidellm, which records
+only first/last token timestamps). On this run, 2.1% of all tokens are slower
+than the largest per-request mean observed.
+
+![Per-token vs per-request-mean ITL](docs/images/mean-vs-pertoken.png)
+
+To regenerate from any trace with per-token `itl_ms` arrays:
+
+```bash
+cargo run --bin inference-sim-trace -- calibrate trace.jsonl --dump-samples samples.json
+uv run scripts/plot_calibration.py --samples samples.json --trace trace.jsonl --out-dir docs/images
+```
+
+### Comparison with llm-d-inference-sim
+
+Same workload (`deploy/trace-capture/loadgen.py`, concurrency 1 and 16, 512/128
+tokens) against three targets: the real H200 engine (tap-recorded), this
+simulator replaying the H200 trace, and the Go
+[llm-d-inference-sim](https://github.com/llm-d/llm-d-inference-sim) (v0.9.1)
+with its latency knobs fit to the same trace (TTFT 132ms, ITL 11ms). Both
+simulators ran natively on the same host, measured client-side by the same
+load generator; the real-engine curves are the tap recording.
+
+Fitting note: the trace's actual std-devs (TTFT 80ms, ITL 8ms) exceed
+llm-d-inference-sim's config validation, which caps std-dev at 30% of the
+mean, so it runs with the largest spread it accepts (39ms / 3.3ms).
+
+![Real engine vs both simulators](docs/images/sim-comparison.png)
+
+```bash
+# llm-d-inference-sim invocation used above
+llm-d-inference-sim --port 8001 --model Qwen/Qwen3-8B --mode random \
+  --force-dummy-tokenizer --max-model-len 16384 --max-num-seqs 128 \
+  --time-to-first-token 132ms --time-to-first-token-std-dev 39ms \
+  --inter-token-latency 11ms --inter-token-latency-std-dev 3300us
+
+# this simulator: vllm-rs frontend + trace replay, vLLM-default scheduler limits
+inference-sim --handshake-address tcp://127.0.0.1:5571 \
+  --latency-trace traces/h200-qwen3-8b/h200-qwen3-tap-trace.jsonl \
+  --max-num-seqs 1024 --max-num-batched-tokens 8192
+```
+
+### Step-granular interference: counterfactual replay
+
+The engine paces emission with a step clock that mirrors vLLM's per-step
+schedule: decodes claim the shared token budget first, prefills chunk into
+whatever remains (in admission order), and every co-running decode's gap is
+the composed step's duration. Chunk compute is fitted from the trace as a
+depth-dependent law (attention makes deep chunks cost more per token) plus a
+max-shape premium for budget-saturated steps; small chunks hide under the
+batch's decode compute. Queueing, chunk serialization, and decode elongation
+all emerge from that one composer - there are no interference knobs.
+
+The test is counterfactual: fit on one workload (a constant-load sweep plus a
+warm multiturn capture), then replay a workload the model never saw - a
+cold-cache multiturn (~11k-token prompts, prefix caching disabled) whose
+prefill chunks continuously interfere with running decodes. The real engine
+spreads that interference as a two-shelf ITL band (~14% of gaps elongated,
+clustering at the chunk-step costs); the replay reproduces the band's shape,
+mass (13.9% vs 14.1%), and tail within a few percent:
+
+![Counterfactual cold-multiturn replay](docs/images/step-model-counterfactual.png)
+
+The factual leg (warm multiturn, 99%+ prefix-cache hits) stays calibrated
+under the same model, and a low-rate cold leg reproduces the same band at a
+quarter of the arrival rate - one mechanic across load regimes:
+
+![Factual warm-multiturn replay](docs/images/step-model-factual.png)
+
+![Low-rate cold-multiturn replay](docs/images/step-model-lowrate.png)
+
+The same fit procedure transfers across architectures: refitting from a
+Qwen3-30B-A3B (MoE) sweep with zero constant changes reproduces its
+counterfactual band as well.
+
+### Workload scenarios: open-loop arrival replay
+
+The calibrations above sample the latency model closed-loop, which proves the
+*distributions* are right but never stresses the reactive path: TTFT queueing,
+prefill stalls, and concurrency mixing only emerge when an arrival process
+drives the scheduler. `calibrate-e2e --replay-arrivals` validates that path:
+it replays a captured arrival schedule in real time (each request sent at its
+recorded offset, open loop, regardless of how earlier requests are going) and
+compares client-side TTFT/ITL/request-total quantiles against the capture.
+`--latency-trace` fits the sim's model from a *different* trace, so the gate
+runs on an arrival process the model was never fitted on.
+
+Setup: the same frontend → tap → engine stack as the capture rig, run locally
+with `inference-sim` as the engine, its latency model fit from the original
+H200 capture (fixed-concurrency closed loop). `deploy/trace-capture/loadgen.py
+--pattern poisson|burst` drives arrival processes that capture never
+contained, the tap records ground truth, and the replay must reproduce it:
+
+| scenario                          | requests | concurrency seen | TTFT max err | ITL max err | req-total err | gate (10%) |
+|-----------------------------------|----------|------------------|--------------|-------------|---------------|------------|
+| poisson, 4 req/s                  | 483      | 1-22, median 9   | 9.3%         | 1.4%        | 3.8%          | PASS       |
+| burst, 24 per 10s                 | 288      | 0 -> 24 spikes   | 2.8%         | 3.8%        | 8.0%          | PASS       |
+| multiturn agentic (see below)     | 580      | 1-25             | 3.4%         | 0.5%        | 1.5%          | PASS       |
+
+The burst scenario is the harsher test: each burst floods an idle engine, so
+TTFT is dominated by queueing the latency model never saw as such (source p99
+1.46s vs the fitting trace's ~250ms). The sim's scheduler recreates the queue
+and the pooled distributions land on top of each other:
+
+![Burst arrival replay](docs/images/replay-arrivals-burst.png)
+
+![Poisson arrival replay](docs/images/replay-arrivals-poisson.png)
+
+Per-concurrency-bucket rows shuffle under bursts (admission order inside a
+burst is not deterministic, so per-request concurrency labels move), which is
+why the gate compares pooled quantiles plus per-request decode totals.
+
+Replayed prompts are unique-token synthetics: the captured workloads carry
+`cached_tokens: 0`, and identical fill tokens would silently turn every
+replayed request into a prefix-cache hit (TTFT collapses into the smallest
+uncached-prompt bucket; this was a real bug). Workloads with genuine prefix
+reuse (multiturn/agentic) need the prefix structure replayed too, which is the
+next scenario.
+
+To reproduce against any trace with `arrival_ms`:
+
+```bash
+# capture: any OpenAI-compatible target
+uv run --with httpx deploy/trace-capture/loadgen.py --url http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-8B --pattern poisson --rate 4 --duration 120 \
+  --prompt-tokens 512 --output-tokens 128 --out run.json --trace-out client.jsonl
+
+# replay the schedule, fitting the model from a different capture
+just replay tap-poisson.jsonl traces/h200-qwen3-8b/h200-qwen3-tap-trace-v2.jsonl
+
+# real-vs-replay survival curves (replay measurements via --dump-trace)
+just compare "real=tap-poisson.jsonl" "replay=replay-measured.jsonl"
+```
+
+### Agentic multiturn and the prefix cache
+
+The agentic scenario (`loadgen.py --pattern multiturn`): sessions arrive
+poisson at `--rate`, each runs `--turns` closed-loop turns whose context grows
+by the turn's prompt plus the model's response, on top of one of
+`--prefix-count` shared `--prefix-tokens` prefixes. The validation run below
+is 116 sessions x 5 turns over two ~10k-token shared prefixes; 578 of 580
+requests were prefix-cache hits (warm median 10.6k of ~11k prompt tokens
+cached).
+
+Prefix caching is not a latency knob in this simulator. The engine runs a real
+block-pool prefix cache; admission computes each request's actual cached-token
+count, the trace-fitted TTFT model conditions on the *uncached* prompt size,
+and a prefill admission stalls concurrent decodes by its uncached tokens only.
+The perf gain emerges from workload structure, which is why replaying it needs
+the workload's sharing structure: the tap fingerprints every prompt with
+chained per-block hashes (`block_hashes`, mooncake-style), and the replay
+expands each distinct hash to one deterministic token block, so replayed
+prompts share prefixes exactly where the captured ones did and the sim's cache
+reacts the same way.
+
+Two replay modes matter here. Pure open-loop replay of this trace fails the
+TTFT gate (16% err, concentrated in ramp-up): the capture's intra-session
+closed loop backs off when the engine runs momentarily slow, open-loop
+arrivals do not, and the divergence compounds. `--replay-sessions` restores
+the generator's semantics (turn N+1 fires when turn N completes plus the
+recorded think gap; sessions are inferred from the hash chains) and passes at
+TTFT 3.4% / ITL 0.5% / request-totals 1.5%.
+
+The shape proof, per turn cohort rather than pooled (compensating errors
+would show here): real vs replay TTFT survival for turn-1 requests (shared
+prefix hit only) and turns 2+ (the session's growing context), plus the same
+schedule replayed with `--cold-prompts` (prefix reuse defeated, the cache-off
+what-if). Without the cache, re-prefilling ~11k tokens per turn collapses the
+queue: TTFT p50 goes from 0.37s to ~18s and p99 from 1.6s to ~29s.
+
+![Multiturn cache effect](docs/images/multiturn-cache-effect.png)
+
+```bash
+# capture an agentic workload (10k-token shared prefixes at ~1.5 tokens/word)
+uv run --with httpx deploy/trace-capture/loadgen.py --url http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-8B --pattern multiturn --rate 1 --turns 5 \
+  --prefix-tokens 6500 --prompt-tokens 128 --output-tokens 128 --duration 120 \
+  --out run.json
+
+# session-paced replay (the gate), then the cache-off what-if
+cargo run --release --bin inference-sim-trace -- calibrate-e2e tap-multiturn.jsonl \
+  --replay-arrivals --replay-sessions --latency-trace traces/h200-qwen3-8b/h200-qwen3-tap-trace-v2.jsonl \
+  --sim-arg=--kv-cache-size --sim-arg=65536 --dump-trace replay-measured.jsonl
+cargo run --release --bin inference-sim-trace -- calibrate-e2e tap-multiturn.jsonl \
+  --replay-arrivals --replay-sessions --cold-prompts ... --dump-trace nocache-measured.jsonl
+
+# the per-cohort figure
+uv run scripts/plot_calibration.py --cache-effect real=tap-multiturn.jsonl \
+  --cache-effect replay=replay-measured.jsonl --cache-effect nocache=nocache-measured.jsonl \
+  --out-dir docs/images
+```
+
+Caveat for absolute cold numbers: the H200 capture's prompts top out around
+800 uncached tokens, so a cold 11k prefill's park time extrapolates from the
+nearest bucket; the ~50x what-if delta is dominated by mechanically simulated
+queueing, but a prompt-length-sweep capture would pin it down. Mooncake-style
+workload traces (block-hash ids + lengths + timestamps) map directly onto this
+schema for replaying production workloads.
+
+### Content-identical replay
+
+By default the trace schema is share-freely: timing, shapes, and prefix
+*structure* (block hashes), never tokens. Opting in with the tap's
+`--record-tokens` adds each request's `output_token_ids` (plus
+`finish_reason`, which is always recorded) to the trace - note that with the
+same tokenizer those ids decode back to the generated text, so such traces
+carry user content.
+
+On the replay side, `inference-sim --replay-tokens <trace>` serves the
+recorded ids verbatim instead of random tokens, and ends each stream with the
+recorded finish reason. A request resolves to its record through the trailing
+`-<index>` of its request id, where the index is the record's position in the
+arrival-ordered schedule (the replay harness already names requests
+`replay-{i}`); unmatched requests fall back to random tokens. Combined with
+arrival replay this makes the simulated engine byte-identical to the capture
+on the wire - deterministic, realistic streams for testing routers, EPPs,
+guardrails, and client SDK streaming behavior without a GPU.
+
+Every trace touchpoint (`--trace-out`, `--latency-trace`, `--replay-tokens`,
+trace conversion and replay harnesses) reads and writes gzip transparently
+when the path ends in `.gz`; token-recording traces grow by one integer per
+generated token, so compressing them is recommended.
+
+### Replay pacing
+
+Content fidelity (`--replay-tokens`) and timing are independent axes, so
+pacing is knob composition rather than a mode switch:
+
+| Mode | Invocation |
+| --- | --- |
+| Timing-accurate | `--replay-tokens trace.gz --latency-trace trace.gz` plus scheduler args matching the capture (`--max-num-seqs`, `--max-num-batched-tokens`, ...) |
+| As fast as possible | `--replay-tokens trace.gz` and nothing else: all timing knobs default to 0, the instant model |
+| Compressed but shaped | `--replay-tokens trace.gz --latency-trace trace.gz --time-scale 100`: same interleavings and relative ordering, 100x faster wall clock |
+| Synthetic timing | `--replay-tokens trace.gz --time-to-first-token 50 --inter-token-latency 10` |
+
+Two knobs worth knowing for the fast path: the scheduler still runs at zero
+delay (`--max-num-seqs` and the token budget produce real queueing and
+backpressure semantics at infinite speed - bump them for pure pass-through),
+and `--output-token-chunk-size` controls output framing if the client under
+test should also see multi-token chunks.
