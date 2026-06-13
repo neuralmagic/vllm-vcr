@@ -81,8 +81,11 @@ RUN git clone ${VLLM_REPO} /src/vllm \
 
 # 3. Build our mock engine against the real libnixl, plus the engine-core recording tap.
 COPY . /src/inference-simulator-rs
+# The nixl feature lives on the root package; the tap is its own workspace
+# member, so build them in one invocation (-p selects packages, --features
+# applies to the root package that defines it).
 RUN cd /src/inference-simulator-rs \
-    && cargo build --release --features nixl \
+    && cargo build --release -p inference-simulator-rs -p sim-tap --features nixl \
     && cp target/release/inference-sim /usr/local/bin/inference-sim \
     && cp target/release/inference-sim-tap /usr/local/bin/inference-sim-tap
 

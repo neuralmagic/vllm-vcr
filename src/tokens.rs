@@ -96,7 +96,7 @@ impl ReplayTokens {
                 .iter()
                 .map(|r| RecordedOutput {
                     token_ids: r.output_token_ids.clone().unwrap_or_default(),
-                    finish_reason: r.finish_reason.map(EngineCoreFinishReason::from),
+                    finish_reason: r.finish_reason.map(crate::wire::engine_finish_reason),
                 })
                 .collect(),
             fallback: RandomTokens { vocab_size },
@@ -194,7 +194,7 @@ impl PrefixMatchTokens {
                 .iter()
                 .map(|r| RecordedOutput {
                     token_ids: r.output_token_ids.clone().unwrap_or_default(),
-                    finish_reason: r.finish_reason.map(EngineCoreFinishReason::from),
+                    finish_reason: r.finish_reason.map(crate::wire::engine_finish_reason),
                 })
                 .collect(),
             by_hash,

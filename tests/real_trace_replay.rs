@@ -91,7 +91,7 @@ async fn replays_real_trace_byte_identical() {
         let last = outputs.last().unwrap().as_ref().unwrap();
         let expected_finish = record
             .finish_reason
-            .map(EngineCoreFinishReason::from)
+            .map(inference_simulator_rs::wire::engine_finish_reason)
             .unwrap_or(EngineCoreFinishReason::Length);
         assert_eq!(
             last.finish_reason,

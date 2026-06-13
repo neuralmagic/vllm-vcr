@@ -32,6 +32,7 @@ use vllm_engine_core_client::protocol::{
 use crate::blockpool::BlockPool;
 use crate::dataplane::{KvDataPlane, NixlConfig, RemoteKv, RequestKv, make_data_plane};
 use crate::kvevents::KvEventTx;
+use crate::kvparams::{extract_kv_params, kv_flag};
 use crate::latency::{Churn, DecodePacing, FirstTokenCtx, LatencyModel};
 use crate::lora::LoraRegistry;
 use crate::sched::{self, Scheduler};
@@ -146,26 +147,6 @@ fn utility_response(
         request.call_id,
         result,
     ))
-}
-
-/// The `kv_transfer_params` the frontend ferries down from the OpenAI request. The
-/// server merges them into `sampling_params.extra_args["kv_transfer_params"]`
-/// (mirroring Python vLLM), so that is where the P/D intent (`do_remote_prefill` /
-/// `do_remote_decode` / `remote_*`) arrives. In real vLLM the produce/consume logic
-/// lives in the NixlConnector inside the engine; here our data plane plays that role.
-pub(crate) fn extract_kv_params(request: &EngineCoreRequest) -> Option<JsonValue> {
-    request
-        .sampling_params
-        .as_ref()?
-        .extra_args
-        .as_ref()?
-        .get("kv_transfer_params")
-        .cloned()
-}
-
-/// Read a boolean flag out of a `kv_transfer_params` object.
-pub(crate) fn kv_flag(kv: &JsonValue, key: &str) -> bool {
-    kv.get(key).and_then(JsonValue::as_bool).unwrap_or(false)
 }
 
 /// Parse the `remote_*` addressing out of a decode request's `kv_transfer_params`

@@ -44,7 +44,7 @@ repos:
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --all-targets --locked --no-deps -- -D warnings
+        entry: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
@@ -52,7 +52,7 @@ repos:
 
       - id: cargo-test
         name: cargo test
-        entry: cargo test --locked
+        entry: cargo test --workspace --locked
         language: system
         types: [rust]
         pass_filenames: false

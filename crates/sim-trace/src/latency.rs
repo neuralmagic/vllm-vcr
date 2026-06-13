@@ -232,7 +232,7 @@ fn scale(millis: u64, load: f64) -> u64 {
 
 /// Sample a normal deviate via the Box-Muller transform. Returns `mean` exactly when
 /// `stddev == 0` (matching upstream, and keeping the zero-config path deterministic).
-pub(crate) fn random_norm(rng: &mut StdRng, mean: f64, stddev: f64) -> f64 {
+pub fn random_norm(rng: &mut StdRng, mean: f64, stddev: f64) -> f64 {
     if stddev == 0.0 {
         return mean;
     }

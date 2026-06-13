@@ -50,9 +50,11 @@ use vllm_engine_core_client::protocol::{
 use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::{PullSocket, RouterSocket, ZmqMessage};
 
-use crate::trace::{
-    ItlContext, StepStatsRecord, TraceMeta, TraceRecord, append_record, append_step_stats,
-};
+use sim_protocol::kvparams::{extract_kv_params, kv_flag};
+use sim_protocol::wire::trace_finish_reason;
+use sim_trace::trace::{ItlContext, TraceMeta, TraceRecord, append_record};
+
+use crate::step_stats::{StepStatsRecord, append_step_stats};
 
 /// Batch context attached to a single ITL gap (one gap per output chunk).
 struct GapSample {
@@ -97,8 +99,8 @@ impl RequestState {
         // P/D decode side: this request's prefill ran on another node, so its
         // first output here is a KV-pull completion, not local prefill compute,
         // and must not count as batch interference.
-        let remote_prefill = crate::engine::extract_kv_params(req)
-            .map(|kv| crate::engine::kv_flag(&kv, "do_remote_prefill"))
+        let remote_prefill = extract_kv_params(req)
+            .map(|kv| kv_flag(&kv, "do_remote_prefill"))
             .unwrap_or(false);
         Self {
             arrival,
@@ -106,7 +108,7 @@ impl RequestState {
             block_hashes: req
                 .prompt_token_ids
                 .as_deref()
-                .and_then(|tokens| crate::trace::prompt_block_hashes(tokens, block_size)),
+                .and_then(|tokens| sim_trace::trace::prompt_block_hashes(tokens, block_size)),
             remote_prefill,
             last_output: None,
             output_tokens: 0,
@@ -201,7 +203,7 @@ impl RequestState {
             block_hashes: self.block_hashes,
             output_token_ids: (record_tokens == TokenRecording::On)
                 .then_some(self.output_token_ids),
-            finish_reason: Some(finish_reason.into()),
+            finish_reason: Some(trace_finish_reason(finish_reason)),
         }
     }
 }
@@ -365,7 +367,7 @@ async fn downstream_connect(
     ready_message: &ReadyMessage,
     ready_response_payload: &[u8],
 ) -> Result<MockEngineSockets> {
-    crate::frontend_connect::connect_to_frontend_raw(
+    sim_protocol::frontend_connect::connect_to_frontend_raw(
         frontend_handshake,
         EngineId::from_engine_index(0),
         ready_message.local.unwrap_or(false),

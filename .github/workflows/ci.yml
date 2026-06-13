@@ -48,13 +48,19 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy (default features)
-        run: cargo clippy --all-targets --locked --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
 
       - name: Test (default features)
-        run: cargo test --locked
+        run: cargo test --workspace --locked
+
+      # Keep the trace tooling crate free of the vLLM engine-core git dependency,
+      # so trace/calibration work builds without compiling the protocol stack.
+      - name: sim-trace stays vLLM-free
+        run: "! cargo tree -p sim-trace -e normal -i vllm-engine-core-client"
 
       # Typecheck the NIXL data-plane code (incl. the loopback test + examples) against
       # the stub bindings. The real transfer needs libnixl/UCX and runs on Linux with
       # the `nixl` feature (out of this fast lane); `check` doesn't link, so it's quick.
+      # The nixl features live on the root package, so this stays root-scoped.
       - name: Check (nixl-stub)
         run: cargo check --all-targets --locked --features nixl-stub

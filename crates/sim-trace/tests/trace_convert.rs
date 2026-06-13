@@ -8,8 +8,8 @@
 
 use std::io::BufReader;
 
-use inference_simulator_rs::trace;
-use inference_simulator_rs::trace_convert::{
+use sim_trace::trace;
+use sim_trace::trace_convert::{
     ConvertOptions, convert_guidellm, summarize_trace, write_conversion, write_summary,
 };
 

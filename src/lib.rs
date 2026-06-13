@@ -26,16 +26,19 @@ pub mod calibrate;
 pub mod dataplane;
 mod engine;
 mod engine_core;
-mod frontend_connect;
 mod io;
 pub mod kvevents;
-pub mod latency;
 pub mod lora;
 mod sched;
-pub mod tap;
 mod tokens;
-pub mod trace;
-pub mod trace_convert;
+
+// The trace schema, latency models, and guidellm converter live in the
+// vllm-free `sim-trace` crate; the engine-core protocol glue (frontend
+// handshake, kv_transfer_params, finish-reason conversions) lives in
+// `sim-protocol`. Re-export both under the original paths so existing
+// `crate::trace` / `crate::frontend_connect` references keep working unchanged.
+pub use sim_protocol::{frontend_connect, kvparams, wire};
+pub use sim_trace::{latency, trace, trace_convert};
 
 use dataplane::PdRole;
 use latency::KnobLatency;

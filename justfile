@@ -21,9 +21,9 @@ default:
 
 # Format, lint, and run the full test suite.
 check:
-    cargo fmt
-    cargo clippy --all --benches --tests --examples --all-features
-    cargo test
+    cargo fmt --all
+    cargo clippy --workspace --benches --tests --examples --all-features
+    cargo test --workspace
 
 # --- capture image ----------------------------------------------------------------
 

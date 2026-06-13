@@ -805,6 +805,8 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_json",
+ "sim-protocol",
+ "sim-trace",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1701,6 +1703,52 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "sim-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "sim-trace",
+ "tokio",
+ "vllm-engine-core-client",
+ "zeromq",
+]
+
+[[package]]
+name = "sim-tap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "inference-simulator-rs",
+ "serde",
+ "serde_json",
+ "sim-protocol",
+ "sim-trace",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "vllm-engine-core-client",
+ "zeromq",
+]
+
+[[package]]
+name = "sim-trace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "rand",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

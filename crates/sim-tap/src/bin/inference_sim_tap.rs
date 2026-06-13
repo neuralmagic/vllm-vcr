@@ -40,8 +40,8 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, info};
 
-use inference_simulator_rs::tap::{TapConfig, TokenRecording, run_tap, write_meta};
-use inference_simulator_rs::trace::TraceWriter;
+use sim_tap::tap::{TapConfig, TokenRecording, run_tap, write_meta};
+use sim_trace::trace::TraceWriter;
 
 #[derive(Debug, Parser)]
 #[command(

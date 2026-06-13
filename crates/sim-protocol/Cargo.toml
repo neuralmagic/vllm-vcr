@@ -1,0 +1,19 @@
+[package]
+name = "sim-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared engine-core protocol glue for the inference simulator: frontend handshake, kv_transfer_params helpers, and trace/wire finish-reason conversions."
+
+[dependencies]
+sim-trace = { workspace = true }
+vllm-engine-core-client = { workspace = true }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+zeromq = { workspace = true }
+
+[dev-dependencies]
+rmpv = { workspace = true }

@@ -32,7 +32,7 @@ use zeromq::{DealerSocket, PushSocket, SocketOptions, SubSocket, ZmqMessage};
 /// keys must be present). This is the sim-owned superset of the crate's
 /// struct, which lags the schema.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct SimReadyResponse {
+pub struct SimReadyResponse {
     pub max_model_len: u64,
     pub num_gpu_blocks: u64,
     /// Tokens per KV block. Required by the python frontend; absent from the
@@ -44,7 +44,7 @@ pub(crate) struct SimReadyResponse {
 }
 
 impl SimReadyResponse {
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+    pub fn encode(&self) -> Result<Vec<u8>> {
         encode_msgpack(self).map_err(|e| anyhow!("encoding ready response: {e}"))
     }
 }
@@ -75,7 +75,7 @@ fn status_message(status: &str, local: bool, headless: bool) -> ReadyMessage {
 
 /// Join a frontend-owned handshake endpoint and open engine data sockets,
 /// registering with `ready_response_payload` verbatim.
-pub(crate) async fn connect_to_frontend_raw(
+pub async fn connect_to_frontend_raw(
     frontend_handshake: &str,
     engine_id: EngineId,
     local: bool,
