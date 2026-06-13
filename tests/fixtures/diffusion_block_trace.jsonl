@@ -1,0 +1,7 @@
+{"meta": {"source": "synthetic", "model": "diffusion-block64-synthetic", "block_size": 16}}
+{"prompt_tokens": 64, "cached_tokens": 0, "output_tokens": 320, "ttft_ms": 102.618, "itl_ms": [79.429, 80.717, 85.091, 79.588], "itl_tokens": [64, 64, 64, 64], "concurrency": 1, "finish_reason": "length"}
+{"prompt_tokens": 64, "cached_tokens": 0, "output_tokens": 320, "ttft_ms": 106.895, "itl_ms": [81.049, 76.216, 80.143, 81.559], "itl_tokens": [64, 64, 64, 64], "concurrency": 1, "finish_reason": "length"}
+{"prompt_tokens": 64, "cached_tokens": 0, "output_tokens": 320, "ttft_ms": 105.402, "itl_ms": [75.129, 77.641, 75.088, 83.716], "itl_tokens": [64, 64, 64, 64], "concurrency": 1, "finish_reason": "length"}
+{"prompt_tokens": 64, "cached_tokens": 0, "output_tokens": 320, "ttft_ms": 104.233, "itl_ms": [74.503, 85.786, 85.577, 81.847], "itl_tokens": [64, 64, 64, 64], "concurrency": 1, "finish_reason": "length"}
+{"prompt_tokens": 64, "cached_tokens": 0, "output_tokens": 320, "ttft_ms": 97.853, "itl_ms": [75.89, 74.18, 80.341, 74.715], "itl_tokens": [64, 64, 64, 64], "concurrency": 1, "finish_reason": "length"}
+{"prompt_tokens": 64, "cached_tokens": 0, "output_tokens": 320, "ttft_ms": 107.636, "itl_ms": [76.903, 74.361, 79.567, 79.286], "itl_tokens": [64, 64, 64, 64], "concurrency": 1, "finish_reason": "length"}
