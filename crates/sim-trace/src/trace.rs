@@ -324,14 +324,18 @@ pub fn read_trace(reader: impl BufRead) -> Result<(TraceMeta, Vec<TraceRecord>)>
     let first_line = loop {
         line_num += 1;
         match lines.next() {
-            Some(line) => {
-                let line = line.with_context(|| format!("reading line {line_num}"))?;
+            Some(Ok(line)) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
                 break Some((line_num, trimmed.to_string()));
             }
+            Some(Err(e)) if is_unfinalized_gz_eof(&e) => {
+                warn_unfinalized_trace(line_num, records.len());
+                break None;
+            }
+            Some(Err(e)) => return Err(e).with_context(|| format!("reading line {line_num}")),
             None => break None,
         }
     };
@@ -356,9 +360,16 @@ pub fn read_trace(reader: impl BufRead) -> Result<(TraceMeta, Vec<TraceRecord>)>
         records.push(record);
     }
 
-    for line in lines {
+    for item in lines {
         line_num += 1;
-        let line = line.with_context(|| format!("reading line {line_num}"))?;
+        let line = match item {
+            Ok(line) => line,
+            Err(e) if is_unfinalized_gz_eof(&e) => {
+                warn_unfinalized_trace(line_num, records.len());
+                break;
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading line {line_num}")),
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -370,6 +381,25 @@ pub fn read_trace(reader: impl BufRead) -> Result<(TraceMeta, Vec<TraceRecord>)>
     }
 
     Ok((meta, records))
+}
+
+/// A gzip trace flushed per-record for live capture (see [`TraceWriter`]) has no
+/// final trailer until [`TraceWriter::finish`] runs. When the tap is still up
+/// (e.g. captured via `kubectl exec cat` under `--no-cleanup`), the trailer is
+/// absent and `MultiGzDecoder` reports the missing trailer as `UnexpectedEof`.
+/// Every complete record precedes it, so this is a clean end-of-stream, not a
+/// parse failure.
+fn is_unfinalized_gz_eof(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::UnexpectedEof
+}
+
+fn warn_unfinalized_trace(line_num: usize, records_read: usize) {
+    tracing::warn!(
+        line = line_num,
+        records = records_read,
+        "trace stream ended without a gzip trailer (live/unfinalized capture); \
+         using records read so far"
+    );
 }
 
 /// Validate that a record has ITL data when output_tokens > 1, and that any
@@ -533,6 +563,33 @@ mod tests {
         write_trace(&mut buf, &meta, &records).unwrap();
 
         let (parsed_meta, parsed_records) = read_trace(io::BufReader::new(buf.as_slice())).unwrap();
+        assert_eq!(parsed_meta, meta);
+        assert_eq!(parsed_records, records);
+    }
+
+    #[test]
+    fn read_trace_tolerates_unfinalized_gz() {
+        use std::io::Read as _;
+
+        // The tap flushes per record but only writes the gzip trailer on finish().
+        // Captured live (tap still up under --no-cleanup), the trailer is absent.
+        let meta = sample_meta();
+        let records = sample_records();
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        write_trace(&mut enc, &meta, &records).unwrap();
+        enc.flush().unwrap(); // sync flush, NO finish() -> no trailer
+        let trailerless = enc.get_ref().clone();
+
+        // It really is trailer-less: a raw decode to EOF errors (UnexpectedEof).
+        let mut sink = Vec::new();
+        let raw = MultiGzDecoder::new(trailerless.as_slice()).read_to_end(&mut sink);
+        assert!(raw.is_err(), "expected unfinalized gz to error at EOF");
+
+        // read_trace recovers every record despite the missing trailer.
+        let (parsed_meta, parsed_records) = read_trace(io::BufReader::new(MultiGzDecoder::new(
+            trailerless.as_slice(),
+        )))
+        .unwrap();
         assert_eq!(parsed_meta, meta);
         assert_eq!(parsed_records, records);
     }
