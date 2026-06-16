@@ -241,8 +241,8 @@ output and `--seed` for determinism.
 
 ### Calibration against a real engine
 
-The recording tap (`inference-sim-tap`, sidecar deployment and component docs in
-[deploy/trace-capture/README.md](deploy/trace-capture/README.md)) sits between the
+The recording tap (`inference-sim-tap`, deployment manifests in
+[deploy/trace-capture/](deploy/trace-capture/)) sits between the
 vLLM Rust frontend and a real headless vLLM engine (Qwen3-8B, TP=1, H200), recording
 per-token inter-token gaps server-side over in-pod localhost ZMQ.
 
@@ -543,7 +543,7 @@ Autoregressive traces report no spec stats, matching a real engine with speculat
 
 ```bash
 # 1. Capture: real engine with ngram spec decode behind the tap (writes
-#    tap-trace.jsonl + step-stats.jsonl). See deploy/trace-capture/README.md.
+#    tap-trace.jsonl + step-stats.jsonl). See deploy/trace-capture/ for manifests.
 just capture-up && bash deploy/trace-capture/run-capture.sh && just capture-down
 
 # 2. Replay the recorded schedule with verbatim per-request bursts and gaps.
