@@ -16,7 +16,40 @@
 
 use std::collections::BTreeMap;
 
-use vllm_engine_core_client::protocol::lora::LoraRequest;
+use serde::{Deserialize, Serialize};
+use vllm_engine_core_client::protocol::EngineCoreRequest;
+
+/// The lora identity (int id + name) the engine needs, off an `add_lora`
+/// utility call or a request's `lora_request`. Our own subset that deserializes
+/// the same msgpack at every supported line: the crate's typed
+/// `protocol::lora::LoraRequest` only exists on 0.23+ (lora is opaque rmpv on
+/// 0.22), and serde ignores the fields we don't name. `Serialize` is for tests
+/// that round-trip an `add_lora` call through the wire.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct LoraSpec {
+    pub lora_int_id: u64,
+    pub lora_name: String,
+}
+
+/// The adapter name a request runs against, read from
+/// `EngineCoreRequest.lora_request`. That field is a typed `LoraRequest` on
+/// 0.23+ and opaque `rmpv::Value` on 0.22, so this is the one access that gates
+/// on the `vllm_lora_typed` capability (emitted by build.rs).
+pub(crate) fn request_lora_name(request: &EngineCoreRequest) -> Option<&str> {
+    #[cfg(vllm_lora_typed)]
+    {
+        request.lora_request.as_ref().map(|l| l.lora_name.as_str())
+    }
+    #[cfg(not(vllm_lora_typed))]
+    {
+        let value = request.lora_request.as_ref()?;
+        value
+            .as_map()?
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("lora_name"))
+            .and_then(|(_, v)| v.as_str())
+    }
+}
 
 /// The set of adapters the frontend has loaded into this engine, plus the running-batch slot
 /// cap. A real vLLM engine would hold adapter weights here; we only need their identities.
@@ -40,7 +73,7 @@ impl LoraRegistry {
     /// Register (or refresh) a loaded adapter. Always succeeds: a real engine could OOM on
     /// weights, but we hold nothing, so we accept every adapter the frontend hands us. Returns
     /// `true` to match what the frontend's `add_lora` utility expects.
-    pub(crate) fn add(&mut self, lora: LoraRequest) -> bool {
+    pub(crate) fn add(&mut self, lora: LoraSpec) -> bool {
         self.loaded.insert(lora.lora_int_id, lora.lora_name);
         true
     }
@@ -83,8 +116,11 @@ impl LoraRegistry {
 mod tests {
     use super::*;
 
-    fn lora(name: &str, id: u64) -> LoraRequest {
-        LoraRequest::new(name.to_string(), id, format!("/loras/{name}"), false, false)
+    fn lora(name: &str, id: u64) -> LoraSpec {
+        LoraSpec {
+            lora_int_id: id,
+            lora_name: name.to_string(),
+        }
     }
 
     #[test]

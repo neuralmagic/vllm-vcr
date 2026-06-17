@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::lora::{LoraSpec, request_lora_name};
 use anyhow::{Result, anyhow};
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
@@ -18,13 +19,14 @@ use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
-use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::stats::{
     BaseCacheStats, PrefillStats, PrefixCacheStats, SchedulerStats, SpecDecodingStats,
 };
 use vllm_engine_core_client::protocol::utility::{
-    EngineCoreUtilityRequest, UtilityCallId, UtilityOutput, UtilityResultEnvelope,
+    UtilityCallId, UtilityOutput, UtilityResultEnvelope,
 };
+
+use crate::engine_core::UtilityRequestSpec;
 use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
 };
@@ -120,10 +122,7 @@ fn utility_result_outputs(
 
 /// Produce the minimal utility responses needed by a real frontend. Stateful utilities
 /// (`add_lora`/`remove_lora`, `reset_prefix_cache`) are handled on `Engine` instead.
-fn utility_response(
-    engine_index: u32,
-    request: EngineCoreUtilityRequest,
-) -> Result<EngineCoreOutputs> {
+fn utility_response(engine_index: u32, request: UtilityRequestSpec) -> Result<EngineCoreOutputs> {
     let result = match request.method_name.as_str() {
         "get_supported_tasks" => utility_envelope(vec!["generate"]),
         "is_sleeping" => utility_envelope(false),
@@ -307,7 +306,7 @@ impl ActiveRequest {
             .as_ref()
             .map(|kv| kv_flag(kv, "do_remote_prefill"))
             .unwrap_or(false);
-        let lora_name = request.lora_request.as_ref().map(|l| l.lora_name.clone());
+        let lora_name = request_lora_name(&request).map(str::to_string);
         let request_id = request.request_id;
         let client_index = request.client_index;
         let prompt_token_ids = request.prompt_token_ids.unwrap_or_default();
@@ -336,7 +335,7 @@ impl ActiveRequest {
         let max_model_len = if opt.max_model_len > 0 {
             opt.max_model_len as usize
         } else {
-            vllm_engine_core_client::mock_engine::DEFAULT_MOCK_MAX_MODEL_LEN as usize
+            sim_protocol::mock_engine::DEFAULT_MOCK_MAX_MODEL_LEN as usize
         };
         let eos_terminable = sampling_params.eos_token_id.is_some();
         let open_ended = prompt_len.saturating_add(max_tokens) >= max_model_len;
@@ -619,11 +618,11 @@ impl SimEngine {
     /// for `remove_lora`.
     fn lora_utility_outputs(
         &mut self,
-        request: &EngineCoreUtilityRequest,
+        request: &UtilityRequestSpec,
     ) -> Result<Option<EngineCoreOutputs>> {
         let ok = match request.method_name.as_str() {
             "add_lora" => {
-                let (lora,): (LoraRequest,) = rmpv::ext::from_value(request.args.clone())
+                let (lora,): (LoraSpec,) = rmpv::ext::from_value(request.args.clone())
                     .map_err(|error| anyhow!("decoding add_lora args: {error}"))?;
                 let name = lora.lora_name.clone();
                 let id = lora.lora_int_id;
@@ -657,7 +656,7 @@ impl SimEngine {
     /// (pinning happens at admission), so they do not block a reset.
     fn reset_prefix_cache_outputs(
         &mut self,
-        request: &EngineCoreUtilityRequest,
+        request: &UtilityRequestSpec,
     ) -> Result<Option<EngineCoreOutputs>> {
         if request.method_name != "reset_prefix_cache" {
             return Ok(None);
@@ -688,7 +687,7 @@ impl SimEngine {
     /// Whether the LoRA slot cap lets this request join the running batch right now (see
     /// `LoraRegistry::admits`). The running batch's distinct adapters are read live.
     fn lora_admits(&self, request: &EngineCoreRequest) -> bool {
-        let lora_name = request.lora_request.as_ref().map(|l| l.lora_name.as_str());
+        let lora_name = request_lora_name(request);
         self.loras.admits(
             lora_name,
             self.active_requests
@@ -887,7 +886,7 @@ impl SimEngine {
         // Measure the local prefix hit, allocate slots for the new blocks, pin them all, and
         // emit BlockStored/BlockRemoved for the router. The slot ids are what the data plane
         // pages over NIXL and what we advertise as remote_block_ids.
-        let lora_name = request.lora_request.as_ref().map(|l| l.lora_name.as_str());
+        let lora_name = request_lora_name(&request);
         let prompt_slice = request.prompt_token_ids.as_deref().unwrap_or_default();
         let outcome =
             self.pool
@@ -904,7 +903,7 @@ impl SimEngine {
         // park the request and spawn the pull on a blocking thread. The completion arrives via
         // `pull_completion_rx` and `finish_pull` promotes it to an ActiveRequest.
         if let Some(remote) = remote {
-            let lora_name_owned = request.lora_request.as_ref().map(|l| l.lora_name.clone());
+            let lora_name_owned = request_lora_name(&request).map(str::to_string);
             self.pending_pulls.insert(
                 request_id.clone(),
                 PendingPull {
@@ -1781,6 +1780,27 @@ mod tests {
     use crate::dataplane::{NixlConfig, PdRole, make_data_plane};
     use crate::engine_core::{EngineInput, EngineOutput};
 
+    /// Build a value for `EngineCoreRequest.lora_request`. The field type is a
+    /// typed `LoraRequest` on 0.23+ and opaque `rmpv::Value` on 0.22, so this
+    /// helper gates on the same `vllm_lora_typed` capability as the engine code.
+    #[cfg(vllm_lora_typed)]
+    fn lora_field(name: &str, id: u64) -> vllm_engine_core_client::protocol::lora::LoraRequest {
+        vllm_engine_core_client::protocol::lora::LoraRequest::new(
+            name.to_string(),
+            id,
+            format!("/loras/{name}"),
+            false,
+            false,
+        )
+    }
+    #[cfg(not(vllm_lora_typed))]
+    fn lora_field(name: &str, id: u64) -> rmpv::Value {
+        rmpv::Value::Map(vec![
+            (rmpv::Value::from("lora_name"), rmpv::Value::from(name)),
+            (rmpv::Value::from("lora_int_id"), rmpv::Value::from(id)),
+        ])
+    }
+
     fn test_opt() -> Opt {
         // clap fills every field with its declared default (all latency knobs = 0 / instant).
         Opt::parse_from(["inference-sim"])
@@ -2180,13 +2200,7 @@ mod tests {
         // request() builds an all-zero 8-token prompt; only the adapter differs. max_tokens 1
         // so each finishes in one step.
         let with_lora = |id: &str, name: &str| EngineCoreRequest {
-            lora_request: Some(LoraRequest::new(
-                name.to_string(),
-                1,
-                format!("/loras/{name}"),
-                false,
-                false,
-            )),
+            lora_request: Some(lora_field(name, 1)),
             ..request(id, 8, 1)
         };
 
@@ -2731,13 +2745,7 @@ mod tests {
     /// resolved to a loaded adapter).
     fn lora_request(id: &str, lora_name: &str, lora_int_id: u64) -> EngineCoreRequest {
         EngineCoreRequest {
-            lora_request: Some(LoraRequest::new(
-                lora_name.to_string(),
-                lora_int_id,
-                format!("/loras/{lora_name}"),
-                false,
-                false,
-            )),
+            lora_request: Some(lora_field(lora_name, lora_int_id)),
             ..request(id, 4, 50)
         }
     }
@@ -2748,7 +2756,12 @@ mod tests {
         method: &str,
         args: A,
     ) -> T {
-        let request = EngineCoreUtilityRequest::new(0, 1, method, args).expect("build utility");
+        let request = UtilityRequestSpec {
+            client_index: 0,
+            call_id: UtilityCallId::from(1u64),
+            method_name: method.to_string(),
+            args: rmpv::ext::to_value(&args).expect("encode utility args"),
+        };
         let mut out = engine
             .handle_input(EngineInput::Utility(request))
             .expect("handle_input");
@@ -2763,13 +2776,10 @@ mod tests {
     #[test]
     fn add_and_remove_lora_utilities_report_bool() {
         let (mut engine, _rx) = test_engine(test_opt());
-        let lora = LoraRequest::new(
-            "adapterA".to_string(),
-            7,
-            "/loras/a".to_string(),
-            false,
-            false,
-        );
+        let lora = LoraSpec {
+            lora_int_id: 7,
+            lora_name: "adapterA".to_string(),
+        };
         assert!(call_utility::<bool, _>(&mut engine, "add_lora", (lora,)));
         // First remove finds it; second reports it gone.
         assert!(call_utility::<bool, _>(&mut engine, "remove_lora", (7u64,)));
