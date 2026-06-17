@@ -9,8 +9,8 @@
 #   just calibrate /tmp/trace-capture-h200/tap-trace.jsonl
 #   just plots /tmp/trace-capture-h200/tap-trace.jsonl docs/images
 
-image := "quay.io/wseaton/mock-engine-nixl:trace-capture-v8"
-namespace := "weaton-dev"
+image := env_var_or_default("IMAGE", "ghcr.io/neuralmagic/inference-simulator-rs:dev")
+namespace := env_var_or_default("NAMESPACE", "inference-sim")
 deploy := "trace-capture-h200"
 
 # List available recipes.
@@ -36,7 +36,7 @@ image-build:
 # Pins Cargo.toml to the line's rev/fork via ci/pin-vllm-rev.py (leaves the tree dirty;
 # restore with `git checkout Cargo.toml Cargo.lock`), stamps VLLM_TARGET_VERSION for build.rs,
 # and builds the vllm-rs frontend from the same source as the tap. Tags as <image>-vllm<line>.
-# amd64 only; on Apple Silicon prefer the build-on-waldorf flow over local emulation.
+# amd64 only; on Apple Silicon prefer a native remote builder over local emulation.
 image-build-line line:
     #!/usr/bin/env bash
     set -euo pipefail

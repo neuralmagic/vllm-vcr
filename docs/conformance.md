@@ -10,6 +10,13 @@ For the version-mapping strategy this runbook serves (the N-3 window, `compat.to
 the build matrix, image tagging), see [versioning.md](versioning.md). For the trace
 schema, see `crates/sim-trace/src/trace.rs`.
 
+> The golden captures live in an object-store bucket that the CI workflow fetches
+> from by sha; the concrete bucket, account, and fetch-role identifiers live only in
+> `.github/workflows/ci.yml` (`CONFORMANCE_BUCKET`). None of it is needed to build,
+> test, or use the simulator: the GPU-free replay half runs from any trace you have.
+> To run conformance against your own captures, point `CONFORMANCE_BUCKET` and the
+> `bucket_path` keys in `conformance/manifest.toml` at a bucket you control.
+
 ## Contents
 
 - [Capture topology](#capture-topology)
@@ -126,14 +133,15 @@ Fetch before the reaper window closes. The marker is the loadgen log line "waiti
 fetch":
 
 ```bash
-POD=$(kubectl get pod -n weaton-dev -l job-name=trace-validation-cached -o name)
+NAMESPACE=${NAMESPACE:-inference-sim}
+POD=$(kubectl get pod -n "$NAMESPACE" -l job-name=trace-validation-cached -o name)
 
 # The trace, and the per-step SchedulerStats sidecar if captured.
-kubectl exec -n weaton-dev "$POD" -c loadgen -- cat /trace/trace.jsonl > trace.jsonl
-kubectl exec -n weaton-dev "$POD" -c loadgen -- cat /trace/step-stats.jsonl > step-stats.jsonl
+kubectl exec -n "$NAMESPACE" "$POD" -c loadgen -- cat /trace/trace.jsonl > trace.jsonl
+kubectl exec -n "$NAMESPACE" "$POD" -c loadgen -- cat /trace/step-stats.jsonl > step-stats.jsonl
 
 # Let the Job complete and release the GPU.
-kubectl exec -n weaton-dev "$POD" -c loadgen -- touch /trace/fetched
+kubectl exec -n "$NAMESPACE" "$POD" -c loadgen -- touch /trace/fetched
 ```
 
 Compress before upload (`.jsonl.gz`); the trace tooling and the sim read gzip
@@ -181,20 +189,19 @@ Two ways to get the hash:
 
 Goldens are NOT committed to the repo: they are measurement data, some are large, and
 token-recording captures carry model content. They live under the `conformance/` prefix
-of `s3://llm-d-artifacts-783952637884`; CI fetches them by sha. The GHA runner assumes
-the least-privilege `llm-d-conformance-ci` role (GitHub OIDC, GetObject on
-`conformance/*` only), defined in the llm-d-infra terraform
-(`aws/783952637884/bootstrap/iam.tf`).
+of the bucket CI fetches by sha (`$CONFORMANCE_BUCKET`, set in
+`.github/workflows/ci.yml`). The GHA runner assumes a least-privilege fetch role over
+GitHub OIDC, scoped to `s3:GetObject` on `conformance/*` only.
 
 ```bash
 # 1. Upload to the conformance/ prefix (use credentials with write access; the CI
-#    role is read-only).
+#    role is read-only). $CONFORMANCE_BUCKET is the bucket defined in ci.yml.
 # Path convention: conformance/<vllm_tag>/<gpu>/<model>/<workload>[-<seed>].jsonl.gz
 # where <vllm_tag> is the release tag (v0.23.0) or "nightly" (tracks main). These
 # mirror config_hash inputs (vllm_tag/gpu/model), so captures across builds, hardware,
 # and models don't collide. CI mirrors the full key locally.
 aws s3 cp trace.jsonl.gz \
-  "s3://llm-d-artifacts-783952637884/conformance/<vllm_tag>/<gpu>/<model>/<workload>-<seed>.jsonl.gz"
+  "$CONFORMANCE_BUCKET/conformance/<vllm_tag>/<gpu>/<model>/<workload>-<seed>.jsonl.gz"
 
 # 2. Record the sha256 (the manifest key CI verifies after fetch).
 sha256sum trace.jsonl.gz

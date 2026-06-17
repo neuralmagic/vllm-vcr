@@ -2,7 +2,9 @@
 name = "sim-tap"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Engine-core recording tap: a transparent ZMQ proxy between a real vLLM frontend and engine-core that records per-request timing into a JSONL trace."
 
 [[bin]]

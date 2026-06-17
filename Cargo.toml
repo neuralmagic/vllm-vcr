@@ -8,7 +8,9 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/neuralmagic/inference-simulator-rs"
 
 [workspace.dependencies]
 # Member crates, referenced by path.
@@ -44,7 +46,9 @@ zeromq = { version = "0.6.0", default-features = false, features = ["tokio-runti
 name = "inference-simulator-rs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "A mock vLLM V1 engine-core backend that speaks the real ZMQ/msgpack protocol, with a NIXL CPU/RDMA data plane for GPU-free prefill/decode testing."
 
 [[bin]]

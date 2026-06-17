@@ -23,8 +23,8 @@
 #   role         "schema" (cheap structural/handshake conformance) or
 #                "fidelity" (tolerance-banded behavioral replay)
 #
-# Bucket is s3://llm-d-artifacts-783952637884 (CONFORMANCE_BUCKET in ci.yml); the
-# fetch role (llm-d-conformance-ci) can GetObject under conformance/ only.
+# The bucket and fetch role live in ci.yml (CONFORMANCE_BUCKET); the role can
+# GetObject under the conformance/ prefix only.
 #
 # Example (uncomment and fill once the first capture is uploaded):
 #

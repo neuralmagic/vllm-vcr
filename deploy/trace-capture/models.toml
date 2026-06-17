@@ -11,7 +11,7 @@
 # in manifest.toml (see docs/conformance.md).
 
 [defaults]
-namespace = "weaton-dev"
+namespace = "inference-sim"
 queue = "conformance-queue"
 service_account = "modelexpress-p2p-nvidia-gpu-vllm-sa"
 gpu = "H200"

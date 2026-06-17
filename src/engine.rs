@@ -1282,18 +1282,15 @@ impl SimEngine {
         // dominates; small chunks elongate nothing.
         let duration = decode_base.max(chunk_cost);
 
-        if std::env::var_os("STEP_DEBUG").is_some() {
-            let chunk_tokens: usize = chunks.iter().map(|(_, t)| *t).sum();
-            eprintln!(
-                "STEP dur_ms={:.2} base_ms={:.2} chunk_ms={:.2} decoders={} chunk_tokens={} saturated={}",
-                duration.as_secs_f64() * 1000.0,
-                decode_base.as_secs_f64() * 1000.0,
-                chunk_cost.as_secs_f64() * 1000.0,
-                decoders.len(),
-                chunk_tokens,
-                left == 0 && !chunks.is_empty(),
-            );
-        }
+        debug!(
+            dur_ms = duration.as_secs_f64() * 1000.0,
+            base_ms = decode_base.as_secs_f64() * 1000.0,
+            chunk_ms = chunk_cost.as_secs_f64() * 1000.0,
+            decoders = decoders.len(),
+            chunk_tokens = chunks.iter().map(|(_, t)| *t).sum::<usize>(),
+            saturated = left == 0 && !chunks.is_empty(),
+            "step",
+        );
         self.current_step = Some(EngineStep {
             end: anchor + duration.div_f64(self.time_scale()),
             decoders,
@@ -1653,7 +1650,6 @@ impl SimEngine {
         let role = opt.pd_role;
         let cfg = NixlConfig {
             kv_block_bytes: opt.kv_block_bytes,
-            tokens_per_block: opt.tokens_per_block,
             kv_cache_blocks: opt.kv_cache_size as usize,
             engine_id: opt.engine_id.clone(),
             side_channel_host: opt.side_channel_host.clone(),
@@ -1816,7 +1812,6 @@ mod tests {
     fn test_engine(opt: Opt) -> (SimEngine, mpsc::UnboundedReceiver<PullCompletion>) {
         let cfg = NixlConfig {
             kv_block_bytes: opt.kv_block_bytes,
-            tokens_per_block: opt.tokens_per_block,
             kv_cache_blocks: opt.kv_cache_size as usize,
             engine_id: opt.engine_id.clone(),
             side_channel_host: opt.side_channel_host.clone(),

@@ -12,7 +12,11 @@
 #     v0.X-era main commits, not the tagged releases; the `tag` is the line label.
 #   - `patch_repo`/`patch_rev` (optional, both-or-neither): a fork that
 #     `[patch]`-overrides the crate for fixes not yet upstream (a DIFFERENT source
-#     than vllm.git). Omit when the line builds against upstream directly.
+#     than vllm.git). Omit when the line builds against upstream directly. NOTE:
+#     the older lines below pin the external `wseaton/vllm` serde-defaults fork;
+#     building those lines needs that fork to stay reachable (mirror it into the
+#     org if you want them to survive the fork going away). The default line
+#     builds against upstream and has no such dependency.
 #   - Exactly one line has `default = true`. That line is `:latest` / unsuffixed.
 #   - A line enters with `fidelity_validated = false` and is promoted to `true`
 #     only once the conformance replay gates pass against its captures.
