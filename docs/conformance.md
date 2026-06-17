@@ -160,23 +160,31 @@ a config it was not captured for. The tap stamps it into the trace metadata line
 `crates/sim-tap/src/bin/inference_sim_tap.rs` and `crates/sim-trace/src/trace.rs`).
 
 The recipe is `ConfigFingerprint` in `crates/sim-trace/src/config_hash.rs`: a lowercase-hex
-SHA-256 over a versioned, order-fixed canonical form (scheme tag `config-fingerprint-v1`)
+SHA-256 over a versioned, order-fixed canonical form (scheme tag `config-fingerprint-v2`)
 of these inputs, in this order:
 
 - `model`, `gpu`, `tp`, `block_size`, `max_num_seqs`
 - `vllm_tag` (the line tag, e.g. `v0.23.0`)
+- `enable_prefix_caching` (the tap's `--no-prefix-caching` flips it off)
+- `speculative` (the tap's `--speculative <descriptor>`, e.g. `ngram-k3`; `none` when off)
 
 `vllm_tag` is the line tag, NOT the engine's raw reported version: the engine reports a
 dev build (`0.23.0.dev1+g...`) that is not reproducible across rebuilds, so capture and
 replay must agree on the tag. The engine's reported version is recorded separately in the
-trace meta (`vllm_version`). If the input set ever changes, bump the scheme so old hashes
-deliberately stop matching.
+trace meta (`vllm_version`). The prefix-cache and speculative inputs (added in v2) keep a
+cache-off or spec-decode capture from sharing a fingerprint with the plain run of the same
+model/hardware. If the input set ever changes, bump the scheme so old hashes deliberately
+stop matching. (v1 goldens keep their v1 hashes and stay valid: the sim compares the
+stamped hash, it never recomputes.)
 
 Two ways to get the hash:
 
 - Run the tap with `--vllm-version <tag>` (and `--model`/`--gpu`/`--tp`/`--block-size`/
-  `--max-num-seqs`) and let it compute the fingerprint, stamping `config_hash` into the
-  trace `meta` automatically. This is the default; the manifest entry just copies it.
+  `--max-num-seqs`, plus `--no-prefix-caching` and/or `--speculative <descriptor>` to
+  match the engine's scheduler/decode config) and let it compute the fingerprint, stamping
+  `config_hash` into the trace `meta` automatically. This is the default; the manifest
+  entry just copies it. The capture driver sets these tap flags to mirror the engine's
+  actual flags, the tap can't observe them on the wire.
 - Or pass `--config-hash <hash>` explicitly to override the computed value.
 
 ## Upload + register the golden

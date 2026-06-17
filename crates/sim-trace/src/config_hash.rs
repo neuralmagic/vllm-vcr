@@ -15,7 +15,14 @@
 use sha2::{Digest, Sha256};
 
 /// Canonical-form scheme tag. Bump when the fingerprint inputs change.
-const SCHEME: &str = "config-fingerprint-v1";
+///
+/// v2 adds the scheduler/decode-mode inputs (`enable_prefix_caching`,
+/// `speculative`): these change replay behavior, so a prefix-cache-on trace and a
+/// prefix-cache-off trace (or a spec-decode trace) of the same model/hardware must
+/// not be interchangeable. v1 goldens keep their v1 hashes and stay valid (the sim
+/// compares the stamped hash, it never recomputes), so the bump only affects new
+/// captures.
+const SCHEME: &str = "config-fingerprint-v2";
 
 /// The deployment-config inputs that determine whether a captured trace is
 /// valid to replay. Two deployments with the same fingerprint produce
@@ -36,6 +43,13 @@ pub struct ConfigFingerprint {
     /// vLLM line/tag the engine spoke, e.g. `"v0.23.0"`. A different vLLM
     /// version can change scheduling/step behavior even at the same knobs.
     pub vllm_tag: String,
+    /// Whether the engine ran with prefix caching on. Cache hits skip prefill, so
+    /// a cache-on and a cache-off trace of the same workload are not interchangeable.
+    pub enable_prefix_caching: bool,
+    /// Speculative-decoding config the engine ran, as a canonical descriptor (e.g.
+    /// `"ngram-k3"`), or `None` for standard decoding. Spec decode emits multiple
+    /// tokens per step, changing the per-chunk ITL structure the replay reproduces.
+    pub speculative: Option<String>,
 }
 
 impl ConfigFingerprint {
@@ -49,8 +63,17 @@ impl ConfigFingerprint {
              tp={}\n\
              block_size={}\n\
              max_num_seqs={}\n\
-             vllm_tag={}\n",
-            self.model, self.gpu, self.tp, self.block_size, self.max_num_seqs, self.vllm_tag
+             vllm_tag={}\n\
+             enable_prefix_caching={}\n\
+             speculative={}\n",
+            self.model,
+            self.gpu,
+            self.tp,
+            self.block_size,
+            self.max_num_seqs,
+            self.vllm_tag,
+            self.enable_prefix_caching,
+            self.speculative.as_deref().unwrap_or("none"),
         )
     }
 
@@ -76,6 +99,8 @@ mod tests {
             block_size: 16,
             max_num_seqs: 256,
             vllm_tag: "v0.23.0".to_string(),
+            enable_prefix_caching: true,
+            speculative: None,
         }
     }
 
@@ -110,6 +135,14 @@ mod tests {
             },
             ConfigFingerprint {
                 vllm_tag: "v0.22.1".to_string(),
+                ..sample()
+            },
+            ConfigFingerprint {
+                enable_prefix_caching: false,
+                ..sample()
+            },
+            ConfigFingerprint {
+                speculative: Some("ngram-k3".to_string()),
                 ..sample()
             },
         ];

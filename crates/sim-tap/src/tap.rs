@@ -847,6 +847,12 @@ pub struct TapMetaConfig {
     /// build (`0.23.0.dev1+g...`) and not reproducible across rebuilds, so the
     /// tag is what capture and replay must agree on.
     pub vllm_tag: Option<String>,
+    /// Whether the engine ran with prefix caching on (a `config_hash` input). The
+    /// caller passes the engine's actual setting; the tap can't observe it.
+    pub enable_prefix_caching: bool,
+    /// Speculative-decode descriptor the engine ran (e.g. `"ngram-k3"`), or `None`
+    /// for standard decoding (a `config_hash` input, set by the caller).
+    pub speculative: Option<String>,
 }
 
 /// Build the trace meta from the caller's inputs plus what the handshake
@@ -870,6 +876,8 @@ fn build_meta(
                 block_size: meta.block_size as u32,
                 max_num_seqs: meta.max_num_seqs.unwrap_or(0),
                 vllm_tag,
+                enable_prefix_caching: meta.enable_prefix_caching,
+                speculative: meta.speculative.clone(),
             }
             .hash(),
         )
@@ -949,6 +957,8 @@ mod tests {
             block_size: 16,
             config_hash: None,
             vllm_tag: Some("v0.23.0".to_string()),
+            enable_prefix_caching: true,
+            speculative: None,
         };
         let a = build_meta(&cfg, "0.23.0.dev1+gAAAA", b"payload-a");
         let b = build_meta(&cfg, "0.23.0.dev9+gZZZZ", b"payload-b");
