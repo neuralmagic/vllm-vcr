@@ -1,11 +1,13 @@
 # Counterfactual-validation captures as Kueue-admitted Jobs.
 #
-# Two self-contained Jobs, queued on weaton-dev's benchmark-queue (ClusterQueue
-# llm-d-cluster-queue, gpu-h200 flavor). Each pod runs the capture stack as
-# sidecars (engine, tap, frontend) and the load generator as the main
-# container, so Kueue holds the Job until GPU quota admits it and releases the
-# GPU the moment the capture completes. The two Jobs are independent and may
-# run in parallel on separate H200s.
+# Two self-contained Jobs, queued on weaton-dev's conformance-queue (a dedicated
+# ClusterQueue with gpu-h200 nominalQuota: 1, see conformance-queue.yaml). Each pod
+# runs the capture stack as sidecars (engine, tap, frontend) and the load generator
+# as the main container, so Kueue holds the Job until GPU quota admits it and
+# releases the GPU the moment the capture completes. The queue's single GPU of quota
+# serializes the two Jobs: only ONE runs at a time, the other waits pending admission
+# (capture hygiene: one workload per pod lifetime, no cross-capture interference).
+# Apply conformance-queue.yaml once before submitting these.
 #
 #   trace-validation-cached    prefix cache ON: prompt-length sweep (fits the
 #                              latency model's long-prefill buckets) + the
@@ -30,7 +32,7 @@ metadata:
   name: trace-validation-cached
   namespace: weaton-dev
   labels:
-    kueue.x-k8s.io/queue-name: benchmark-queue
+    kueue.x-k8s.io/queue-name: conformance-queue
     llm-d.ai/guide: trace-capture
 spec:
   suspend: true # Kueue unsuspends on admission
@@ -154,7 +156,7 @@ metadata:
   name: trace-validation-nocache
   namespace: weaton-dev
   labels:
-    kueue.x-k8s.io/queue-name: benchmark-queue
+    kueue.x-k8s.io/queue-name: conformance-queue
     llm-d.ai/guide: trace-capture
 spec:
   suspend: true

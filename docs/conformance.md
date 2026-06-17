@@ -98,10 +98,19 @@ completes. Two self-contained Jobs live in `deploy/trace-capture/validation-jobs
 - `trace-validation-nocache` — engine started with `--no-enable-prefix-caching`, same
   multiturn workload: the real counterfactual.
 
-The Jobs are independent and may run in parallel on separate H200s. Each pod runs the
-engine/tap/frontend as sidecars and `validation-runner.sh` as the main loadgen
-container, which runs the phases in `$PHASES`, marks the trace line count at each phase
-boundary (for slicing the JSONL locally), then idles until the trace is fetched.
+Both Jobs target `conformance-queue` (`deploy/trace-capture/conformance-queue.yaml`), a
+dedicated Kueue queue with a one-GPU quota, so they run **one at a time**: whichever
+admits first holds the single GPU of quota, the other waits pending until it completes.
+This is deliberate (capture hygiene: one workload per pod lifetime, no cross-capture
+interference). Apply the queue once before the first capture:
+
+```bash
+kubectl apply -f deploy/trace-capture/conformance-queue.yaml
+```
+
+Each pod runs the engine/tap/frontend as sidecars and `validation-runner.sh` as the main
+loadgen container, which runs the phases in `$PHASES`, marks the trace line count at each
+phase boundary (for slicing the JSONL locally), then idles until the trace is fetched.
 
 Per line, the steps (wrapped by the justfile in the canonical flow):
 
