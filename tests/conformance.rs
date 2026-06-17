@@ -180,8 +180,11 @@ async fn check_fidelity(trace_path: &Path) {
 /// checked (0 means cleanly skipped: none for this line, or none fetched).
 async fn run_conformance(manifest_path: &Path, goldens_dir: Option<&Path>) -> usize {
     let manifest = GoldenManifest::load(manifest_path).expect("load conformance manifest");
+    // The build's compat line: the major.minor for a release tag (v0.23.0 -> 0.23), or
+    // the tag verbatim when it has no major.minor (e.g. "nightly", which tracks main).
+    // Matches the `line` field on golden entries (compat.toml uses "0.23" / "nightly").
     let line = sim_compat::minor_line(VLLM_TARGET_VERSION)
-        .expect("VLLM_TARGET_VERSION must have a major.minor line");
+        .unwrap_or_else(|| VLLM_TARGET_VERSION.to_string());
 
     let goldens: Vec<_> = manifest.for_line(&line).collect();
     if goldens.is_empty() {
@@ -240,8 +243,15 @@ async fn build_conforms_to_its_vllm_line_goldens() {
 async fn synthetic_schema_golden_passes_the_static_checks() {
     use std::io::Write as _;
 
-    let line = sim_compat::minor_line(VLLM_TARGET_VERSION).expect("build line");
-    let captured_version = format!("{line}.0.dev1+gTEST");
+    let line = sim_compat::minor_line(VLLM_TARGET_VERSION)
+        .unwrap_or_else(|| VLLM_TARGET_VERSION.to_string());
+    // A release line (0.23) needs a captured version on that line; nightly tracks main,
+    // so assert_same_line accepts any version there (use a representative dev build).
+    let captured_version = if sim_compat::minor_line(VLLM_TARGET_VERSION).is_some() {
+        format!("{line}.0.dev1+gTEST")
+    } else {
+        "0.99.0.dev1+gTEST".to_string()
+    };
     let config_hash = "synthetic-config-hash";
 
     // A ready response carrying exactly the sim's registration field set.

@@ -55,9 +55,16 @@ pub fn assert_ready_response_schema(recorded: &[u8], sim_ready: &SimReadyRespons
 }
 
 /// Assert the golden was captured from an engine on the same `major.minor` line
-/// this build targets. Strict: an unparseable version is a conformance failure
-/// (unlike the tap's capture guard, which is lenient so a capture still runs).
+/// this build targets. Strict: an unparseable *captured* version is a conformance
+/// failure (unlike the tap's capture guard, which is lenient so a capture still runs).
+///
+/// Exception: a build target with no major.minor (e.g. `"nightly"`, which tracks vLLM
+/// main) matches any captured version. Nightly *is* whatever main currently reports,
+/// so there is no fixed line to compare against.
 pub fn assert_same_line(build_target: &str, captured_version: &str) -> Result<()> {
+    if sim_compat::minor_line(build_target).is_none() {
+        return Ok(());
+    }
     match (
         sim_compat::minor_line(build_target),
         sim_compat::minor_line(captured_version),
@@ -147,5 +154,13 @@ mod tests {
     #[test]
     fn line_check_is_strict_on_unparseable_versions() {
         assert!(assert_same_line("v0.23.0", "nightly-weird").is_err());
+    }
+
+    #[test]
+    fn nightly_build_matches_any_captured_version() {
+        // "nightly" tracks main, so it has no fixed line and accepts whatever the
+        // captured engine reported (here a main dev build).
+        assert_same_line("nightly", "0.24.0.dev1+gABCDEF").expect("nightly matches main");
+        assert_same_line("nightly", "0.23.0").expect("nightly matches a release too");
     }
 }
