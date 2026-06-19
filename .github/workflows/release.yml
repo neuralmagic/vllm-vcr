@@ -41,35 +41,13 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+      # `cargo xtask release-matrix` crosses every compat.toml line with the
+      # native-arch release platforms (defined in xtask). The default line also
+      # publishes the line-agnostic trace tooling.
       - name: Build the line x platform matrix
         id: parse
-        run: |
-          include=$(python3 - <<'PY'
-          import json, tomllib
-          # Native per-arch runners (no cross-compile): Linux targets build static musl,
-          # macOS builds its native arm64. Add platforms here to widen the fan-out.
-          platforms = [
-              {"runner": "ubuntu-latest",    "target": "x86_64-unknown-linux-musl",  "os": "linux"},
-              {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-musl", "os": "linux"},
-              {"runner": "macos-14",         "target": "aarch64-apple-darwin",       "os": "macos"},
-          ]
-          with open("compat.toml", "rb") as f:
-              lines = tomllib.load(f).get("vllm", [])
-          rows = []
-          for v in lines:
-              for p in platforms:
-                  rows.append({
-                      "line": v["line"],
-                      "tag": v["tag"],
-                      "protocol_rev": v["protocol_rev"],
-                      # The default line also publishes the line-agnostic trace tooling.
-                      "default": v.get("default", False),
-                      **p,
-                  })
-          print(json.dumps(rows, separators=(",", ":")))
-          PY
-          )
-          echo "include=${include}" >> "$GITHUB_OUTPUT"
+        run: echo "include=$(cargo xtask release-matrix)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: matrix
@@ -96,10 +74,10 @@ jobs:
         if: ${{ matrix.os == 'linux' }}
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      # Pin Cargo.toml to this line's rev + fork patch (see ci/pin-vllm-rev.py). The rev
+      # Pin Cargo.toml to this line's rev + fork patch (see cargo xtask pin-vllm). The rev
       # then no longer matches Cargo.lock, so the build omits --locked.
       - name: Pin vLLM rev (line ${{ matrix.line }})
-        run: python3 ci/pin-vllm-rev.py "${{ matrix.line }}"
+        run: cargo xtask pin-vllm "${{ matrix.line }}"
 
       # Default features only: no NIXL, so these stay small pure-Rust binaries.
       - name: Build inference-sim + inference-sim-tap (${{ matrix.target }})

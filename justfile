@@ -33,23 +33,15 @@ image-build:
     podman build --platform linux/amd64 -t {{image}} .
 
 # Build the capture image for a specific compat.toml line, e.g. `just image-build-line 0.22`.
-# Pins Cargo.toml to the line's rev/fork via ci/pin-vllm-rev.py (leaves the tree dirty;
+# Pins Cargo.toml to the line's rev/fork via `cargo xtask pin-vllm` (leaves the tree dirty;
 # restore with `git checkout Cargo.toml Cargo.lock`), stamps VLLM_TARGET_VERSION for build.rs,
 # and builds the vllm-rs frontend from the same source as the tap. Tags as <image>-vllm<line>.
 # amd64 only; on Apple Silicon prefer a native remote builder over local emulation.
 image-build-line line:
     #!/usr/bin/env bash
     set -euo pipefail
-    python3 ci/pin-vllm-rev.py "{{line}}"
-    eval "$(python3 - "{{line}}" <<'PY'
-    import sys, tomllib
-    line = sys.argv[1]
-    v = next(x for x in tomllib.load(open("compat.toml", "rb"))["vllm"] if x["line"] == line)
-    repo = v.get("patch_repo") or "https://github.com/vllm-project/vllm.git"
-    ref = v.get("patch_rev") or v["protocol_rev"]
-    print(f'TAG={v["tag"]}; FREPO={repo}; FREF={ref}')
-    PY
-    )"
+    cargo xtask pin-vllm "{{line}}"
+    eval "$(cargo xtask frontend-args "{{line}}")"
     podman build --platform linux/amd64 \
         --build-arg VLLM_TARGET_VERSION="$TAG" \
         --build-arg VLLM_REPO="$FREPO" \

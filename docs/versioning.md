@@ -91,11 +91,11 @@ fails for every line (including the head). The per-line build instead rewrites
 the manifest in a throwaway checkout:
 
 ```sh
-python3 ci/pin-vllm-rev.py "<line>"   # reads compat.toml, edits Cargo.toml
+cargo xtask pin-vllm "<line>"   # reads compat.toml, edits Cargo.toml
 cargo build --workspace               # no --locked: the rev changed
 ```
 
-`pin-vllm-rev.py` sets the rev in `[workspace.dependencies]` and rewrites or
+`cargo xtask pin-vllm` sets the rev in `[workspace.dependencies]` and rewrites or
 removes the fork `[patch]` from the line's `patch_repo`/`patch_rev` (the head
 line carries the #45848 fork; lines without a fork build against `protocol_rev`
 upstream). `compat.toml` stays the single source of truth.
@@ -132,7 +132,7 @@ When vLLM cuts N+1:
    **Done** (per-line build/unit/conformance; see `conformance.md`).
 3. Compatibility shim for the protocol crate's per-line API drift. **Done** for
    the 0.22 line; see `multi-version-shim.md` (capability cfgs + owned/tolerant
-   decodes, `ci/pin-vllm-rev.py`). This is what lets one `main` build against
+   decodes, `cargo xtask pin-vllm`). This is what lets one `main` build against
    multiple lines without a single multi-version binary.
 
 ## Open coupling note: the `block_size` / registration drift

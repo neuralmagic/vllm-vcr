@@ -81,39 +81,16 @@ jobs:
         with:
           persist-credentials: false
 
-      # tomllib is stdlib on the ubuntu-latest python3 (3.12), so no pip install.
-      # Emit one matrix entry per [[vllm]] line as compact JSON on $GITHUB_OUTPUT.
-      - name: Parse compat.toml into a build matrix
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      # `cargo xtask ci-matrix` reads compat.toml + conformance/manifest.toml via
+      # sim-compat and emits one row per [[vllm]] line (compact JSON on stdout).
+      - name: Build matrix from compat.toml
         id: parse
-        run: |
-          include=$(python3 - <<'PY'
-          import json, tomllib, os
-          with open("compat.toml", "rb") as f:
-              compat = tomllib.load(f)
-          # Lines that have at least one golden registered drive the AWS fetch; the
-          # rest skip credentials entirely.
-          golden_lines = set()
-          if os.path.exists("conformance/manifest.toml"):
-              with open("conformance/manifest.toml", "rb") as f:
-                  manifest = tomllib.load(f)
-              golden_lines = {g["line"] for g in manifest.get("golden", [])}
-          rows = []
-          for v in compat.get("vllm", []):
-              rows.append({
-                  "line": v["line"],
-                  "tag": v["tag"],
-                  "protocol_rev": v["protocol_rev"],
-                  "fidelity_validated": bool(v.get("fidelity_validated", False)),
-                  "default": bool(v.get("default", False)),
-                  "has_goldens": v["line"] in golden_lines,
-              })
-          print(json.dumps(rows, separators=(",", ":")))
-          PY
-          )
-          echo "include=${include}" >> "$GITHUB_OUTPUT"
+        run: echo "include=$(cargo xtask ci-matrix)" >> "$GITHUB_OUTPUT"
 
   # Per-line build + conformance. One leg per compat.toml line, each compiling the
-  # protocol crate against that line's rev (pinned into Cargo.toml by ci/pin-vllm-rev.py;
+  # protocol crate against that line's rev (pinned into Cargo.toml by cargo xtask pin-vllm;
   # see that script for why --config can't do it). fmt/clippy stay in build-and-test
   # above: they don't depend on the vLLM rev, so running them once is enough.
   #
@@ -165,7 +142,7 @@ jobs:
       # rewritten or removed. After this the rev no longer matches Cargo.lock, so the
       # build/test below deliberately omit --locked. compat.toml is the source of truth.
       - name: Pin vLLM rev (line ${{ matrix.line }})
-        run: python3 ci/pin-vllm-rev.py "${{ matrix.line }}"
+        run: cargo xtask pin-vllm "${{ matrix.line }}"
 
       - name: Build (vLLM ${{ matrix.line }} @ ${{ matrix.tag }})
         run: cargo build --workspace
