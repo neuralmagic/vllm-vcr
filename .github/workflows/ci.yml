@@ -65,6 +65,20 @@ jobs:
       - name: Check (nixl-stub)
         run: cargo check --all-targets --locked --features nixl-stub
 
+  # Supply-chain gate: RUSTSEC advisories, license compatibility, and source
+  # allowlisting over the whole dependency graph (config in deny.toml). The
+  # advisories check is time-sensitive, so a newly published CVE can turn this red
+  # on an unrelated push; that's the gate working (address or ignore-with-reason).
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check
+
   # Read compat.toml and emit the N-3 support window as a JSON matrix. Keeping the
   # parse in its own tiny job means the heavy per-line build job can `needs:` a
   # ready-made list instead of re-parsing the manifest per matrix leg.

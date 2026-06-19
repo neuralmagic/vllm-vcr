@@ -65,6 +65,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "A mock vLLM V1 engine-core backend that speaks the real ZMQ/msgpack protocol, with a NIXL CPU/RDMA data plane for GPU-free prefill/decode testing."
 
 [[bin]]
