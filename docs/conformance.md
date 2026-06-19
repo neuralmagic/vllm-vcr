@@ -300,7 +300,7 @@ under QEMU is unreliable (rustc SIGSEGVs under emulation). Build natively:
   for the compat.toml default line (slow under emulation; run on an amd64 host).
 - `just image-build-line <line>` builds the image for an older line, e.g.
   `just image-build-line 0.22`: it pins `Cargo.toml` to that line's rev/fork with
-  `ci/pin-vllm-rev.py`, stamps `VLLM_TARGET_VERSION`, and builds the vllm-rs frontend
+  `cargo xtask pin-vllm`, stamps `VLLM_TARGET_VERSION`, and builds the vllm-rs frontend
   from the same source as the tap. (It leaves `Cargo.toml`/`Cargo.lock` rewritten;
   `git checkout Cargo.toml Cargo.lock` to restore.)
 - On Apple Silicon, use the **build-on-waldorf** flow to build natively on the cluster

@@ -30,7 +30,7 @@ the **same** source ("patches must point to different sources"). So the per-line
 rev is swapped in `[workspace.dependencies]`, not via `--config patch`. `build.rs`
 cannot do it either: dependency resolution happens before any build script runs.
 
-`ci/pin-vllm-rev.py <line>` reads `compat.toml` and rewrites `Cargo.toml`: it sets
+`cargo xtask pin-vllm <line>` reads `compat.toml` and rewrites `Cargo.toml`: it sets
 the `vllm-engine-core-client` rev to the line's `protocol_rev`, and inserts,
 rewrites, or removes the fork `[patch]` to match the line's `patch_repo`/`patch_rev`
 (a fork is a *different* source, so it is allowed to `[patch]`). The committed
@@ -46,7 +46,7 @@ block first, so it's idempotent. After the rewrite the rev no longer matches
 older-line build must too:
 
 ```sh
-python3 ci/pin-vllm-rev.py 0.22
+cargo xtask pin-vllm 0.22
 VLLM_TARGET_VERSION=v0.22.1 cargo build --workspace   # no --locked
 ```
 
@@ -130,7 +130,7 @@ bump. The fix is `vllm-project/vllm#45848` backported onto the 0.22 base:
 - it adds the field defaults (temperature/top_p/repetition_penalty=1.0,
   max_tokens=16, the rest zero/None/empty) and nothing else.
 - both the 0.21 and 0.22 lines carry it via `patch_repo`/`patch_rev` in
-  `compat.toml`; `ci/pin-vllm-rev.py` inserts the `[patch]` block per leg (the
+  `compat.toml`; `cargo xtask pin-vllm` inserts the `[patch]` block per leg (the
   committed `Cargo.toml` has none, since the default line builds upstream).
 
 ## Follow-ups

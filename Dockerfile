@@ -86,7 +86,7 @@ RUN git clone ${VLLM_REPO} /src/vllm \
 
 # 3. Build our mock engine against the real libnixl, plus the engine-core recording tap.
 #    The context's Cargo.toml is already pinned to this line's rev/fork by
-#    ci/pin-vllm-rev.py (so no --locked: the rev no longer matches Cargo.lock).
+#    cargo xtask pin-vllm (so no --locked: the rev no longer matches Cargo.lock).
 COPY . /src/inference-simulator-rs
 # The nixl feature lives on the root package; the tap is its own workspace
 # member, so build them in one invocation (-p selects packages, --features
