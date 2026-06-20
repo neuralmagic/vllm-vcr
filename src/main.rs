@@ -42,6 +42,13 @@ enum Command {
     /// and run calibration.
     #[command(subcommand)]
     Inspect(inspect::InspectCommand),
+
+    /// Print a shell completion script to stdout. Source it from your shell rc,
+    /// e.g. `vllm-vcr completions fish > ~/.config/fish/completions/vllm-vcr.fish`.
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
 }
 
 /// Logs go to stderr so `inspect`'s stdout stays clean for piping (Perfetto
@@ -79,6 +86,11 @@ fn main() -> ExitCode {
         Command::Record(args) => record::run(args).map(|()| ExitCode::SUCCESS),
         Command::Play(opt) => play(*opt).map(|()| ExitCode::SUCCESS),
         Command::Inspect(command) => inspect::run(command),
+        Command::Completions { shell } => {
+            let mut cmd = <Cli as clap::CommandFactory>::command();
+            clap_complete::generate(shell, &mut cmd, "vllm-vcr", &mut std::io::stdout());
+            Ok(ExitCode::SUCCESS)
+        }
     };
 
     match result {
