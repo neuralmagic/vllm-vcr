@@ -27,6 +27,7 @@ vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", re
 
 anyhow = "1.0.100"
 clap = { version = "4.5.38", features = ["derive", "env"] }
+clap_complete = "4.5.58"
 flate2 = "1.1.9"
 futures = "0.3.31"
 rand = "0.9.2"
@@ -99,6 +100,7 @@ base64 = { version = "0.22.1", optional = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
 rmpv = { workspace = true }
