@@ -8,7 +8,7 @@ This directory uses **Kustomize** for multi-cluster trace capture deployments.
 deploy/trace-capture/
 ├── base/                           # Cluster-agnostic manifests
 │   ├── kustomization.yaml          # Base resource list
-│   ├── h200-capture.yaml           # H200 deployment (no namespace/SA)
+│   ├── h200-capture.yaml           # H200 deployment (no namespace)
 │   ├── conformance-queue.yaml      # Kueue queue configuration
 │   └── pvcs/                       # PersistentVolumeClaims
 │       ├── gemma3-model-cache-pvc.yaml
@@ -16,7 +16,7 @@ deploy/trace-capture/
 │
 └── overlays/                       # Per-cluster configurations
     └── inference-sim/              # Cluster-specific overlay
-        └── kustomization.yaml      # namespace + serviceAccount via replacements
+        └── kustomization.yaml      # sets namespace
 ```
 
 ## Quick Start
@@ -37,9 +37,6 @@ just replay-up               # Deploy offline replay
 # Check namespace is set
 kustomize build deploy/trace-capture/overlays/inference-sim | grep "namespace: inference-sim"
 
-# Check serviceAccount is set on all Deployments (expect 11)
-kustomize build deploy/trace-capture/overlays/inference-sim | grep "serviceAccountName:" | wc -l
-
 # Preview without applying
 kustomize build deploy/trace-capture/overlays/inference-sim > /tmp/preview.yaml
 ```
@@ -53,35 +50,15 @@ To deploy to a different cluster:
    cp -r deploy/trace-capture/overlays/inference-sim deploy/trace-capture/overlays/my-cluster
    ```
 
-2. **Edit `kustomization.yaml`** — two values in one file:
+2. **Edit `kustomization.yaml`** to set your cluster's namespace:
    ```yaml
    apiVersion: kustomize.config.k8s.io/v1beta1
    kind: Kustomization
 
-   namespace: my-namespace  # Change this
+   namespace: my-namespace
 
    resources:
      - ../../base
-
-   configMapGenerator:
-     - name: cluster-config
-       literals:
-         - serviceAccountName=my-gpu-serviceaccount  # Change this
-       options:
-         disableNameSuffixHash: true
-
-   replacements:
-     - source:
-         kind: ConfigMap
-         name: cluster-config
-         fieldPath: data.serviceAccountName
-       targets:
-         - select:
-             kind: Deployment
-           fieldPaths:
-             - spec.template.spec.serviceAccountName
-           options:
-             create: true
    ```
 
 3. **Test and apply**:
@@ -90,18 +67,18 @@ To deploy to a different cluster:
    kustomize build deploy/trace-capture/overlays/my-cluster | kubectl apply -f -
    ```
 
-The overlay also emits a `cluster-config` ConfigMap (metadata only) used as the replacement source at build time.
+Pods use the namespace default ServiceAccount unless the namespace is configured otherwise.
 
 ## What Changed
 
 Previously, manifests used `your-namespace` and `your-gpu-serviceaccount` placeholders requiring manual `sed` replacement. Now:
 
-- **Base manifests** have no hardcoded namespace or serviceAccount
-- **Overlays** set namespace once and serviceAccount once via `configMapGenerator` + `replacements`
+- **Base manifests** have no hardcoded namespace
+- **Overlays** set namespace once via kustomize
 - **Justfile recipes** use `kustomize build` instead of direct `kubectl apply`
 
-Conformance capture Jobs are generated separately from `models.toml` (`service_account` in `[defaults]`); update that when changing clusters too.
+Conformance capture Jobs are generated separately from `models.toml`; set `namespace` in `[defaults]` when changing clusters.
 
 ## Original Manifests
 
-Original manifests are preserved in `base/` with only namespace/serviceAccount fields removed. All container images, args, volumes, and resources remain unchanged.
+Original manifests are preserved in `base/` with only namespace fields removed. All container images, args, volumes, and resources remain unchanged.

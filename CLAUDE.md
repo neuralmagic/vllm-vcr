@@ -109,10 +109,10 @@ The project maintains a rolling support window for multiple vLLM versions define
 ## Deployment
 
 Trace capture deployments use **Kustomize** for multi-cluster configuration. Manifests are in `deploy/trace-capture/`:
-- **`base/`** - Cluster-agnostic manifests (no hardcoded namespace/serviceAccount)
-- **`overlays/inference-sim/`** - Cluster-specific configuration (namespace: `inference-sim`, serviceAccount: `modelexpress-p2p-nvidia-gpu-vllm-sa`)
+- **`base/`** - Cluster-agnostic manifests (no hardcoded namespace)
+- **`overlays/inference-sim/`** - Cluster-specific configuration (namespace: `inference-sim`)
 
-To deploy to a different cluster, copy `overlays/inference-sim/` and update `namespace` + `serviceAccountName`. See `deploy/trace-capture/README.md` for details.
+To deploy to a different cluster, copy `overlays/inference-sim/` and update `namespace`. See `deploy/trace-capture/README.md` for details.
 
 ## Justfile Recipes
 

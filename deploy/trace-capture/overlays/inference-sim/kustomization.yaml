@@ -5,23 +5,3 @@ namespace: inference-sim
 
 resources:
   - ../../base
-
-configMapGenerator:
-  - name: cluster-config
-    literals:
-      - serviceAccountName=modelexpress-p2p-nvidia-gpu-vllm-sa
-    options:
-      disableNameSuffixHash: true
-
-replacements:
-  - source:
-      kind: ConfigMap
-      name: cluster-config
-      fieldPath: data.serviceAccountName
-    targets:
-      - select:
-          kind: Deployment
-        fieldPaths:
-          - spec.template.spec.serviceAccountName
-        options:
-          create: true
