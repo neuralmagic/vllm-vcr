@@ -118,6 +118,18 @@ phases = "sweep multiturn"
 engine_memory_request = "64Gi"
 engine_memory_limit = "128Gi"
 
+[[capture]]
+name = "gemma-4-12B"
+model = "google/gemma-4-12B"
+vllm_tag = "v0.23.0"
+scenario = "baseline"
+engine_memory_request = "64Gi"
+engine_memory_limit = "96i"
+
+
+
+
+
 # Multimodal: needs the loadgen image mode (a /v1/chat/completions image path) before it
 # captures successfully; the runner rejects an unknown "multimodal" phase until then.
 [[capture]]
@@ -127,3 +139,4 @@ vllm_tag = "v0.23.0"
 scenario = "multimodal"
 phases = "multimodal"
 max_model_len = 32768
+
