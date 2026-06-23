@@ -36,6 +36,7 @@
 
 # Operations
 
+- [Deploy layouts](./deploy.md)
 - [Versioning](./versioning.md)
 - [Multi-version shim](./multi-version-shim.md)
 - [Conformance](./conformance.md)
