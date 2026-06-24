@@ -54,9 +54,15 @@ image-push:
 
 # --- cluster capture rig ----------------------------------------------------------
 
+# Apply only resources tagged with the given rig label (see llm-d.ai/rig in base/).
+_apply-rig rig:
+    kustomize build deploy/trace-capture/overlays/{{namespace}} | \
+      yq 'select(.metadata.labels["llm-d.ai/rig"] == "{{rig}}")' | \
+      kubectl apply -f -
+
 # Apply the manifests via kustomize and scale the capture pod up (1x GPU; queues if none free).
 capture-up:
-    kustomize build deploy/trace-capture/overlays/{{namespace}} | kubectl apply -f -
+    just _apply-rig h200
     kubectl -n {{namespace}} scale deploy {{deploy}} --replicas=1
 
 # Scale the capture pod down (always do this when finished).
@@ -83,7 +89,7 @@ capture-fetch out="/tmp/tap-trace.jsonl":
 
 # Apply the one-GPU conformance queue (serializes captures; run once).
 conformance-queue:
-    kustomize build deploy/trace-capture/overlays/{{namespace}} | kubectl apply -f -
+    just _apply-rig conformance-queue
 
 # List the capture targets defined in models.toml.
 conformance-list:
@@ -103,7 +109,7 @@ conformance-capture +names:
 
 # Agentic capture rig: python frontend (/v1/messages) + tap + GPU engine.
 agentic-capture-up:
-    kustomize build deploy/trace-capture/overlays/{{namespace}} | kubectl apply -f -
+    just _apply-rig agentic
     kubectl -n {{namespace}} scale deploy trace-capture-h200-agentic --replicas=1
 
 agentic-capture-down:
@@ -115,7 +121,7 @@ agentic-capture-fetch out="/tmp/agentic-tap-trace.jsonl":
 
 # Offline replay rig: python frontend + vllm-vcr play, zero GPU (then: replay-load-trace).
 replay-up:
-    kustomize build deploy/trace-capture/overlays/{{namespace}} | kubectl apply -f -
+    just _apply-rig replay
 
 replay-down:
     kubectl -n {{namespace}} scale deploy offline-replay --replicas=0
@@ -172,7 +178,7 @@ replay trace latency_trace tolerance="0.10":
 
 # Apply the rig with the engine's prefix cache DISABLED (counterfactual capture).
 capture-up-nocache:
-    kustomize build deploy/trace-capture/overlays/{{namespace}} | kubectl apply -f -
+    just _apply-rig h200
     kubectl -n {{namespace}} patch deploy {{deploy}} --type=json \
         -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--no-enable-prefix-caching"}]'
     kubectl -n {{namespace}} scale deploy {{deploy}} --replicas=1

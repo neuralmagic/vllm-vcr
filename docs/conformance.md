@@ -139,6 +139,10 @@ line count at each phase boundary, then idles until the trace is fetched.
 
 The flow (wrapped by the justfile):
 
+> **Warning:** `kustomize build deploy/trace-capture/overlays/inference-sim | kubectl apply -f -`
+> applies the **full GPU fleet** (every capture Deployment at `replicas: 1`). Always use the
+> justfile recipes below, or filter by `llm-d.ai/rig` before apply.
+
 ```bash
 just conformance-queue                  # apply the one-GPU queue (once)
 just conformance-list                   # see the targets in models.toml

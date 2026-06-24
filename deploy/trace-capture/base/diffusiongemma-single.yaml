@@ -7,6 +7,7 @@ metadata:
   labels:
     llm-d.ai/guide: trace-capture-dg-single
     llm-d.ai/model: diffusiongemma-26B-A4B
+    llm-d.ai/rig: diffusiongemma-single
 spec:
   replicas: 1
   selector:

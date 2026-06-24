@@ -3,6 +3,8 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: gemma4-31b-model-cache
+  labels:
+    llm-d.ai/rig: gemma4-31b
 spec:
   accessModes: ["ReadWriteMany"]
   storageClassName: shared-vast

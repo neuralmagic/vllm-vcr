@@ -8,6 +8,7 @@ metadata:
   labels:
     llm-d.ai/guide: trace-capture
     llm-d.ai/model: gemma-4-26B-A4B
+    llm-d.ai/rig: gemma4
 spec:
   replicas: 1
   selector:

@@ -7,6 +7,7 @@ metadata:
   labels:
     llm-d.ai/guide: offline-replay
     llm-d.ai/model: Qwen3-Coder-30B-A3B
+    llm-d.ai/rig: replay
 spec:
   replicas: 1
   selector:
