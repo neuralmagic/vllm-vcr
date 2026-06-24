@@ -197,6 +197,6 @@ The CI flow (`.github/workflows/ci.yml`):
    once the golden validates, and the leg becomes a hard gate.
 
 The replay-many half needs no GPU and is the same mechanism as the offline replay rig
-(`deploy/trace-capture/offline-replay.yaml`): the python frontend talks to
+(`deploy/trace-capture/base/offline-replay.yaml`): the python frontend talks to
 `vllm-vcr play` serving the captured trace, with no real engine behind it. CI runs it
 headlessly; the rig serves a live agent the same byte-identical streams.

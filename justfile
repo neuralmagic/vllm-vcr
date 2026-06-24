@@ -172,7 +172,7 @@ replay trace latency_trace tolerance="0.10":
 
 # Apply the rig with the engine's prefix cache DISABLED (counterfactual capture).
 capture-up-nocache:
-    kubectl apply -f deploy/trace-capture/h200-capture.yaml
+    kustomize build deploy/trace-capture/overlays/{{namespace}} | kubectl apply -f -
     kubectl -n {{namespace}} patch deploy {{deploy}} --type=json \
         -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--no-enable-prefix-caching"}]'
     kubectl -n {{namespace}} scale deploy {{deploy}} --replicas=1

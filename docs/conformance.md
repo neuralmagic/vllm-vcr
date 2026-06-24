@@ -130,7 +130,7 @@ scenario drives the engine *and* tap flags so the `config_hash` matches the engi
 available for timing inspection. To add a model or scenario, edit `models.toml`, no YAML by
 hand.
 
-All capture Jobs target `conformance-queue` (`conformance-queue.yaml`), a dedicated Kueue
+All capture Jobs target `conformance-queue` (`base/conformance-queue.yaml`), a dedicated Kueue
 queue with a one-GPU quota, so they run **one at a time**: submit as many as you like and
 they serialize, the rest wait pending (capture hygiene: one workload per pod lifetime, no
 cross-capture interference). Each pod runs engine/tap/frontend as sidecars and
@@ -329,7 +329,7 @@ golden-fetch role as CI, and replays it before publishing the rolling prerelease
 
 ## The GPU-free replay half
 
-The replay-many half needs no GPU anywhere. `deploy/trace-capture/offline-replay.yaml`
+The replay-many half needs no GPU anywhere. `deploy/trace-capture/base/offline-replay.yaml`
 runs the same python frontend with `vllm-vcr play` (not a real engine) in the engine
 slot, serving a captured trace with content-keyed matching:
 

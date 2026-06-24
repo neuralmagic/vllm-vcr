@@ -102,7 +102,7 @@ already ships the anthropic entrypoint including the billing-header strip):
 </div>
 
 1. `just agentic-capture-up` deploys
-   `deploy/trace-capture/h200-capture-agentic.yaml` (tap has
+   `deploy/trace-capture/base/h200-capture-agentic.yaml` (tap has
    `--record-tokens` on; the trace carries user content, token ids decode
    back to text, treat it accordingly). First deploy: verify the API-only
    frontend boots without a GPU; vLLM's platform probe has historically
@@ -128,7 +128,7 @@ already ships the anthropic entrypoint including the billing-header strip):
 ## Replay (no GPU)
 
 On the cluster: `just replay-up` deploys
-`deploy/trace-capture/offline-replay.yaml` (the same python frontend in
+`deploy/trace-capture/base/offline-replay.yaml` (the same python frontend in
 front of `vllm-vcr play --replay-match prefix`, zero GPU), then
 `just replay-load-trace <trace>` copies the capture in; the sim starts as
 soon as the file appears. Or run the same pair locally:
