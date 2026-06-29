@@ -1,5 +1,6 @@
-//! S3 object I/O for vllm-vcr trace files: a [`TraceUri`] is a local path
-//! or an `s3://` object, fetched/uploaded via the AWS default credential chain.
+//! S3 and HuggingFace object I/O for vllm-vcr trace files: a [`TraceUri`] is a local path,
+//! an `s3://` object, or an `hf://` HuggingFace Hub file, fetched/uploaded via the AWS
+//! default credential chain or HuggingFace Hub API.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -13,9 +14,12 @@ use aws_sdk_s3::primitives::ByteStream;
 use tracing::{debug, info};
 use url::Url;
 
-/// Whether a raw path string is an `s3://` URI rather than a local path.
+/// Whether a raw path string is an `s3://` or `hf://` URI rather than a local path.
 pub fn is_remote(uri: &str) -> bool {
-    uri.len() >= 5 && uri[..5].eq_ignore_ascii_case("s3://")
+    uri.len() >= 5 && (
+        uri[..5].eq_ignore_ascii_case("s3://") ||
+        uri[..5].eq_ignore_ascii_case("hf://")
+    )
 }
 
 /// A trace location, parsed (and validated) at the CLI boundary.
@@ -23,6 +27,7 @@ pub fn is_remote(uri: &str) -> bool {
 pub enum TraceUri {
     Local(PathBuf),
     S3 { bucket: String, key: String },
+    HuggingFace { repo: String, file: String },
 }
 
 impl FromStr for TraceUri {
@@ -30,8 +35,15 @@ impl FromStr for TraceUri {
 
     fn from_str(s: &str) -> Result<Self, String> {
         if is_remote(s) {
-            let (bucket, key) = parse_s3_uri(s).map_err(|e| format!("{e:#}"))?;
-            Ok(TraceUri::S3 { bucket, key })
+            if s.starts_with("s3://") || s.starts_with("S3://") {
+                let (bucket, key) = parse_s3_uri(s).map_err(|e| format!("{e:#}"))?;
+                Ok(TraceUri::S3 { bucket, key })
+            } else if s.starts_with("hf://") || s.starts_with("HF://") {
+                let (repo, file) = parse_hf_uri(s).map_err(|e| format!("{e:#}"))?;
+                Ok(TraceUri::HuggingFace { repo, file })
+            } else {
+                Err("unknown remote URI scheme (expected s3:// or hf://)".to_string())
+            }
         } else {
             Ok(TraceUri::Local(PathBuf::from(s)))
         }
@@ -43,29 +55,31 @@ impl fmt::Display for TraceUri {
         match self {
             TraceUri::Local(path) => write!(f, "{}", path.display()),
             TraceUri::S3 { bucket, key } => write!(f, "s3://{bucket}/{key}"),
+            TraceUri::HuggingFace { repo, file } => write!(f, "hf://{repo}/{file}"),
         }
     }
 }
 
 impl TraceUri {
     pub fn is_remote(&self) -> bool {
-        matches!(self, TraceUri::S3 { .. })
+        matches!(self, TraceUri::S3 { .. } | TraceUri::HuggingFace { .. })
     }
 
-    /// The local path, when this is a local target (`None` for S3).
+    /// The local path, when this is a local target (`None` for remote).
     pub fn local_path(&self) -> Option<&Path> {
         match self {
             TraceUri::Local(path) => Some(path),
-            TraceUri::S3 { .. } => None,
+            TraceUri::S3 { .. } | TraceUri::HuggingFace { .. } => None,
         }
     }
 
     /// A local path holding this trace's bytes: the path itself when local, or a
-    /// scratch file fetched from S3.
+    /// scratch file fetched from S3 or HuggingFace.
     pub async fn materialize(&self, scratch_dir: &Path) -> Result<PathBuf> {
         match self {
             TraceUri::Local(path) => Ok(path.clone()),
             TraceUri::S3 { bucket, key } => self.fetch(bucket, key, scratch_dir).await,
+            TraceUri::HuggingFace { repo, file } => self.fetch_hf(repo, file).await,
         }
     }
 
@@ -75,6 +89,7 @@ impl TraceUri {
         match self {
             TraceUri::Local(path) => path.clone(),
             TraceUri::S3 { key, .. } => scratch_path(&self.to_string(), key, scratch_dir),
+            TraceUri::HuggingFace { file, .. } => scratch_path(&self.to_string(), file, scratch_dir),
         }
     }
 
@@ -126,6 +141,39 @@ impl TraceUri {
         info!(uri = %self, bytes = bytes.len(), content_length, dest = %dest.display(), elapsed_ms = started.elapsed().as_millis(), "S3 GET: trace materialized");
         Ok(dest)
     }
+
+    async fn fetch_hf(&self, repo: &str, filename: &str) -> Result<PathBuf> {
+        use hf_hub::api::tokio::Api;
+
+        info!(
+            uri = %self,
+            repo = repo,
+            file = filename,
+            "HF GET: downloading from HuggingFace Hub"
+        );
+
+        let started = Instant::now();
+
+        // Download using hf-hub async API
+        let api = Api::new()
+            .map_err(|e| anyhow::anyhow!("initializing HF API: {}", e))?;
+        let repo_api = api.model(repo.to_string());
+        let local_path = repo_api.get(filename).await
+            .map_err(|e| anyhow::anyhow!("downloading {} from {}: {}", filename, repo, e))?;
+
+        let elapsed = started.elapsed();
+        let size = std::fs::metadata(&local_path).map(|m| m.len()).ok();
+
+        info!(
+            uri = %self,
+            path = %local_path.display(),
+            bytes = size,
+            elapsed_ms = elapsed.as_millis(),
+            "HF GET: file cached"
+        );
+
+        Ok(local_path)
+    }
 }
 
 fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
@@ -146,6 +194,37 @@ fn parse_s3_uri(uri: &str) -> Result<(String, String)> {
         bail!("S3 URI has no object key: {uri}");
     }
     Ok((bucket, key))
+}
+
+fn parse_hf_uri(uri: &str) -> Result<(String, String)> {
+    let url = Url::parse(uri).with_context(|| format!("parsing HuggingFace URI: {uri}"))?;
+    if url.scheme() != "hf" {
+        bail!(
+            "expected an hf:// URI, got scheme {:?}: {uri}",
+            url.scheme()
+        );
+    }
+
+    // Parse hf://org/repo/path/to/file.json
+    // The path should be: /org/repo/file or /org/repo/path/to/file
+    let path = url.path().trim_start_matches('/');
+    let parts: Vec<&str> = path.splitn(3, '/').collect();
+
+    if parts.len() < 3 {
+        bail!(
+            "HuggingFace URI must be hf://org/repo/file (got {})",
+            uri
+        );
+    }
+
+    let repo = format!("{}/{}", parts[0], parts[1]);
+    let file = parts[2].to_string();
+
+    if file.is_empty() {
+        bail!("HuggingFace URI has no file path: {uri}");
+    }
+
+    Ok((repo, file))
 }
 
 fn key_basename(key: &str) -> &str {
