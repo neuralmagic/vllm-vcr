@@ -6,7 +6,9 @@
 //! serves the output ids recorded in a trace (tap `--record-tokens`), making replayed
 //! streams content-identical to the capture. `HFDatasetTokens` loads a HuggingFace dataset
 //! in memory (via `--replay-tokens`) and serves tokenized responses, matching rows by
-//! request id or prompt block-hash prefix per `--replay-match`.
+//! request id or prompt block-hash prefix per `--replay-match`. Prompts and responses are
+//! tokenized with the HuggingFace model named by `--model-name` / `MODEL` (default
+//! `Qwen/Qwen3-0.6B`) so block-hash prefix matching aligns with the vLLM frontend.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -294,11 +296,35 @@ struct DatasetRow {
     response_tokens: Vec<u32>,
 }
 
+/// Default HuggingFace model id for tokenizing dataset rows when `--model-name` is unset.
+pub(crate) const DEFAULT_DATASET_TOKENIZER: &str = "Qwen/Qwen3-0.6B";
+
+/// Download and load a HuggingFace `tokenizer.json` for `model_id`.
+fn load_hf_tokenizer(model_id: &str) -> Result<Tokenizer> {
+    info!(
+        model = model_id,
+        "loading dataset tokenizer from HuggingFace"
+    );
+    let api = Api::new().map_err(|e| anyhow::anyhow!("initializing HuggingFace API: {e}"))?;
+    let repo = api.model(model_id.to_string());
+    let tokenizer_file = repo
+        .get("tokenizer.json")
+        .map_err(|e| anyhow::anyhow!("downloading tokenizer for {model_id}: {e}"))?;
+    info!(
+        model = model_id,
+        tokenizer_cache = %tokenizer_file.display(),
+        "dataset tokenizer cached"
+    );
+    Tokenizer::from_file(tokenizer_file)
+        .map_err(|e| anyhow::anyhow!("loading tokenizer for {model_id}: {e}"))
+}
+
 /// Serves tokens from a HuggingFace dataset loaded in memory at init.
 ///
-/// Prompt and response text are tokenized with the GPT-2 tokenizer. Requests
-/// resolve to rows via [`ReplayMatch`]: by trailing request-id index (`index`)
-/// or by longest block-hash prefix of the incoming prompt (`prefix`).
+/// Prompt and response text are tokenized with the HuggingFace model named by
+/// `tokenizer_model`. Requests resolve to rows via [`ReplayMatch`]: by trailing
+/// request-id index (`index`) or by longest block-hash prefix of the incoming prompt
+/// (`prefix`).
 pub(crate) struct HFDatasetTokens {
     rows: Vec<DatasetRow>,
     assignments: HashMap<String, usize>,
@@ -311,33 +337,22 @@ pub(crate) struct HFDatasetTokens {
 }
 
 impl HFDatasetTokens {
-    /// Load a dataset file and tokenize prompts and responses using GPT-2 from HuggingFace.
+    /// Load a dataset file and tokenize prompts and responses with `tokenizer_model`.
     pub(crate) fn from_file(
         dataset_path: &Path,
         block_size: usize,
-        vocab_size: u32,
         replay_match: ReplayMatch,
+        tokenizer_model: &str,
     ) -> Result<Self> {
         info!(
             dataset = %dataset_path.display(),
             replay_match = ?replay_match,
-            "loading dataset with GPT-2 tokenizer from HuggingFace (openai-community/gpt2)"
+            tokenizer_model,
+            "loading HuggingFace dataset for replay"
         );
 
-        let api = Api::new()
-            .map_err(|e| anyhow::anyhow!("initializing HuggingFace API: {}", e))?;
-        let repo = api.model("openai-community/gpt2".to_string());
-        let tokenizer_file = repo.get("tokenizer.json").map_err(|e| {
-            anyhow::anyhow!("downloading GPT-2 tokenizer from HuggingFace: {}", e)
-        })?;
-
-        info!(
-            tokenizer_cache = %tokenizer_file.display(),
-            "GPT-2 tokenizer cached"
-        );
-
-        let tokenizer = Tokenizer::from_file(tokenizer_file)
-            .map_err(|e| anyhow::anyhow!("loading GPT-2 tokenizer: {}", e))?;
+        let tokenizer = load_hf_tokenizer(tokenizer_model)?;
+        let vocab_size = tokenizer.get_vocab_size(true) as u32;
 
         let json_rows = sim_trace::dataset_convert::parse_dataset(dataset_path)
             .with_context(|| format!("parsing dataset {}", dataset_path.display()))?;
@@ -402,7 +417,12 @@ impl HFDatasetTokens {
             }
         }
 
-        info!(rows = rows.len(), "loaded dataset with tokenized prompts and responses");
+        info!(
+            rows = rows.len(),
+            tokenizer_model,
+            vocab_size,
+            "loaded dataset with tokenized prompts and responses"
+        );
 
         let row_count = rows.len();
         Ok(HFDatasetTokens {
@@ -436,7 +456,19 @@ impl HFDatasetTokens {
     }
 
     fn match_prefix(&mut self, request_id: &str, prompt_token_ids: &[u32]) -> Option<usize> {
+        info!(
+            request_id,
+            prompt_len = prompt_token_ids.len(),
+            block_size = self.block_size,
+            "match_prefix called"
+        );
         let chain = crate::trace::prompt_block_hashes(prompt_token_ids, self.block_size)?;
+        info!(
+            request_id,
+            prompt_blocks = chain.len(),
+            hashes = ?chain,
+            "computed prompt hash chain"
+        );
         for (depth, hash) in chain.iter().enumerate().rev() {
             let Some(candidates) = self.by_hash.get(hash) else {
                 continue;
@@ -449,7 +481,7 @@ impl HFDatasetTokens {
             self.consumed[idx] = true;
             self.assignments.insert(request_id.to_string(), idx);
             self.positions.insert(request_id.to_string(), 0);
-            debug!(
+            info!(
                 request_id,
                 dataset_row = idx,
                 matched_blocks = depth + 1,

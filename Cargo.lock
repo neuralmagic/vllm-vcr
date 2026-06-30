@@ -5001,7 +5001,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=17bc1445562435b608041d434e9738440954159c#17bc1445562435b608041d434e9738440954159c"
+source = "git+https://github.com/vllm-project/vllm.git?rev=0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665#0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -5035,9 +5035,8 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=17bc1445562435b608041d434e9738440954159c#17bc1445562435b608041d434e9738440954159c"
+source = "git+https://github.com/vllm-project/vllm.git?rev=0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665#0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665"
 dependencies = [
- "itertools 0.14.0",
  "prometheus-client",
 ]
 

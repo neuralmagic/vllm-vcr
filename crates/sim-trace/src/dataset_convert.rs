@@ -2,6 +2,7 @@
 //!
 //! This module provides utilities to load datasets and extract prompt/response pairs.
 //! Used by `HFDatasetTokens` to drive token generation from actual dataset text.
+//! Rows are tokenized with the HuggingFace model named by `--model-name` / `MODEL`.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};

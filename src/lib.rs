@@ -131,8 +131,9 @@ pub struct Opt {
     ///
     /// Also accepts HuggingFace-style dataset files (JSON/JSONL/CSV/Parquet): the
     /// dataset is loaded in memory at startup, prompts and responses are tokenized
-    /// with the GPT-2 tokenizer (downloaded from HuggingFace), and output tokens are
-    /// served directly via [`tokens::HFDatasetTokens`] — no trace conversion.
+    /// with the HuggingFace model named by `--model-name` / `MODEL` (default
+    /// [`tokens::DEFAULT_DATASET_TOKENIZER`]), and output tokens are served directly
+    /// via [`tokens::HFDatasetTokens`] — no trace conversion.
     #[arg(long)]
     pub replay_tokens: Option<TraceUri>,
 
@@ -320,7 +321,9 @@ pub struct Opt {
     #[arg(long, default_value = "")]
     pub kv_events_topic: String,
 
-    /// Served model name, used only to build the default KV-event topic.
+    /// Served model name: builds the default KV-event topic and tokenizes HuggingFace
+    /// dataset rows for `--replay-tokens` (defaults to [`tokens::DEFAULT_DATASET_TOKENIZER`
+    /// when unset).
     #[arg(long, env = "MODEL", default_value = "")]
     pub model_name: String,
 
@@ -396,6 +399,15 @@ impl Opt {
         Wrap::parse_from(args).opt
     }
 
+    /// HuggingFace model id used to tokenize dataset rows for `--replay-tokens`.
+    pub(crate) fn dataset_tokenizer_model(&self) -> &str {
+        if self.model_name.is_empty() {
+            tokens::DEFAULT_DATASET_TOKENIZER
+        } else {
+            &self.model_name
+        }
+    }
+
     /// Build the KV-cache event publisher config for one engine. The endpoint port and the
     /// topic's pod id are offset by `engine_index` so several engines in one process publish
     /// on distinct sockets/streams.
@@ -451,8 +463,8 @@ impl Opt {
             return Ok(Box::new(tokens::HFDatasetTokens::from_file(
                 path,
                 self.tokens_per_block,
-                self.vocab_size,
                 self.replay_match,
+                self.dataset_tokenizer_model(),
             )?));
         }
 
