@@ -1,0 +1,5 @@
+{"meta":{"model":"synthetic-model","source":"ci-validation","max_num_seqs":8}}
+{"prompt_tokens":10,"output_tokens":1,"ttft_ms":15.5,"arrival_ms":0.0}
+{"prompt_tokens":100,"output_tokens":5,"ttft_ms":50.0,"itl_ms":[10.0,12.0,11.0,9.0],"arrival_ms":100.0,"output_token_ids":[500,501,502,503,504],"finish_reason":"stop"}
+{"prompt_tokens":50,"output_tokens":3,"ttft_ms":30.0,"itl_ms":[8.0,7.5],"arrival_ms":200.0,"output_token_ids":[600,601,602],"finish_reason":"stop"}
+{"prompt_tokens":200,"output_tokens":10,"ttft_ms":80.0,"itl_summary":{"mean_ms":11.5,"count":9},"arrival_ms":300.0,"finish_reason":"length"}

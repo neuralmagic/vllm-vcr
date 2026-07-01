@@ -1,0 +1,63 @@
+name: Trace Validation
+
+# Validate synthetic trace fixtures with pseudo TTFT/ITL timing data.
+# Ensures trace format contract is enforced in CI, catching regressions in
+# trace schema, validation logic, or replay fidelity.
+
+on:
+  push:
+    branches: ['**']
+  merge_group:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref so pushes don't pile up.
+concurrency:
+  group: trace-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation is a loss in CI (no warm incremental dir); turning it
+  # off shrinks the cached target/ and speeds cold builds.
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Harden cargo against flaky crates.io fetches.
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  validate-synthetic-traces:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Toolchain plus coarse Cargo cache; sccache adds compiler object caching.
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      # Build the vllm-vcr binary for trace inspection
+      - name: Build vllm-vcr
+        run: cargo build --release --bin vllm-vcr
+
+      # Validate trace structure using the inspect summarize command.
+      # This exercises the trace parsing and validation logic without needing
+      # to run the full simulator or connect a client.
+      - name: Validate trace structure (inspect summarize)
+        run: |
+          set -euo pipefail
+          echo "Validating synthetic trace fixtures..."
+          for trace in tests/fixtures/synthetic/*.jsonl; do
+            echo "  Validating $(basename "$trace")..."
+            ./target/release/vllm-vcr inspect summarize "$trace" > /dev/null
+          done
+          echo "All trace fixtures passed validation."
+
+      # Run the Rust integration test that replays each synthetic trace through
+      # the simulator and validates outputs match expected token counts and timing.
+      - name: Test trace replay (integration test)
+        run: cargo test --test trace_validation_ci --release -- --nocapture
