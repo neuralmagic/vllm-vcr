@@ -37,7 +37,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Toolchain plus coarse Cargo cache; sccache adds compiler object caching.
+      # Toolchain plus coarse Cargo cache
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
 
       # Build the vllm-vcr binary for trace inspection
