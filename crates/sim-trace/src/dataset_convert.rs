@@ -276,7 +276,7 @@ pub fn is_dataset_file(path: &Path) -> Result<bool> {
             }
             let value: Value = serde_json::from_str(trimmed)
                 .with_context(|| format!("parsing first line of {}", path.display()))?;
-            return Ok(!looks_like_trace_record(&value) && !value.get("meta").is_some());
+                return Ok(!looks_like_trace_record(&value) && value.get("meta").is_none());
         }
         return Ok(false);
     }
