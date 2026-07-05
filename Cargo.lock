@@ -1273,7 +1273,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2777,7 +2777,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3790,7 +3790,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=17bc1445562435b608041d434e9738440954159c#17bc1445562435b608041d434e9738440954159c"
+source = "git+https://github.com/vllm-project/vllm.git?rev=ee0da84ab9e04ac7610e28580af62c365e898389#ee0da84ab9e04ac7610e28580af62c365e898389"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -3824,7 +3824,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=17bc1445562435b608041d434e9738440954159c#17bc1445562435b608041d434e9738440954159c"
+source = "git+https://github.com/vllm-project/vllm.git?rev=ee0da84ab9e04ac7610e28580af62c365e898389#ee0da84ab9e04ac7610e28580af62c365e898389"
 dependencies = [
  "itertools 0.14.0",
  "prometheus-client",

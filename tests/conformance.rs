@@ -69,6 +69,10 @@ fn sim_ready_response() -> SimReadyResponse {
         dp_stats_address: None,
         dtype: ModelDtype::Float32,
         vllm_version: VLLM_TARGET_VERSION.to_string(),
+        world_size: 1,
+        data_parallel_size: 1,
+        kv_cache_size_tokens: Some(16000),
+        kv_cache_max_concurrency: Some(0.5),
     }
 }
 
