@@ -17,7 +17,7 @@ use crate::trace::TraceRecord;
 
 /// Context passed to `TokenSource::next_tokens` so implementations can condition on
 /// request state without holding a reference to the full `ActiveRequest`.
-#[allow(dead_code)]
+#[allow(dead_code)] // Fields read via trait method param; rustc can't see through the indirection.
 pub(crate) struct TokenCtx<'a> {
     pub request_id: &'a str,
     pub prompt_token_ids: &'a [u32],

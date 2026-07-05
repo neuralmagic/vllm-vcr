@@ -1,8 +1,11 @@
 # vLLM version mapping and release automation
 
-Goal: support a rolling **N-3** window (latest vLLM release plus the three
-before it) from a single repo, with automation that catches protocol drift the
-day a new vLLM lands and ships one clearly-labelled artifact per supported line.
+Goal: support a rolling window of **up to four stable lines** (latest vLLM release
+plus three back) from a single repo, with automation that catches protocol drift
+the day a new vLLM lands and ships one clearly-labelled artifact per supported
+line. Two non-stable "tracker" lines ride ahead of the window so drift shows up
+before a release pins us to it: `nightly` (vLLM main) and `rc` (the newest
+release candidate).
 
 ## Where vLLM version actually bites
 
@@ -50,6 +53,12 @@ protocol_rev = "9c7c74bf..."
 fidelity_validated = false
 
 [[vllm]]
+line = "rc"                   # tracks the newest release candidate (e.g. v0.24.0rc1)
+tag  = "v0.24.0rc1"           # bumped (tag + rev) by the release watcher
+protocol_rev = "7b3d595e..."
+fidelity_validated = false
+
+[[vllm]]
 line = "0.23"                 # current default line
 tag  = "v0.23.0"              # vLLM release tag; also the e2e frontend version
 protocol_rev = "17bc1445..."  # rev for vllm-engine-core-client at this line
@@ -57,8 +66,16 @@ fidelity_validated = false    # flips true once replay gates validate goldens
 default = true                # what :latest / unsuffixed builds point at
 
 [[vllm]]
-line = "0.22"                 # older supported release line
+line = "0.22"                 # N-1 supported release line
 tag  = "v0.22.1"
+protocol_rev = "0decac0d..."
+patch_repo = "https://github.com/wseaton/vllm.git"
+patch_rev = "b48f2434..."
+fidelity_validated = false
+
+[[vllm]]
+line = "0.21"                 # N-2 supported release line
+tag  = "v0.21.0"
 protocol_rev = "0decac0d..."
 patch_repo = "https://github.com/wseaton/vllm.git"
 patch_rev = "b48f2434..."
@@ -147,6 +164,17 @@ When vLLM cuts N+1:
    runner, and publishes a rolling `nightly` prerelease with the sha in its notes.
    A red scheduled run is the early warning that upstream moved the engine-core
    protocol. **Done.**
+5. Release watcher (`.github/workflows/vllm-release-watch.yml`). The tag-driven
+   counterpart to the canary, run daily. It keeps the `rc` line on the newest
+   release candidate (`cargo xtask watch-rc`) and rolls the stable window when a
+   new final release lands (`cargo xtask watch-stable --max-stable 4`: new default,
+   oldest stable dropped past four). A patch release on a line already in the
+   window (v0.23.0 -> v0.23.1) bumps that line's tag/rev in place and resets its
+   `fidelity_validated` (old captures were taken against the old rev). Both pin +
+   build + run the protocol e2e against the new tag and only open a build-gated
+   PR if green; when the change moves the default line, the PR also carries the
+   re-pinned `Cargo.toml`/`Cargo.lock` so the committed pin keeps tracking the
+   default. **Done.**
 
 ## Open coupling note: the `block_size` / registration drift
 
@@ -175,7 +203,8 @@ captures with a GPU-free replay in CI. The capture runbook is
 
 Three artifacts cooperate:
 
-- **`compat.toml`** — the N-3 window (above). Each line carries `fidelity_validated`,
+- **`compat.toml`** — the four-line stable window plus the `nightly`/`rc` trackers
+  (above). Each line carries `fidelity_validated`,
   which gates whether its conformance failures block promotion.
 - **`conformance/manifest.toml`** — one `[[golden]]` entry per captured trace, with
   `line`, `bucket_path`, `sha256`, `config_hash`, `workload`, and `role` (`schema` or
