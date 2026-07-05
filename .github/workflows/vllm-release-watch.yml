@@ -1,0 +1,201 @@
+name: vLLM Release Watch
+
+# Keeps compat.toml's tag-driven lines fresh against upstream vLLM:
+#   * the `rc` line tracks the newest release candidate ahead of the stable window
+#     (so we build a vllm-vcr:vllmrc image against the next release before it ships),
+#   * the stable window rolls when a new final release lands (new default, oldest
+#     dropped), and
+#   * a patch release on a line already in the window (v0.23.0 -> v0.23.1) bumps
+#     that line's tag/rev in place and demotes its fidelity_validated.
+#
+# Mirrors the nightly canary's "prove then propose" shape: resolve the upstream
+# state, pin + build + run the protocol e2e against the new tag, and only open a
+# build-gated PR if it's green. compat.toml stays the source of truth; this just
+# edits it (cargo xtask watch-rc / watch-stable). Unlike the canary (which tracks
+# a moving main HEAD, weekly bump), release/rc tags are low-noise events, so the
+# PR opens as soon as a new tag is detected.
+#
+# The auto-bump PR steps are gated on the same GitHub App secret as the canary
+# (CANARY_APP_ID); until it's provisioned the watcher still runs its detect +
+# build check, it just doesn't open the PR.
+on:
+  schedule:
+    - cron: "0 7 * * *" # daily, an hour after the nightly canary
+  workflow_dispatch:
+
+concurrency:
+  group: vllm-release-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write # the auto-bump PR branch
+  pull-requests: write # open/update the auto-bump PR
+  issues: write # file/refresh the failure issue on red scheduled runs
+  id-token: write # assume the sccache S3 role via OIDC
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Same crates.io hardening as the canary (force HTTP/1.1, retry transient blips).
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  # One job per tracked axis. They share the upstream-resolution prelude but open
+  # independent PRs (different branches), so a stuck rc bump can't block a stable roll.
+  watch:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # rc PRs carry compat.toml only: the rc line is never the default, so
+          # the committed Cargo.toml pin (which tracks the default stable line)
+          # doesn't move. The stable axis DOES move the default (roll or patch
+          # bump), so its PR also carries the re-pinned Cargo.toml/Cargo.lock,
+          # keeping the committed pin == default line's protocol_rev invariant.
+          - axis: rc
+            branch: auto/vllm-rc-bump
+            title: "ci: bump rc line to latest vLLM release candidate"
+            add_paths: compat.toml
+          - axis: stable
+            branch: auto/vllm-stable-roll
+            title: "ci: update stable window to latest vLLM release"
+            add_paths: |
+              compat.toml
+              Cargo.toml
+              Cargo.lock
+    env:
+      # Guards the auto-bump PR steps (see header). Reuses the canary's App.
+      CANARY_APP_ID: ${{ secrets.CANARY_APP_ID }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      - uses: ./.github/actions/setup-sccache
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
+
+      # Latest stable release + every tag, dumped for `cargo xtask` to decide from.
+      - name: Resolve upstream vLLM state
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          stable=$(gh api repos/vllm-project/vllm/releases/latest -q .tag_name)
+          if [[ ! "${stable}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: latest release tag '${stable}' does not match expected format ^v[0-9]+\.[0-9]+\.[0-9]+$" >&2
+            exit 1
+          fi
+          echo "stable=${stable}" >> "$GITHUB_OUTPUT"
+          echo "latest stable release: ${stable}"
+          git ls-remote --tags https://github.com/vllm-project/vllm.git > tags.txt
+
+      # Edit compat.toml in place and emit changed/tag/line/rev. stdout is the
+      # key=value summary (xtask runs --quiet); the human log goes to stderr.
+      - name: Detect drift (${{ matrix.axis }})
+        id: watch
+        run: |
+          cargo xtask watch-${{ matrix.axis }} \
+            --tags-file tags.txt \
+            --latest-stable "${{ steps.upstream.outputs.stable }}" >> "$GITHUB_OUTPUT"
+
+      # Pin Cargo.toml to the new tag's rev + fork (the stable roll picks the new
+      # default line; the rc bump pins the rc line) and prove it builds. The
+      # VLLM_TARGET_VERSION stamp makes build.rs emit the right capability cfgs for
+      # the tag. Omit --locked: the pin moved the rev off Cargo.lock.
+      - name: Pin + build against new tag
+        if: steps.watch.outputs.changed == 'true'
+        env:
+          VLLM_TARGET_VERSION: ${{ steps.watch.outputs.tag }}
+        run: |
+          cargo xtask pin-vllm "${{ steps.watch.outputs.line }}"
+          cargo update -p vllm-engine-core-client
+          cargo build --workspace
+          cargo test --workspace --lib
+
+      # The real "does the sim still talk to this vLLM client?" boundary: EngineCore
+      # over ZMQ + tap record/replay, same set the canary runs against HEAD.
+      - name: Protocol e2e against new tag
+        if: steps.watch.outputs.changed == 'true'
+        env:
+          VLLM_TARGET_VERSION: ${{ steps.watch.outputs.tag }}
+        run: |
+          cargo test --test engine_core_e2e -- --nocapture
+          cargo test --test tap_e2e -- --nocapture
+
+      # --- Open the build-gated auto-bump PR (only if green + App provisioned) -----
+      - name: Mint App token for the bump PR
+        id: app-token
+        if: ${{ steps.watch.outputs.changed == 'true' && env.CANARY_APP_ID != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CANARY_APP_ID }}
+          private-key: ${{ secrets.CANARY_APP_PRIVATE_KEY }}
+
+      # The pin step rewrote Cargo.toml/Cargo.lock to prove the build, but the
+      # committed pin must keep tracking the DEFAULT stable line. When the change
+      # didn't move the default (rc bump, patch bump on an older line), restore
+      # the pin so the stable axis's add_paths can't sweep it into the PR.
+      - name: Restore the transient pin (change is not the default line)
+        if: ${{ steps.watch.outputs.changed == 'true' && steps.watch.outputs.is_default != 'true' }}
+        run: git checkout -- Cargo.toml Cargo.lock
+
+      - name: Open/update the auto-bump PR
+        if: ${{ steps.watch.outputs.changed == 'true' && env.CANARY_APP_ID != '' }}
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          # API commit so it's signed (Verified), satisfying the branch's
+          # required-signatures rule (same as the canary).
+          sign-commits: true
+          add-paths: ${{ matrix.add_paths }}
+          base: main
+          branch: ${{ matrix.branch }}
+          delete-branch: true
+          commit-message: "${{ matrix.title }} (${{ steps.watch.outputs.tag }})"
+          title: ${{ matrix.title }}
+          body: |
+            Automated by the vLLM release watcher (${{ matrix.axis }}).
+
+            Pinned the `${{ steps.watch.outputs.line }}` line to vLLM
+            [`${{ steps.watch.outputs.tag }}`](https://github.com/vllm-project/vllm/releases/tag/${{ steps.watch.outputs.tag }})
+            (`protocol_rev` = `${{ steps.watch.outputs.rev }}`) and it passed the
+            build, unit, and protocol-e2e checks against that tag.
+
+            Before merging, review:
+            - whether this line needs a `[patch]` fork (the watcher assumes upstream
+              builds clean, true for >=0.23), and
+            - the `protocol_rev` (pinned to the tag's commit, not a post-release
+              main sha; bump it if a release-branch fix is needed).
+
+            If the change moved the default stable line, this PR also carries the
+            re-pinned `Cargo.toml`/`Cargo.lock` (the committed pin tracks the
+            default line); otherwise the pin used to prove the build was transient
+            and only `compat.toml` changes.
+
+      # Scheduled watchers fail silently unless someone stares at the Actions tab;
+      # file (or refresh) an issue so a red run actually reaches a human. Manual
+      # dispatches skip this: whoever clicked is already watching.
+      - name: File failure issue
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="vllm-release-watch (${{ matrix.axis }}): scheduled run failed"
+          url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still failing: $url"
+          else
+            gh issue create --title "$title" --body "The scheduled vLLM release watch run failed: $url"
+          fi

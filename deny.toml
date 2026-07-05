@@ -15,11 +15,10 @@ targets = [
 
 [advisories]
 version = 2
-# Deny on any RUSTSEC vulnerability (and yanked crates, the v2 default). Scope the
-# "unmaintained" lint to our own direct deps: a transitive going unmaintained
-# (e.g. bincode 1.3.3, RUSTSEC-2025-0141) isn't actionable for us, but an
-# unmaintained crate WE pick should surface. Add an id to `ignore` with a
-# justification only when a vuln fix isn't yet available.
+# Deny on any RUSTSEC vulnerability (and yanked crates, the v2 default). The
+# "unmaintained" lint scopes to the workspace's transitive normal dependencies
+# (excluding dev/build deps). Add an id to `ignore` with a justification only
+# when a vuln fix isn't yet available.
 unmaintained = "workspace"
 ignore = [
     # rustls-webpki 0.101.7 cert-validation/CRL bugs. Reached only through the AWS

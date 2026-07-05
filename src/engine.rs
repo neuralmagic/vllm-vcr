@@ -2546,7 +2546,6 @@ mod tests {
             })
             .collect();
         crate::latency::TraceLatency::from_records(
-            crate::trace::TraceMeta::default(),
             &records,
             opt.latency_model(),
             opt.max_num_batched_tokens as usize,

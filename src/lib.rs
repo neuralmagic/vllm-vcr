@@ -601,13 +601,12 @@ impl Opt {
             );
         }
 
-        let (meta, records) = trace::read_trace_file(local_input(uri, "--latency-trace")?)?;
+        let (_meta, records) = trace::read_trace_file(local_input(uri, "--latency-trace")?)?;
 
         // The KV-transfer knobs are NOT mutually exclusive: the trace does not cover
         // P/D transfer timing, so the knob model handles do_remote_prefill requests.
         let kv_fallback = self.latency_model();
         let trace_model = latency::TraceLatency::from_records(
-            meta,
             &records,
             kv_fallback,
             self.max_num_batched_tokens as usize,
