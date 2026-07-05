@@ -58,6 +58,16 @@ tag = "v0.24.0rc1"
 protocol_rev = "7b3d595eb197d714052ce296cc8b124f0dc8af31"
 fidelity_validated = false
 
+# Auto-rolled in by vllm-release-watch as the new default. Review the
+# protocol_rev (pinned to the release tag's commit, not a post-release main
+# sha) and whether this line needs a [patch] fork before promoting fidelity.
+[[vllm]]
+line = "0.24"
+tag = "v0.24.0"
+protocol_rev = "ee0da84ab9e04ac7610e28580af62c365e898389"
+fidelity_validated = false
+default = true
+
 [[vllm]]
 # N (head). 17bc1445 is the post-#45848 main commit (serde-default fix upstream
 # as of 2026-06-17), so no fork patch. Builds + conformance + unit tests green.
@@ -65,7 +75,6 @@ line = "0.23"
 tag = "v0.23.0"
 protocol_rev = "17bc1445562435b608041d434e9738440954159c"
 fidelity_validated = false
-default = true
 
 [[vllm]]
 # N-1. Builds against the 0.22 crate (0decac0d), patched to the wseaton/vllm

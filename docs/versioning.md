@@ -59,14 +59,20 @@ protocol_rev = "7b3d595e..."
 fidelity_validated = false
 
 [[vllm]]
-line = "0.23"                 # current default line
-tag  = "v0.23.0"              # vLLM release tag; also the e2e frontend version
-protocol_rev = "17bc1445..."  # rev for vllm-engine-core-client at this line
+line = "0.24"                 # current default line
+tag  = "v0.24.0"              # vLLM release tag; also the e2e frontend version
+protocol_rev = "ee0da84a..."  # rev for vllm-engine-core-client at this line
 fidelity_validated = false    # flips true once replay gates validate goldens
 default = true                # what :latest / unsuffixed builds point at
 
 [[vllm]]
-line = "0.22"                 # N-1 supported release line
+line = "0.23"                 # N-1 supported release line
+tag  = "v0.23.0"
+protocol_rev = "17bc1445..."
+fidelity_validated = false
+
+[[vllm]]
+line = "0.22"                 # N-2 supported release line
 tag  = "v0.22.1"
 protocol_rev = "0decac0d..."
 patch_repo = "https://github.com/wseaton/vllm.git"
@@ -74,7 +80,7 @@ patch_rev = "b48f2434..."
 fidelity_validated = false
 
 [[vllm]]
-line = "0.21"                 # N-2 supported release line
+line = "0.21"                 # N-3 supported release line
 tag  = "v0.21.0"
 protocol_rev = "0decac0d..."
 patch_repo = "https://github.com/wseaton/vllm.git"
