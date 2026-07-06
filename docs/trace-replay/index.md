@@ -16,6 +16,7 @@ gitignored. See
 [traces/README.md](https://github.com/neuralmagic/vllm-vcr/blob/main/traces/README.md)
 for the local inventory and which captures are fitting inputs versus gate seeds.
 
-Start with [Concepts](./concepts.md) for terminology, then use the scenario pages for
-arrival replay, prefix-cache workloads, content-identical replay, and multi-token
-step replay.
+Start with the [Simulation guide](../simulation-guide.md) for trace format, prefill,
+budget, and how `play` consumes captures. Then read [Concepts](./concepts.md) for
+terminology, and use the scenario pages for arrival replay, prefix-cache workloads,
+content-identical replay, and multi-token step replay.
