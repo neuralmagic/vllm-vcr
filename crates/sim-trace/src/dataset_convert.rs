@@ -97,8 +97,7 @@ pub fn extract_response(row: &Value) -> Result<String> {
 }
 
 fn parse_json_dataset(path: &Path) -> Result<Vec<Value>> {
-    let content = std::fs::read(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if content.is_empty() {
         return Ok(Vec::new());
     }
@@ -124,8 +123,7 @@ fn parse_json_dataset(path: &Path) -> Result<Vec<Value>> {
         return Ok(rows);
     }
 
-    let value: Value =
-        serde_json::from_slice(&content).context("parsing JSON dataset")?;
+    let value: Value = serde_json::from_slice(&content).context("parsing JSON dataset")?;
     rows_from_json_value(value)
 }
 
@@ -157,12 +155,9 @@ fn rows_from_json_value(value: Value) -> Result<Vec<Value>> {
 }
 
 fn parse_csv_dataset(path: &Path) -> Result<Vec<Value>> {
-    let mut reader = csv::Reader::from_path(path)
-        .with_context(|| format!("opening CSV {}", path.display()))?;
-    let headers = reader
-        .headers()
-        .context("reading CSV headers")?
-        .clone();
+    let mut reader =
+        csv::Reader::from_path(path).with_context(|| format!("opening CSV {}", path.display()))?;
+    let headers = reader.headers().context("reading CSV headers")?.clone();
     let mut rows = Vec::new();
     for result in reader.records() {
         let record = result.context("reading CSV row")?;
@@ -177,8 +172,8 @@ fn parse_csv_dataset(path: &Path) -> Result<Vec<Value>> {
 
 fn parse_parquet_dataset(path: &Path) -> Result<Vec<Value>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .context("opening parquet dataset")?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).context("opening parquet dataset")?;
     let reader = builder.build().context("building parquet reader")?;
 
     let mut rows = Vec::new();
@@ -228,10 +223,7 @@ fn format_chat_messages(messages: &[Value], user_only: bool) -> String {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_ascii_lowercase();
-        let content = obj
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let content = obj.get("content").and_then(Value::as_str).unwrap_or("");
         if content.is_empty() {
             continue;
         }
@@ -270,8 +262,7 @@ pub fn is_dataset_file(path: &Path) -> Result<bool> {
         _ => return Ok(false),
     }
 
-    let content = std::fs::read(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if content.is_empty() {
         return Ok(false);
     }
@@ -285,13 +276,12 @@ pub fn is_dataset_file(path: &Path) -> Result<bool> {
             }
             let value: Value = serde_json::from_str(trimmed)
                 .with_context(|| format!("parsing first line of {}", path.display()))?;
-            return Ok(!looks_like_trace_record(&value) && !value.get("meta").is_some());
+            return Ok(!looks_like_trace_record(&value) && value.get("meta").is_none());
         }
         return Ok(false);
     }
 
-    let value: Value =
-        serde_json::from_slice(&content).context("parsing JSON file")?;
+    let value: Value = serde_json::from_slice(&content).context("parsing JSON file")?;
     if value.get("meta").is_some() || value.get("benchmarks").is_some() {
         return Ok(false);
     }
@@ -325,10 +315,7 @@ mod tests {
 
     #[test]
     fn parses_json_array() {
-        let dir = std::env::temp_dir().join(format!(
-            "sim-trace-dataset-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("sim-trace-dataset-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("test.json");
         std::fs::write(
@@ -353,10 +340,8 @@ mod tests {
 
     #[test]
     fn is_dataset_file_detects_instruction_json() {
-        let dir = std::env::temp_dir().join(format!(
-            "sim-trace-dataset-detect-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("sim-trace-dataset-detect-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("data.json");
         std::fs::write(
@@ -370,10 +355,8 @@ mod tests {
 
     #[test]
     fn is_dataset_file_rejects_trace_shape_jsonl() {
-        let dir = std::env::temp_dir().join(format!(
-            "sim-trace-trace-detect-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("sim-trace-trace-detect-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("trace.jsonl");
         std::fs::write(

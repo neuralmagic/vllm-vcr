@@ -16,10 +16,8 @@ use url::Url;
 
 /// Whether a raw path string is an `s3://` or `hf://` URI rather than a local path.
 pub fn is_remote(uri: &str) -> bool {
-    uri.len() >= 5 && (
-        uri[..5].eq_ignore_ascii_case("s3://") ||
-        uri[..5].eq_ignore_ascii_case("hf://")
-    )
+    uri.len() >= 5
+        && (uri[..5].eq_ignore_ascii_case("s3://") || uri[..5].eq_ignore_ascii_case("hf://"))
 }
 
 /// A trace location, parsed (and validated) at the CLI boundary.
@@ -89,7 +87,9 @@ impl TraceUri {
         match self {
             TraceUri::Local(path) => path.clone(),
             TraceUri::S3 { key, .. } => scratch_path(&self.to_string(), key, scratch_dir),
-            TraceUri::HuggingFace { file, .. } => scratch_path(&self.to_string(), file, scratch_dir),
+            TraceUri::HuggingFace { file, .. } => {
+                scratch_path(&self.to_string(), file, scratch_dir)
+            }
         }
     }
 
@@ -155,10 +155,11 @@ impl TraceUri {
         let started = Instant::now();
 
         // Download using hf-hub async API
-        let api = Api::new()
-            .map_err(|e| anyhow::anyhow!("initializing HF API: {}", e))?;
+        let api = Api::new().map_err(|e| anyhow::anyhow!("initializing HF API: {}", e))?;
         let repo_api = api.model(repo.to_string());
-        let local_path = repo_api.get(filename).await
+        let local_path = repo_api
+            .get(filename)
+            .await
             .map_err(|e| anyhow::anyhow!("downloading {} from {}: {}", filename, repo, e))?;
 
         let elapsed = started.elapsed();
@@ -219,10 +220,7 @@ fn parse_hf_uri(uri: &str) -> Result<(String, String)> {
     }
 
     if segments.len() < 3 {
-        bail!(
-            "HuggingFace URI must be hf://org/repo/file (got {})",
-            uri
-        );
+        bail!("HuggingFace URI must be hf://org/repo/file (got {})", uri);
     }
 
     let repo = format!("{}/{}", segments[0], segments[1]);
@@ -366,7 +364,10 @@ mod tests {
             }
         );
         assert!(uri.is_remote());
-        assert_eq!(uri.to_string(), "hf://neuralmagic/vllm-traces/trace.jsonl.gz");
+        assert_eq!(
+            uri.to_string(),
+            "hf://neuralmagic/vllm-traces/trace.jsonl.gz"
+        );
     }
 
     #[test]

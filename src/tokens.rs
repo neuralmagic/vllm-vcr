@@ -21,8 +21,8 @@ use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
-use crate::trace::TraceRecord;
 use crate::ReplayMatch;
+use crate::trace::TraceRecord;
 
 /// Context passed to `TokenSource::next_tokens` so implementations can condition on
 /// request state without holding a reference to the full `ActiveRequest`.
@@ -379,12 +379,14 @@ impl HFDatasetTokens {
             let response_tokens: Vec<u32> = response_encoding.get_ids().to_vec();
 
             if response_tokens.is_empty() {
-                warn!(row = idx, "row has empty response after tokenization, skipping");
+                warn!(
+                    row = idx,
+                    "row has empty response after tokenization, skipping"
+                );
                 continue;
             }
 
-            let block_hashes =
-                crate::trace::prompt_block_hashes(&prompt_token_ids, block_size);
+            let block_hashes = crate::trace::prompt_block_hashes(&prompt_token_ids, block_size);
 
             rows.push(DatasetRow {
                 prompt_token_ids,
@@ -419,9 +421,7 @@ impl HFDatasetTokens {
 
         info!(
             rows = rows.len(),
-            tokenizer_model,
-            vocab_size,
-            "loaded dataset with tokenized prompts and responses"
+            tokenizer_model, vocab_size, "loaded dataset with tokenized prompts and responses"
         );
 
         let row_count = rows.len();
