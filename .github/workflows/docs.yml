@@ -40,7 +40,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install mdBook
-        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        uses: taiki-e/install-action@5ebac0d9522d786674368e47e92963ba13f2c376 # v2.82.11
         with:
           tool: mdbook@${{ env.MDBOOK_VERSION }}
       - name: Build
@@ -64,7 +64,7 @@ jobs:
           path: book
       - name: Comment the preview link
         if: ${{ github.event_name == 'pull_request' }}
-        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         with:
           header: docs-preview
           message: |
