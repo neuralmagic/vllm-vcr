@@ -23,7 +23,8 @@ concurrency:
 permissions:
   contents: write # refresh the rolling `nightly` prerelease
   pull-requests: write # open/update the auto-bump PR
-  id-token: write # assume the golden-fetch role if nightly captures exist
+  issues: write # file/refresh the failure issue on red scheduled runs
+  id-token: write # sccache S3 role + the golden-fetch role if nightly captures exist
 
 env:
   CARGO_TERM_COLOR: always
@@ -190,6 +191,25 @@ jobs:
             against the `nightly` line, so this bumps `compat.toml`'s nightly
             `protocol_rev` to it.
 
-            On merge, CI re-derives `Cargo.toml` from `compat.toml`
-            (`cargo xtask pin-vllm nightly`). Review the build + conformance results
-            before merging.
+            The committed `Cargo.toml` pin tracks the default stable line and is
+            untouched; CI pins the nightly line transiently at build time
+            (`cargo xtask pin-vllm nightly`). Review the build + conformance
+            results before merging.
+
+      # Scheduled canaries fail silently unless someone stares at the Actions tab;
+      # file (or refresh) an issue so a red run actually reaches a human. Manual
+      # dispatches skip this: whoever clicked is already watching.
+      - name: File failure issue
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="nightly-canary: scheduled run failed"
+          url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still failing: $url"
+          else
+            gh issue create --title "$title" --body "The scheduled nightly canary run failed (likely upstream vLLM protocol drift): $url"
+          fi

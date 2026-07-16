@@ -2,6 +2,8 @@
 //! `compat.toml` is parsed in exactly one place (these used to be inline Python
 //! in the workflows, re-parsing the manifest each time).
 
+mod version;
+
 use std::collections::BTreeSet;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
@@ -14,7 +16,9 @@ use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest as _, Sha256};
 use sim_compat::{CompatManifest, GoldenManifest};
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{DocumentMut, Item, Table, Value, value};
+
+use crate::version::{VllmVersion, parse_ls_remote, pick_latest_rc};
 
 const COMPAT_TOML: &str = "compat.toml";
 const MANIFEST_TOML: &str = "conformance/manifest.toml";
@@ -23,6 +27,11 @@ const VLLM_GIT: &str = "https://github.com/vllm-project/vllm.git";
 const KUBE_OIDC_AUDIENCE_ENCODED: &str = "https%3A%2F%2Fkubernetes.default.svc";
 /// The compat.toml line that tracks vLLM main (auto-bumped by the nightly canary).
 const NIGHTLY_LINE: &str = "nightly";
+/// The compat.toml line that tracks the newest upstream release candidate.
+const RC_LINE: &str = "rc";
+/// Non-stable "tracker" lines that ride ahead of the stable window and are never
+/// `default`. The stable roll counts and trims everything *except* these.
+const TRACKER_LINES: &[&str] = &[NIGHTLY_LINE, RC_LINE];
 
 /// Native per-arch release runners (no cross-compile).
 const PLATFORMS: &[Platform] = &[
@@ -85,6 +94,39 @@ enum Command {
     SetNightlyRev {
         /// The vllm.git main commit sha to pin the `nightly` line to.
         sha: String,
+    },
+    /// Refresh the `rc` line to the newest upstream release candidate newer than
+    /// the latest stable release. Reads a `git ls-remote --tags` dump (the
+    /// workflow fetches it) and bumps both the `rc` line's `tag` and
+    /// `protocol_rev`. Prints `key=value` lines (changed/tag/line/rev) for the
+    /// workflow to gate the build + PR on. A no-op (no newer rc) prints
+    /// `changed=false` and leaves compat.toml untouched.
+    WatchRc {
+        /// File holding `git ls-remote --tags https://github.com/vllm-project/vllm.git`.
+        #[arg(long)]
+        tags_file: PathBuf,
+        /// The latest stable release tag (e.g. `v0.23.0`), from `releases/latest`.
+        #[arg(long)]
+        latest_stable: String,
+    },
+    /// Roll the stable window to a newly released vLLM line: add it as the new
+    /// `default`, demote the old default, and drop the oldest stable line once
+    /// the window exceeds `--max-stable`. A release on a line already in the
+    /// window is a patch bump instead: that line's tag/protocol_rev move in
+    /// place and its `fidelity_validated` resets to false. No-op (prints
+    /// `changed=false`) when the release is already tracked or isn't newer.
+    /// The `nightly`/`rc` trackers are never touched. Prints the same
+    /// `key=value` summary as `watch-rc`.
+    WatchStable {
+        /// File holding `git ls-remote --tags https://github.com/vllm-project/vllm.git`.
+        #[arg(long)]
+        tags_file: PathBuf,
+        /// The latest stable release tag (e.g. `v0.24.0`), from `releases/latest`.
+        #[arg(long)]
+        latest_stable: String,
+        /// Maximum stable lines to keep (oldest dropped beyond this).
+        #[arg(long, default_value_t = 4)]
+        max_stable: usize,
     },
     /// Emit one `[[golden]]` TOML entry for a captured nightly trace.
     NightlyGoldenEntry {
@@ -192,6 +234,15 @@ fn main() -> Result<()> {
         Command::FrontendArgs { line } => frontend_args(&line),
         Command::PinVllm { line, rev } => pin_vllm(&line, rev.as_deref()),
         Command::SetNightlyRev { sha } => set_nightly_rev(&sha),
+        Command::WatchRc {
+            tags_file,
+            latest_stable,
+        } => watch_rc(&tags_file, &latest_stable),
+        Command::WatchStable {
+            tags_file,
+            latest_stable,
+            max_stable,
+        } => watch_stable(&tags_file, &latest_stable, max_stable),
         Command::NightlyGoldenEntry {
             trace,
             archive,
@@ -364,13 +415,146 @@ fn apply_pin(
 
 fn set_nightly_rev(sha: &str) -> Result<()> {
     let mut doc = read_compat_toml()?;
-    if apply_nightly_rev(&mut doc, sha)? {
+    if apply_set_line(&mut doc, NIGHTLY_LINE, None, Some(sha))? {
         std::fs::write(COMPAT_TOML, doc.to_string()).context("writing compat.toml")?;
         eprintln!("bumped nightly protocol_rev -> {sha}");
     } else {
         eprintln!("nightly protocol_rev already {sha}; no change");
     }
     Ok(())
+}
+
+/// Refresh the `rc` line to the newest upstream rc tag newer than `latest_stable`.
+fn watch_rc(tags_file: &Path, latest_stable: &str) -> Result<()> {
+    let stable = VllmVersion::parse(latest_stable).with_context(|| {
+        format!(
+            "--latest-stable '{latest_stable}' is not a vX.Y.Z release tag (expected e.g. v0.24.0)"
+        )
+    })?;
+    let tags = parse_ls_remote(&read_tags_file(tags_file)?);
+
+    let Some((tag, rev)) = pick_latest_rc(&tags, stable) else {
+        println!("changed=false");
+        eprintln!("no upstream rc newer than {latest_stable}; rc line left untouched");
+        return Ok(());
+    };
+
+    let mut doc = read_compat_toml()?;
+    let changed = apply_set_line(&mut doc, RC_LINE, Some(&tag), Some(&rev))?;
+    if changed {
+        std::fs::write(COMPAT_TOML, doc.to_string()).context("writing compat.toml")?;
+        eprintln!("bumped rc line -> {tag} ({rev})");
+    } else {
+        eprintln!("rc line already {tag}; no change");
+    }
+    let outcome = if changed {
+        WatchOutcome::ChangedTransient
+    } else {
+        WatchOutcome::Unchanged
+    };
+    print_watch_summary(outcome, &tag, RC_LINE, &rev);
+    Ok(())
+}
+
+/// Roll the stable window to `latest_stable` if it is a new line newer than the
+/// current default.
+fn watch_stable(tags_file: &Path, latest_stable: &str, max_stable: usize) -> Result<()> {
+    let new = VllmVersion::parse(latest_stable).with_context(|| {
+        format!(
+            "--latest-stable '{latest_stable}' is not a vX.Y.Z release tag (expected e.g. v0.24.0)"
+        )
+    })?;
+    if new.rc.is_some() {
+        bail!("--latest-stable {latest_stable} is a pre-release; expected a final release");
+    }
+    let tags = parse_ls_remote(&read_tags_file(tags_file)?);
+    let rev = tags
+        .get(latest_stable)
+        .with_context(|| format!("tag {latest_stable} not found in {}", tags_file.display()))?
+        .clone();
+
+    let manifest = CompatManifest::load(COMPAT_TOML)?;
+    let minor = new.minor_line();
+    // A release on a line already in the window is a patch bump (v0.23.0 ->
+    // v0.23.1): move that line's tag/rev in place. The new rev invalidates any
+    // fidelity captures taken against the old one, so the line is demoted back
+    // to fidelity_validated = false until conformance re-passes.
+    if let Some(existing) = manifest.line(&minor) {
+        let current = VllmVersion::parse(&existing.tag)
+            .with_context(|| format!("line {minor} tag {} is unparseable", existing.tag))?;
+        if new <= current {
+            println!("changed=false");
+            eprintln!(
+                "line {minor} already at {}; nothing to update",
+                existing.tag
+            );
+            return Ok(());
+        }
+        let mut doc = read_compat_toml()?;
+        apply_set_line(&mut doc, &minor, Some(latest_stable), Some(&rev))?;
+        apply_demote_fidelity(&mut doc, &minor)?;
+        std::fs::write(COMPAT_TOML, doc.to_string()).context("writing compat.toml")?;
+        eprintln!(
+            "patch-bumped line {minor}: {} -> {latest_stable} ({rev})",
+            existing.tag
+        );
+        let outcome = if manifest.default_line()?.line == minor {
+            WatchOutcome::ChangedDefault
+        } else {
+            WatchOutcome::ChangedTransient
+        };
+        print_watch_summary(outcome, latest_stable, &minor, &rev);
+        return Ok(());
+    }
+    let default = manifest.default_line()?;
+    let default_v = VllmVersion::parse(&default.tag)
+        .with_context(|| format!("current default tag {} is unparseable", default.tag))?;
+    if new <= default_v {
+        println!("changed=false");
+        eprintln!(
+            "{latest_stable} is not newer than the current default {}",
+            default.tag
+        );
+        return Ok(());
+    }
+
+    let mut doc = read_compat_toml()?;
+    apply_roll_stable(&mut doc, &minor, latest_stable, &rev, max_stable)?;
+    std::fs::write(COMPAT_TOML, doc.to_string()).context("writing compat.toml")?;
+    eprintln!("rolled stable window: new default {latest_stable} (line {minor})");
+    print_watch_summary(WatchOutcome::ChangedDefault, latest_stable, &minor, &rev);
+    Ok(())
+}
+
+fn read_tags_file(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// What a watch run did to compat.toml, and whether the committed Cargo.toml
+/// pin (which tracks the `default = true` stable line) has to follow.
+#[derive(Clone, Copy)]
+enum WatchOutcome {
+    /// compat.toml untouched; the target was already pinned.
+    Unchanged,
+    /// A tracker or non-default stable line moved; the CI build pin is transient.
+    ChangedTransient,
+    /// The default stable line moved (roll or patch bump); the committed
+    /// Cargo.toml/Cargo.lock pin belongs in the auto-bump PR.
+    ChangedDefault,
+}
+
+/// Emit the `key=value` lines the workflow appends to `$GITHUB_OUTPUT`.
+fn print_watch_summary(outcome: WatchOutcome, tag: &str, line: &str, rev: &str) {
+    let (changed, is_default) = match outcome {
+        WatchOutcome::Unchanged => (false, false),
+        WatchOutcome::ChangedTransient => (true, false),
+        WatchOutcome::ChangedDefault => (true, true),
+    };
+    println!("changed={changed}");
+    println!("tag={tag}");
+    println!("line={line}");
+    println!("rev={rev}");
+    println!("is_default={is_default}");
 }
 
 fn nightly_golden_entry(
@@ -579,29 +763,134 @@ fn replace_nightly_goldens_block(manifest: &str, entries: &str) -> String {
     format!("{}\n\n{block}\n", manifest.trim_end())
 }
 
-/// Set the `nightly` `[[vllm]]` line's `protocol_rev` to `sha` in place, preserving
-/// the surrounding formatting and comments. Returns `true` if the value changed, so
-/// the caller (and the canary's `git diff` check) can skip an empty write / no-op PR.
-fn apply_nightly_rev(doc: &mut DocumentMut, sha: &str) -> Result<bool> {
+/// Set a `[[vllm]]` line's `tag` and/or `protocol_rev` in place, preserving the
+/// surrounding formatting and comments. `None` leaves that field alone. Returns
+/// `true` if anything changed, so the caller (and the watcher's `git diff` check)
+/// can skip an empty write / no-op PR.
+fn apply_set_line(
+    doc: &mut DocumentMut,
+    line: &str,
+    tag: Option<&str>,
+    rev: Option<&str>,
+) -> Result<bool> {
     let tables = doc["vllm"]
         .as_array_of_tables_mut()
         .context("compat.toml [[vllm]] is not an array of tables")?;
     let entry = tables
         .iter_mut()
-        .find(|t| t.get("line").and_then(Item::as_str) == Some(NIGHTLY_LINE))
-        .with_context(|| {
-            format!("no [[vllm]] entry with line = \"{NIGHTLY_LINE}\" in compat.toml")
-        })?;
-    let rev = entry
-        .get_mut("protocol_rev")
-        .context("nightly line has no protocol_rev")?
+        .find(|t| t.get("line").and_then(Item::as_str) == Some(line))
+        .with_context(|| format!("no [[vllm]] entry with line = \"{line}\" in compat.toml"))?;
+
+    let mut changed = false;
+    if let Some(tag) = tag {
+        changed |= set_str_field(entry, "tag", tag)?;
+    }
+    if let Some(rev) = rev {
+        changed |= set_str_field(entry, "protocol_rev", rev)?;
+    }
+    Ok(changed)
+}
+
+/// Reset a `[[vllm]]` line's `fidelity_validated` to `false`. Used when the
+/// line's tag/rev moves: existing fidelity captures were taken against the old
+/// rev, so the promotion has to be re-earned through the conformance gates.
+fn apply_demote_fidelity(doc: &mut DocumentMut, line: &str) -> Result<()> {
+    let tables = doc["vllm"]
+        .as_array_of_tables_mut()
+        .context("compat.toml [[vllm]] is not an array of tables")?;
+    let entry = tables
+        .iter_mut()
+        .find(|t| t.get("line").and_then(Item::as_str) == Some(line))
+        .with_context(|| format!("no [[vllm]] entry with line = \"{line}\" in compat.toml"))?;
+    entry["fidelity_validated"] = value(false);
+    Ok(())
+}
+
+/// Set an existing string field on a `[[vllm]]` table, returning whether it moved.
+fn set_str_field(entry: &mut Table, field: &str, val: &str) -> Result<bool> {
+    let item = entry
+        .get_mut(field)
+        .with_context(|| format!("line has no {field}"))?
         .as_value_mut()
-        .context("protocol_rev is not a value")?;
-    if rev.as_str() == Some(sha) {
+        .with_context(|| format!("{field} is not a value"))?;
+    if item.as_str() == Some(val) {
         return Ok(false);
     }
-    *rev = sha.into();
+    *item = val.into();
     Ok(true)
+}
+
+/// Insert `minor` (`tag`/`rev`) as the new `default = true` stable line, demote the
+/// old default, and drop the oldest stable line(s) past `max_stable`. The
+/// `nightly`/`rc` trackers are never counted or removed. Caller must have already
+/// verified `minor` is absent and newer than the current default.
+fn apply_roll_stable(
+    doc: &mut DocumentMut,
+    minor: &str,
+    tag: &str,
+    rev: &str,
+    max_stable: usize,
+) -> Result<()> {
+    let tables = doc["vllm"]
+        .as_array_of_tables_mut()
+        .context("compat.toml [[vllm]] is not an array of tables")?;
+
+    // Demote whatever currently carries default = true.
+    for table in tables.iter_mut() {
+        if table.get("default").and_then(Item::as_bool) == Some(true) {
+            table.remove("default");
+        }
+    }
+
+    // Build the new default line and insert it ahead of the existing stable lines
+    // (i.e. right after the nightly/rc trackers), so the file stays newest-first.
+    let mut entry = Table::new();
+    entry.decor_mut().set_prefix(
+        "\n# Auto-rolled in by vllm-release-watch as the new default. Review the\n\
+         # protocol_rev (pinned to the release tag's commit, not a post-release main\n\
+         # sha) and whether this line needs a [patch] fork before promoting fidelity.\n",
+    );
+    entry["line"] = value(minor);
+    entry["tag"] = value(tag);
+    entry["protocol_rev"] = value(rev);
+    entry["fidelity_validated"] = value(false);
+    entry["default"] = value(true);
+
+    let insert_at = first_stable_index(tables);
+    tables.insert(insert_at, entry);
+
+    // Trim the oldest stable lines (highest index) until we're within the window.
+    while stable_indices(tables).len() > max_stable {
+        if let Some(&oldest) = stable_indices(tables).last() {
+            tables.remove(oldest);
+        }
+    }
+    Ok(())
+}
+
+fn is_tracker(table: &Table) -> bool {
+    table
+        .get("line")
+        .and_then(Item::as_str)
+        .is_some_and(|l| TRACKER_LINES.contains(&l))
+}
+
+/// Index of the first non-tracker (stable) line, or the end if there are none.
+fn first_stable_index(tables: &toml_edit::ArrayOfTables) -> usize {
+    tables
+        .iter()
+        .position(|t| !is_tracker(t))
+        .unwrap_or(tables.len())
+}
+
+/// Indices of the stable lines (everything that is not a nightly/rc tracker).
+fn stable_indices(tables: &toml_edit::ArrayOfTables) -> Vec<usize> {
+    tables
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !is_tracker(t))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 fn read_compat_toml() -> Result<DocumentMut> {
@@ -724,7 +1013,7 @@ default = true
 
     fn set_nightly(toml: &str, sha: &str) -> (String, bool) {
         let mut doc: DocumentMut = toml.parse().unwrap();
-        let changed = apply_nightly_rev(&mut doc, sha).unwrap();
+        let changed = apply_set_line(&mut doc, "nightly", None, Some(sha)).unwrap();
         (doc.to_string(), changed)
     }
 
@@ -753,6 +1042,149 @@ default = true
     fn set_nightly_rev_is_idempotent_no_change() {
         let (_, changed) = set_nightly(COMPAT, "oldsha");
         assert!(!changed, "setting the same sha must report no change");
+    }
+
+    #[test]
+    fn set_line_bumps_tag_and_rev_together() {
+        let mut doc: DocumentMut = COMPAT.parse().unwrap();
+        let changed =
+            apply_set_line(&mut doc, "nightly", Some("v0.24.0rc1"), Some("newsha")).unwrap();
+        let out = doc.to_string();
+        assert!(changed);
+        assert!(out.contains(r#"tag = "v0.24.0rc1""#));
+        assert!(out.contains(r#"protocol_rev = "newsha""#));
+        // The other line stays put.
+        assert!(out.contains(r#"protocol_rev = "keepsha""#));
+    }
+
+    // A window with both trackers (nightly, rc) and three stable lines, newest first.
+    const WINDOW: &str = "\
+[[vllm]]
+line = \"nightly\"
+tag = \"nightly\"
+protocol_rev = \"mainsha\"
+fidelity_validated = false
+
+[[vllm]]
+line = \"rc\"
+tag = \"v0.24.0rc1\"
+protocol_rev = \"rcsha\"
+fidelity_validated = false
+
+[[vllm]]
+line = \"0.23\"
+tag = \"v0.23.0\"
+protocol_rev = \"sha23\"
+default = true
+
+[[vllm]]
+line = \"0.22\"
+tag = \"v0.22.1\"
+protocol_rev = \"sha22\"
+
+[[vllm]]
+line = \"0.21\"
+tag = \"v0.21.0\"
+protocol_rev = \"sha21\"
+";
+
+    fn roll(toml: &str, minor: &str, tag: &str, rev: &str, max: usize) -> CompatManifest {
+        let mut doc: DocumentMut = toml.parse().unwrap();
+        apply_roll_stable(&mut doc, minor, tag, rev, max).unwrap();
+        CompatManifest::parse(&doc.to_string()).unwrap()
+    }
+
+    #[test]
+    fn roll_stable_makes_the_new_line_the_only_default() {
+        let m = roll(WINDOW, "0.24", "v0.24.0", "sha24", 4);
+        let default = m.default_line().unwrap();
+        assert_eq!(default.line, "0.24");
+        assert_eq!(default.tag, "v0.24.0");
+        assert_eq!(default.protocol_rev, "sha24");
+        assert!(!default.fidelity_validated);
+        assert_eq!(m.lines.iter().filter(|l| l.default).count(), 1);
+    }
+
+    #[test]
+    fn roll_stable_inserts_after_trackers_keeping_newest_first() {
+        let m = roll(WINDOW, "0.24", "v0.24.0", "sha24", 4);
+        let order: Vec<&str> = m.lines.iter().map(|l| l.line.as_str()).collect();
+        // Trackers stay on top; new default leads the stable lines.
+        assert_eq!(order, ["nightly", "rc", "0.24", "0.23", "0.22", "0.21"]);
+    }
+
+    #[test]
+    fn roll_stable_keeps_four_then_drops_the_oldest() {
+        // Window starts at 3 stable; rolling to 0.24 fills it to 4, none dropped.
+        let four = roll(WINDOW, "0.24", "v0.24.0", "sha24", 4);
+        assert!(four.line("0.21").is_some(), "0.21 survives at the 4th slot");
+
+        // Roll again to 0.25 on the already-full window: 0.21 (oldest) ages out.
+        let five = roll(&toml_for(&four), "0.25", "v0.25.0", "sha25", 4);
+        let stable: Vec<&str> = five
+            .lines
+            .iter()
+            .filter(|l| l.line != "nightly" && l.line != "rc")
+            .map(|l| l.line.as_str())
+            .collect();
+        assert_eq!(stable, ["0.25", "0.24", "0.23", "0.22"]);
+        assert!(five.line("0.21").is_none(), "oldest stable line is dropped");
+        // Trackers are never touched by a roll.
+        assert!(five.line("nightly").is_some());
+        assert!(five.line("rc").is_some());
+    }
+
+    #[test]
+    fn patch_bump_moves_the_line_in_place_and_demotes_fidelity() {
+        // A patch release on an existing line (v0.22.1 -> v0.22.2) edits that
+        // line only: same window shape, same default, fidelity reset to false.
+        let mut doc: DocumentMut = WINDOW.parse().unwrap();
+        apply_set_line(&mut doc, "0.22", Some("v0.22.2"), Some("sha222")).unwrap();
+        apply_demote_fidelity(&mut doc, "0.22").unwrap();
+        let m = CompatManifest::parse(&doc.to_string()).unwrap();
+
+        let line = m.line("0.22").unwrap();
+        assert_eq!(line.tag, "v0.22.2");
+        assert_eq!(line.protocol_rev, "sha222");
+        assert!(!line.fidelity_validated);
+        assert!(!line.default, "a patch bump never moves the default");
+        assert_eq!(m.default_line().unwrap().line, "0.23");
+        let order: Vec<&str> = m.lines.iter().map(|l| l.line.as_str()).collect();
+        assert_eq!(order, ["nightly", "rc", "0.23", "0.22", "0.21"]);
+    }
+
+    #[test]
+    fn demote_fidelity_resets_a_promoted_line() {
+        let toml = "\
+[[vllm]]
+line = \"0.23\"
+tag = \"v0.23.0\"
+protocol_rev = \"sha23\"
+fidelity_validated = true
+default = true
+";
+        let mut doc: DocumentMut = toml.parse().unwrap();
+        apply_demote_fidelity(&mut doc, "0.23").unwrap();
+        let m = CompatManifest::parse(&doc.to_string()).unwrap();
+        assert!(!m.line("0.23").unwrap().fidelity_validated);
+    }
+
+    /// Re-serialize a parsed manifest back to TOML for a second roll. The field
+    /// order matches what `apply_roll_stable`/the file use, so a round trip is faithful.
+    fn toml_for(m: &CompatManifest) -> String {
+        let mut out = String::new();
+        for l in &m.lines {
+            out.push_str("[[vllm]]\n");
+            out.push_str(&format!("line = \"{}\"\n", l.line));
+            out.push_str(&format!("tag = \"{}\"\n", l.tag));
+            out.push_str(&format!("protocol_rev = \"{}\"\n", l.protocol_rev));
+            out.push_str(&format!("fidelity_validated = {}\n", l.fidelity_validated));
+            if l.default {
+                out.push_str("default = true\n");
+            }
+            out.push('\n');
+        }
+        out
     }
 
     #[test]

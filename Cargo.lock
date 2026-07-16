@@ -113,9 +113,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "arc-swap"
@@ -1709,15 +1709,6 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "esaxx-rs"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
-dependencies = [
- "cc",
 ]
 
 [[package]]
@@ -5001,7 +4992,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665#0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665"
+source = "git+https://github.com/vllm-project/vllm.git?rev=ee0da84ab9e04ac7610e28580af62c365e898389#ee0da84ab9e04ac7610e28580af62c365e898389"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -5035,7 +5026,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665#0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665"
+source = "git+https://github.com/vllm-project/vllm.git?rev=ee0da84ab9e04ac7610e28580af62c365e898389#ee0da84ab9e04ac7610e28580af62c365e898389"
 dependencies = [
  "prometheus-client",
 ]

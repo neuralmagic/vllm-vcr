@@ -17,6 +17,7 @@
 # Guide
 
 - [Testing](./testing.md)
+- [Real-world examples](./examples.md)
 - [LoRA simulation](./lora.md)
 - [NIXL data plane](./nixl.md)
 - [Engine internals](./engine-internals.md)

@@ -22,8 +22,8 @@ sim-s3 = { path = "crates/sim-s3" }
 
 # The real vLLM engine-core protocol + reusable mock-engine handshake harness,
 # pulled straight from the in-tree Rust frontend so the wire format never drifts.
-# Using v0.23.0 to match the frontend version.
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665" }
+# Rev contains vllm-project/vllm#45848 (serde defaults), so no fork patch is needed.
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "ee0da84ab9e04ac7610e28580af62c365e898389" }
 
 anyhow = "1.0.100"
 base64 = "0.22.1"

@@ -270,7 +270,7 @@ fn random_norm_truncated(rng: &mut StdRng, mean: u64, stddev: u64) -> u64 {
     clamped as u64
 }
 
-use crate::trace::{TraceMeta, TraceRecord};
+use crate::trace::TraceRecord;
 
 /// Prompt-token bucket edges (powers of two). A value `v` falls into bucket `i` where
 /// `PROMPT_EDGES[i] <= v < PROMPT_EDGES[i+1]`. The last bucket is uncapped.
@@ -794,8 +794,6 @@ pub struct TraceLatency {
     /// Sorted recorded output lengths (tokens) across all records, the empirical
     /// EOS-termination distribution sampled by `sample_output_len`.
     output_lens: Vec<f64>,
-    #[allow(dead_code)]
-    meta: TraceMeta,
 }
 
 impl TraceLatency {
@@ -803,7 +801,6 @@ impl TraceLatency {
     /// capture's per-step token budget (chunk sizes are derived from it).
     /// Returns an error if the trace has no records or no decode-pacing data.
     pub fn from_records(
-        meta: TraceMeta,
         records: &[TraceRecord],
         kv_transfer_fallback: KnobLatency,
         max_batched_tokens: usize,
@@ -991,7 +988,6 @@ impl TraceLatency {
             budget_tokens: max_batched_tokens.max(1),
             spec_tokens,
             output_lens,
-            meta,
         })
     }
 }
@@ -1395,7 +1391,7 @@ mod tests {
     // TraceLatency tests
 
     use crate::latency::TraceLatency;
-    use crate::trace::{ItlSummary, TraceMeta, TraceRecord};
+    use crate::trace::{ItlSummary, TraceRecord};
 
     /// The synthetic service law used by the curve-fit tests.
     fn quad_ms(u: f64) -> f64 {
@@ -1418,13 +1414,7 @@ mod tests {
 
     #[test]
     fn trace_service_fit_recovers_quadratic() {
-        let trace = TraceLatency::from_records(
-            TraceMeta::default(),
-            &quad_floor_records(),
-            zero_knob(),
-            8192,
-        )
-        .unwrap();
+        let trace = TraceLatency::from_records(&quad_floor_records(), zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         // Interpolated and extrapolated points; the fit is deterministic.
         for u in [500usize, 2_000, 5_000, 7_800, 11_000] {
@@ -1450,8 +1440,7 @@ mod tests {
                 records.push(make_record(u, 2, quad_ms(u as f64) + 400.0, vec![10.0], 9));
             }
         }
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let got = trace
             .first_token_delay(&mut rng, &ctx(5_000, 0, false, 1))
@@ -1466,13 +1455,7 @@ mod tests {
 
     #[test]
     fn trace_service_fit_clamps_to_floor() {
-        let trace = TraceLatency::from_records(
-            TraceMeta::default(),
-            &quad_floor_records(),
-            zero_knob(),
-            8192,
-        )
-        .unwrap();
+        let trace = TraceLatency::from_records(&quad_floor_records(), zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         // u=1: the raw curve sits near its intercept; the clamp keeps the
         // result at or above the smallest observed window floor.
@@ -1532,8 +1515,7 @@ mod tests {
             make_spec_record(100, vec![5.0; 9], vec![2; 9]),
             make_spec_record(100, vec![50.0; 9], vec![8; 9]),
         ];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(11);
 
         let mut seen_fast = false;
@@ -1563,8 +1545,7 @@ mod tests {
     #[test]
     fn autoregressive_traces_always_draw_single_token_steps() {
         let records = vec![make_record(100, 10, 40.0, vec![10.0; 9], 1)];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
         let mut pacing = DecodePacing::default();
         for _ in 0..30 {
@@ -1580,22 +1561,20 @@ mod tests {
             make_spec_record(100, vec![5.0; 9], vec![2; 9]),
             make_spec_record(100, vec![50.0; 9], vec![8; 9]),
         ];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         assert_eq!(trace.spec_tokens(), Some(7));
     }
 
     #[test]
     fn spec_tokens_none_for_autoregressive() {
         let records = vec![make_record(100, 10, 40.0, vec![10.0; 9], 1)];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         assert_eq!(trace.spec_tokens(), None);
     }
 
     #[test]
     fn trace_empty_records_is_error() {
-        let result = TraceLatency::from_records(TraceMeta::default(), &[], zero_knob(), 8192);
+        let result = TraceLatency::from_records(&[], zero_knob(), 8192);
         assert!(result.is_err());
     }
 
@@ -1606,8 +1585,7 @@ mod tests {
             make_record(50, 2, 42.0, vec![9.0], 1),
             make_record(60, 1, 42.0, vec![], 1),
         ];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(99);
         for _ in 0..100 {
             let d = trace.first_token_delay(&mut rng, &ctx(55, 0, false, 1));
@@ -1622,8 +1600,7 @@ mod tests {
             make_record(60, 3, 20.0, vec![8.0, 12.0], 1),
             make_record(40, 3, 15.0, vec![6.0, 10.0], 1),
         ];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         for _ in 0..1000 {
             let ttft = trace.first_token_delay(&mut rng, &ctx(50, 0, false, 1));
@@ -1652,8 +1629,7 @@ mod tests {
             make_record(780, 163, 12.0, vec![5.0; 50], 1),
             make_record(790, 1193, 14.0, vec![5.0; 100], 1),
         ];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         for _ in 0..1000 {
             let n = trace
@@ -1680,8 +1656,7 @@ mod tests {
             make_record(100, 5, 25.0, vec![3.0, 4.0, 5.0, 6.0], 2),
             make_record(120, 3, 35.0, vec![7.0, 8.0], 2),
         ];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
 
         let run = |seed: u64| {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -1709,8 +1684,7 @@ mod tests {
     fn trace_fallback_to_nearest_bucket() {
         // Only populate a single cell: prompt 30 tokens, concurrency 1.
         let records = vec![make_record(30, 2, 77.0, vec![11.0], 1)];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
 
         // A much larger prompt borrows the only populated bucket's service
@@ -1745,8 +1719,7 @@ mod tests {
             itl_ctx: None,
             ..Default::default()
         }];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
 
         // All ITL samples are 9.0, so sampling always returns 9.0.
@@ -1777,8 +1750,7 @@ mod tests {
             }),
             ..Default::default()
         }];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
         let mut pacing = DecodePacing::default();
 
@@ -1818,8 +1790,7 @@ mod tests {
             make_record(100, 10, 40.0, vec![5.0; 9], 4),
             make_record(100, 10, 40.0, vec![50.0; 9], 4),
         ];
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
 
         let mut seen_fast_request = false;
@@ -1868,7 +1839,7 @@ mod tests {
             make_record(50, 1, 42.0, vec![], 1),
             make_record(60, 1, 42.0, vec![], 1),
         ];
-        let result = TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192);
+        let result = TraceLatency::from_records(&records, zero_knob(), 8192);
         let error = result.err().expect("ITL-less trace must be rejected");
         assert!(error.to_string().contains("inter-token"), "got: {error}");
     }
@@ -1878,7 +1849,7 @@ mod tests {
         let records = vec![make_record(50, 2, 10.0, vec![1.0], 1)];
         let mut knob = zero_knob();
         knob.kv_cache_transfer_latency = 500;
-        let trace = TraceLatency::from_records(TraceMeta::default(), &records, knob, 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, knob, 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
 
         let d = trace.first_token_delay(&mut rng, &ctx(50, 0, true, 1));
@@ -1926,8 +1897,7 @@ mod tests {
     fn chunk_cost_fit_recovers_isolated_marks() {
         let (c0, c1) = (0.012, 2.0e-6);
         let records = marked_records(20, c0, c1, &[5, 15, 25, 35]);
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
 
         // A full budget chunk at depth 0.
         let cost = trace.prefill_chunk_cost(8192, 0).as_secs_f64() * 1000.0;
@@ -1955,8 +1925,7 @@ mod tests {
         // Adjacent marks mean two admissions' chunks share measured gaps; with
         // no isolated marks left the fit must refuse rather than double-count.
         let records = marked_records(10, 0.024, 4.0e-6, &[5, 6, 15, 16]);
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         assert_eq!(trace.prefill_chunk_cost(8192, 0), std::time::Duration::ZERO);
     }
 
@@ -1966,8 +1935,7 @@ mod tests {
         let (c0, c1) = (0.012, 2.0e-6);
         let mut records = quad_floor_records();
         records.extend(marked_records(20, c0, c1, &[5, 15, 25, 35]));
-        let trace =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let trace = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let u = 5_000usize;
         let total = trace

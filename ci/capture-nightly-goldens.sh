@@ -67,10 +67,13 @@ if missing:
 if any(c.get("vllm_tag") == "nightly" for c in selected):
     nightly = next(v for v in compat["vllm"] if v["line"] == "nightly")
     engine_image = models["lines"]["nightly"]["engine_image"]
-    if nightly["protocol_rev"] not in engine_image:
+    # engine_image tag format: <registry>/<repo>:<protocol_rev>[@digest]
+    # Extract the tag (after last colon, before any @) and verify it matches protocol_rev.
+    tag = engine_image.split(":")[-1].split("@")[0]
+    if tag != nightly["protocol_rev"]:
         raise SystemExit(
-            "nightly engine_image must include compat.toml nightly protocol_rev "
-            f"{nightly['protocol_rev']}: {engine_image}"
+            f"nightly engine_image tag must match compat.toml nightly protocol_rev "
+            f"{nightly['protocol_rev']}, got: {tag} (full image: {engine_image})"
         )
 PY
 }

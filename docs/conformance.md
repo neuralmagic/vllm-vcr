@@ -378,8 +378,9 @@ under QEMU is unreliable (rustc SIGSEGVs under emulation). Build natively:
 - `just image-build-line <line>` builds the image for an older line, e.g.
   `just image-build-line 0.22`: it pins `Cargo.toml` to that line's rev/fork with
   `cargo xtask pin-vllm`, stamps `VLLM_TARGET_VERSION`, and builds the vllm-rs frontend
-  from the same source as the tap. (It leaves `Cargo.toml`/`Cargo.lock` rewritten;
-  restore those files after the build if you do not want to keep the local pin.)
+  from the same source as the tap. **Note:** The justfile does NOT restore
+  `Cargo.toml`/`Cargo.lock` after the build; they are left modified. If you want the
+  original pin, restore them manually with `git restore Cargo.toml Cargo.lock`.
 - On Apple Silicon, use the **build-on-waldorf** flow to build natively on the cluster
   with an unprivileged kaniko pod instead of cross-building locally.
 

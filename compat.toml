@@ -18,12 +18,24 @@
 #     org if you want them to survive the fork going away). The default line
 #     builds against upstream and has no such dependency.
 #   - Exactly one line has `default = true`. That line is `:latest` / unsuffixed.
+#     It is always the newest stable release.
 #   - A line enters with `fidelity_validated = false` and is promoted to `true`
 #     only once the conformance replay gates pass against its captures.
-#   - The `nightly` line is special: it tracks vLLM main (post-merge commits), so
-#     its `tag` is the literal `"nightly"` rather than a release. Its `protocol_rev`
-#     is bumped to the latest main sha to catch wire drift before a release lands.
-#     build.rs treats a non-`vX.Y` tag as the newest line (all capability cfgs on).
+#   - Two non-stable "tracker" lines ride ahead of the stable window so wire drift
+#     shows up before a release pins us to it. Neither is ever `default`:
+#       * `nightly` tracks vLLM main (post-merge commits); its `tag` is the literal
+#         `"nightly"`. protocol_rev is bumped to the latest main sha by the canary.
+#       * `rc` tracks the newest upstream release candidate newer than the current
+#         stable (e.g. `v0.24.0rc1`); both its `tag` and `protocol_rev` are bumped
+#         by the release watcher. build.rs parses the rc tag's `major.minor` like
+#         any release, so the right capability cfgs turn on.
+#     build.rs treats a non-`vX.Y` tag (i.e. `nightly`) as the newest line (all
+#     capability cfgs on).
+#   - The stable window holds up to four lines (newest default + three back). A
+#     new stable release rolls in as the default, demotes the old default, and
+#     drops the oldest once the window is full. The `nightly`/`rc` trackers and the
+#     stable roll are automated by .github/workflows/vllm-release-watch.yml (build-
+#     gated PRs); the manifest stays the source of truth, the watcher just edits it.
 
 [[vllm]]
 # Bleeding edge: tracks vLLM main so the build/conformance matrix flags wire drift
@@ -36,13 +48,33 @@ protocol_rev = "8dd1b702f27edeed24a4336f531b01c346e04253"
 fidelity_validated = false
 
 [[vllm]]
+# Latest upstream release candidate, ahead of the newest stable. Tracked by the
+# release watcher (`cargo xtask watch-rc`), which bumps BOTH tag and protocol_rev
+# to the highest `vX.Y.ZrcN` tag newer than the default line. v0.24.0rc1 is the
+# rc for the upcoming 0.24; builds clean against upstream (>=0.23 carries #45848),
+# so no fork. fidelity_validated stays false (RCs never get goldens).
+line = "rc"
+tag = "v0.24.0rc1"
+protocol_rev = "7b3d595eb197d714052ce296cc8b124f0dc8af31"
+fidelity_validated = false
+
+# Auto-rolled in by vllm-release-watch as the new default. Review the
+# protocol_rev (pinned to the release tag's commit, not a post-release main
+# sha) and whether this line needs a [patch] fork before promoting fidelity.
+[[vllm]]
+line = "0.24"
+tag = "v0.24.0"
+protocol_rev = "ee0da84ab9e04ac7610e28580af62c365e898389"
+fidelity_validated = false
+default = true
+
+[[vllm]]
 # N (head). 17bc1445 is the post-#45848 main commit (serde-default fix upstream
 # as of 2026-06-17), so no fork patch. Builds + conformance + unit tests green.
 line = "0.23"
 tag = "v0.23.0"
 protocol_rev = "17bc1445562435b608041d434e9738440954159c"
 fidelity_validated = false
-default = true
 
 [[vllm]]
 # N-1. Builds against the 0.22 crate (0decac0d), patched to the wseaton/vllm

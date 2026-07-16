@@ -17,8 +17,10 @@ The full smoke scripts also boot a real vLLM frontend:
 ```
 
 These scripts need `vllm-rs` built once (`cargo build --bin vllm-rs` in the vLLM
-`rust/` workspace). Override its path with `FRONTEND_BIN=...`. The first run fetches
-the tokenizer from Hugging Face.
+`rust/` workspace). By default the scripts look for the binary at
+`$HOME/git/vllm-main/rust/target/debug/vllm-rs`; override this path with
+`FRONTEND_BIN=/path/to/vllm-rs`. The first run fetches the tokenizer from
+Hugging Face.
 
 `e2e_lora.sh` needs a frontend that exports `vllm:lora_requests_info` from the
 frontend metrics path. The image and current default protocol pin qualify; if you use

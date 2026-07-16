@@ -629,13 +629,12 @@ impl Opt {
             );
         }
 
-        let (meta, records) = trace::read_trace_file(local_input(uri, "--latency-trace")?)?;
+        let (_meta, records) = trace::read_trace_file(local_input(uri, "--latency-trace")?)?;
 
         // The KV-transfer knobs are NOT mutually exclusive: the trace does not cover
         // P/D transfer timing, so the knob model handles do_remote_prefill requests.
         let kv_fallback = self.latency_model();
         let trace_model = latency::TraceLatency::from_records(
-            meta,
             &records,
             kv_fallback,
             self.max_num_batched_tokens as usize,
@@ -658,19 +657,27 @@ fn local_input<'a>(uri: &'a TraceUri, flag: &str) -> Result<&'a std::path::Path>
 async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) -> Result<()> {
     // Advertise the sim's actual configured limits in the registration ready
     // response so the frontend validates against what this engine enforces.
-    // This is sim-owned (not the crate's EngineCoreReadyResponse) because the
-    // python frontend requires `block_size`, which the crate's struct lacks.
+    // This is sim-owned (not the crate's EngineCoreReadyResponse) so the wire
+    // schema is the superset every supported line's frontend requires,
+    // independent of whichever crate rev this build is pinned to.
+    let max_model_len = if opt.max_model_len > 0 {
+        opt.max_model_len
+    } else {
+        DEFAULT_MOCK_MAX_MODEL_LEN
+    };
+    let kv_cache_size_tokens = opt.kv_cache_size * opt.tokens_per_block as u64;
     let ready_payload = frontend_connect::SimReadyResponse {
-        max_model_len: if opt.max_model_len > 0 {
-            opt.max_model_len
-        } else {
-            DEFAULT_MOCK_MAX_MODEL_LEN
-        },
+        max_model_len,
         num_gpu_blocks: opt.kv_cache_size,
         block_size: opt.tokens_per_block as u64,
         dp_stats_address: None,
         dtype: default_dtype(),
         vllm_version: opt.target_vllm_version().to_string(),
+        // One sim worker per engine: no tensor or pipeline parallelism.
+        world_size: 1,
+        data_parallel_size: opt.engine_count as u64,
+        kv_cache_size_tokens: Some(kv_cache_size_tokens),
+        kv_cache_max_concurrency: Some(kv_cache_size_tokens as f64 / max_model_len as f64),
     }
     .encode()?;
 
