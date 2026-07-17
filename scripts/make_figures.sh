@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Rebuild every README/deck figure from the committed traces (traces/README.md
-# is the inventory). Run it as `just figures`.
+# Rebuild every README/deck figure from local trace files listed in
+# traces/README.md. Run it as `just figures`.
 #
 # The arrival replays run in REAL TIME (each one spins the actual simulator
 # and replays a captured schedule wall-clock), so the full set takes ~30
@@ -23,7 +23,7 @@ FIT="$WORK/fit.jsonl"
 PLOT=(uv run scripts/plot_calibration.py)
 
 cargo build --release -q
-BIN=target/release/inference-sim-trace
+BIN=target/release/vllm-vcr
 
 # The H200 capture rig's scheduler/cache config, mirrored by the step-model
 # replays (the local-sim captures ran engine defaults instead).
@@ -47,12 +47,12 @@ replay() {
     echo "==> replay $name ($tap)"
     # The verdict gates at 10% on worst-quantile cells; small-n tails can
     # exceed that while medians and totals agree, so don't abort the build.
-    "$BIN" calibrate-e2e "$tap" --replay-arrivals --latency-trace "$FIT" \
+    "$BIN" inspect calibrate-e2e "$tap" --replay-arrivals --latency-trace "$FIT" \
         --dump-trace "$WORK/$name.jsonl" "$@" || true
 }
 
 echo "==> in-sample ITL fidelity + per-token-vs-mean (model level)"
-"$BIN" calibrate "$H8/h200-qwen3-tap-trace.jsonl" --dump-samples "$WORK/samples.json" || true
+"$BIN" inspect calibrate "$H8/h200-qwen3-tap-trace.jsonl" --dump-samples "$WORK/samples.json" || true
 "${PLOT[@]}" --samples "$WORK/samples.json" \
     --trace "$H8/h200-qwen3-tap-trace.jsonl" --out-dir "$OUT"
 

@@ -1,8 +1,11 @@
 # vLLM version mapping and release automation
 
-Goal: support a rolling **N-3** window (latest vLLM release plus the three
-before it) from a single repo, with automation that catches protocol drift the
-day a new vLLM lands and ships one clearly-labelled artifact per supported line.
+Goal: support a rolling window of **up to four stable lines** (latest vLLM release
+plus three back) from a single repo, with automation that catches protocol drift
+the day a new vLLM lands and ships one clearly-labelled artifact per supported
+line. Two non-stable "tracker" lines ride ahead of the window so drift shows up
+before a release pins us to it: `nightly` (vLLM main) and `rc` (the newest
+release candidate).
 
 ## Where vLLM version actually bites
 
@@ -41,29 +44,55 @@ A manifest at repo root defines the support window. The manifest diff *is* the
 release.
 
 ```toml
-# compat.toml — the N-3 support window. Oldest line drops as N advances.
+# compat.toml — the rolling support window. Oldest release line drops as N advances.
 
 [[vllm]]
-line = "0.10"                 # N (head)
-tag  = "v0.10.1"              # vLLM release tag; also the e2e frontend version
-protocol_rev = "abc123..."    # rev for vllm-engine-core-client at this line
-fidelity_validated = true     # replay gates green against this line's captures
+line = "nightly"              # tracks vLLM main for drift detection
+tag  = "nightly"
+protocol_rev = "9c7c74bf..."
+fidelity_validated = false
+
+[[vllm]]
+line = "rc"                   # tracks the newest release candidate (e.g. v0.24.0rc1)
+tag  = "v0.24.0rc1"           # bumped (tag + rev) by the release watcher
+protocol_rev = "7b3d595e..."
+fidelity_validated = false
+
+[[vllm]]
+line = "0.24"                 # current default line
+tag  = "v0.24.0"              # vLLM release tag; also the e2e frontend version
+protocol_rev = "ee0da84a..."  # rev for vllm-engine-core-client at this line
+fidelity_validated = false    # flips true once replay gates validate goldens
 default = true                # what :latest / unsuffixed builds point at
 
 [[vllm]]
-line = "0.9"                  # N-1
-tag  = "v0.9.2"
-protocol_rev = "c9340e6f350a009cf835878abad2a0e379b9e6a4"
-fidelity_validated = true
+line = "0.23"                 # N-1 supported release line
+tag  = "v0.23.0"
+protocol_rev = "17bc1445..."
+fidelity_validated = false
 
-# ... N-2, N-3
+[[vllm]]
+line = "0.22"                 # N-2 supported release line
+tag  = "v0.22.1"
+protocol_rev = "0decac0d..."
+patch_repo = "https://github.com/wseaton/vllm.git"
+patch_rev = "b48f2434..."
+fidelity_validated = false
+
+[[vllm]]
+line = "0.21"                 # N-3 supported release line
+tag  = "v0.21.0"
+protocol_rev = "0decac0d..."
+patch_repo = "https://github.com/wseaton/vllm.git"
+patch_rev = "b48f2434..."
+fidelity_validated = false
 ```
 
 Rules:
 
-- **Pin to vLLM release tags, not arbitrary revs.** `protocol_rev` is the rev of
-  the in-tree Rust crate that ships with that tag. Today's `c9340e6f` becomes
-  "the rev for the 0.9 line."
+- **Pin release lines to release tags, not arbitrary labels.** `tag` is the vLLM
+  release label for the line. `protocol_rev` is the vLLM git rev whose in-tree
+  `vllm-engine-core-client` crate the simulator builds against for that line.
 - **Exactly one `default = true`.** That line is `:latest` and the unsuffixed
   build.
 - **A line enters the window only when `fidelity_validated = true`.** New lines
@@ -77,10 +106,10 @@ Conflating them is the classic mistake.
 
 Image tags:
 
-- `inference-sim:0.3.0-vllm0.10` — immutable, the real artifact (sim version ×
+- `vllm-vcr:0.3.0-vllm0.23` — immutable, the real artifact (sim version ×
   vLLM line).
-- `inference-sim:vllm0.10` — floating, → latest sim for that line.
-- `inference-sim:latest` — sim-head × the `default = true` line.
+- `vllm-vcr:vllm0.23` — floating, latest sim for that line.
+- `vllm-vcr:latest` — sim-head × the `default = true` line.
 
 ## CI matrix mechanics
 
@@ -91,11 +120,11 @@ fails for every line (including the head). The per-line build instead rewrites
 the manifest in a throwaway checkout:
 
 ```sh
-python3 ci/pin-vllm-rev.py "<line>"   # reads compat.toml, edits Cargo.toml
+cargo xtask pin-vllm "<line>"   # reads compat.toml, edits Cargo.toml
 cargo build --workspace               # no --locked: the rev changed
 ```
 
-`pin-vllm-rev.py` sets the rev in `[workspace.dependencies]` and rewrites or
+`cargo xtask pin-vllm` sets the rev in `[workspace.dependencies]` and rewrites or
 removes the fork `[patch]` from the line's `patch_repo`/`patch_rev` (the head
 line carries the #45848 fork; lines without a fork build against `protocol_rev`
 upstream). `compat.toml` stays the single source of truth.
@@ -112,7 +141,7 @@ non-blocking annotation rather than blocking the merge.
 The frontend registration already carries `vllm_version`
 (`frontend_connect.rs:43`). On connect, assert the peer's version is in the
 artifact's supported set and refuse with a clear error otherwise. That turns
-"silent msgpack corruption" into "this image speaks vLLM 0.10, peer is 0.8,
+"silent msgpack corruption" into "this image speaks vLLM 0.23, peer is 0.22,
 abort." Cheap, high value, independent of the matrix.
 
 ## Rotation when N advances
@@ -132,8 +161,26 @@ When vLLM cuts N+1:
    **Done** (per-line build/unit/conformance; see `conformance.md`).
 3. Compatibility shim for the protocol crate's per-line API drift. **Done** for
    the 0.22 line; see `multi-version-shim.md` (capability cfgs + owned/tolerant
-   decodes, `ci/pin-vllm-rev.py`). This is what lets one `main` build against
+   decodes, `cargo xtask pin-vllm`). This is what lets one `main` build against
    multiple lines without a single multi-version binary.
+4. Nightly canary (`.github/workflows/nightly-canary.yml`). The `nightly` line is
+   pinned and only moves when bumped; the canary instead pins to the LIVE upstream
+   main HEAD each night (`cargo xtask pin-vllm nightly --rev <sha>`), builds,
+   runs unit tests, runs the HEAD-client protocol e2e tests, runs the conformance
+   runner, and publishes a rolling `nightly` prerelease with the sha in its notes.
+   A red scheduled run is the early warning that upstream moved the engine-core
+   protocol. **Done.**
+5. Release watcher (`.github/workflows/vllm-release-watch.yml`). The tag-driven
+   counterpart to the canary, run daily. It keeps the `rc` line on the newest
+   release candidate (`cargo xtask watch-rc`) and rolls the stable window when a
+   new final release lands (`cargo xtask watch-stable --max-stable 4`: new default,
+   oldest stable dropped past four). A patch release on a line already in the
+   window (v0.23.0 -> v0.23.1) bumps that line's tag/rev in place and resets its
+   `fidelity_validated` (old captures were taken against the old rev). Both pin +
+   build + run the protocol e2e against the new tag and only open a build-gated
+   PR if green; when the change moves the default line, the PR also carries the
+   re-pinned `Cargo.toml`/`Cargo.lock` so the committed pin keeps tracking the
+   default. **Done.**
 
 ## Open coupling note: the `block_size` / registration drift
 
@@ -162,7 +209,8 @@ captures with a GPU-free replay in CI. The capture runbook is
 
 Three artifacts cooperate:
 
-- **`compat.toml`** — the N-3 window (above). Each line carries `fidelity_validated`,
+- **`compat.toml`** — the four-line stable window plus the `nightly`/`rc` trackers
+  (above). Each line carries `fidelity_validated`,
   which gates whether its conformance failures block promotion.
 - **`conformance/manifest.toml`** — one `[[golden]]` entry per captured trace, with
   `line`, `bucket_path`, `sha256`, `config_hash`, `workload`, and `role` (`schema` or
@@ -184,7 +232,6 @@ The CI flow (`.github/workflows/ci.yml`):
    once the golden validates, and the leg becomes a hard gate.
 
 The replay-many half needs no GPU and is the same mechanism as the offline replay rig
-(`deploy/trace-capture/offline-replay.yaml`): the python frontend talks to
-`inference-sim` serving the captured trace, no engine, no card. CI runs it headlessly;
-the rig serves a live agent the same byte-identical streams.
-
+(`deploy/trace-capture/base/offline-replay.yaml`): the python frontend talks to
+`vllm-vcr play` serving the captured trace, with no real engine behind it. CI runs it
+headlessly; the rig serves a live agent the same byte-identical streams.

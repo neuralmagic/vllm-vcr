@@ -27,7 +27,7 @@ MANIFEST = Path(__file__).with_name("models.toml")
 
 # Scalar keys a [[capture]] may inherit from [defaults] (or override).
 INHERITED = (
-    "namespace queue service_account gpu gpu_memory_utilization tp block_size "
+    "namespace queue gpu gpu_memory_utilization tp block_size "
     "max_num_seqs max_model_len enforce_eager engine_cpu_request engine_cpu_limit "
     "engine_memory_request engine_memory_limit model_cache_size"
 ).split()
@@ -110,11 +110,27 @@ def tap_args(c: dict) -> list[str]:
         f"--vllm-version={c['vllm_tag']}",
         f"--max-num-seqs={c['max_num_seqs']}",
         f"--engine-config={canonical_engine_config(c)}",
+        "--record-tokens",
+        "--step-stats-out=/trace/step-stats.jsonl",
     ]
 
 
 def env(pairs: dict) -> list[dict]:
     return [{"name": k, "value": v} for k, v in pairs.items()]
+
+
+def loadgen_env(c: dict) -> list[dict]:
+    pairs = {"PHASES": c["phases"], "MODEL": c["model"]}
+    optional = {
+        "mt_seed": "MT_SEED",
+        "mt_rate": "MT_RATE",
+        "sweep_words": "SWEEP_WORDS",
+        "sweep_conc": "SWEEP_CONC",
+    }
+    for key, env_name in optional.items():
+        if key in c:
+            pairs[env_name] = str(c[key])
+    return env(pairs)
 
 
 def build_job(c: dict, lines: dict) -> dict:
@@ -152,7 +168,6 @@ def build_job(c: dict, lines: dict) -> dict:
                 },
                 "spec": {
                     "restartPolicy": "Never",
-                    "serviceAccountName": c["service_account"],
                     "initContainers": [
                         {
                             "name": "engine",
@@ -191,7 +206,7 @@ def build_job(c: dict, lines: dict) -> dict:
                             "name": "tap",
                             **floating,
                             "image": line["tap_image"],
-                            "command": ["/usr/local/bin/inference-sim-tap"],
+                            "command": ["/usr/local/bin/vllm-vcr", "record"],
                             "args": tap_args(c),
                             "env": env({"RUST_LOG": "info"}),
                             "resources": {
@@ -225,7 +240,7 @@ def build_job(c: dict, lines: dict) -> dict:
                             "name": "loadgen",
                             "image": "python:3.12-slim",
                             "command": ["bash", "/scripts/runner.sh"],
-                            "env": env({"PHASES": c["phases"], "MODEL": c["model"]}),
+                            "env": loadgen_env(c),
                             "resources": {
                                 "requests": {"cpu": "2", "memory": "2Gi"},
                                 "limits": {"cpu": "4", "memory": "4Gi"},

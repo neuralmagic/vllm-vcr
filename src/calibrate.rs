@@ -5,7 +5,7 @@
 //!   2. `KnobLatency` structurally cannot reproduce heavy tails: its `[0.3*mean, 1.7*mean]`
 //!      clamp caps p99/p50 at roughly 1.7 for any knob settings.
 //!
-//! Four entry points, each exposed on the `inference-sim-trace` binary:
+//! Four entry points, each exposed under the `vllm-vcr inspect` subcommand:
 //!   - `gen_demo`: synthesize a heavy-tailed demo trace (lognormal TTFT/ITL).
 //!   - `calibrate`: model-level quantile comparison (source vs replay vs knob-fit).
 //!   - `calibrate_e2e`: wire-level proof using the real simulator in-process.
@@ -590,7 +590,7 @@ pub fn dump_samples(records: &[TraceRecord], num_samples: usize, seed: u64) -> R
     source_ttft.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     source_itl.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    let trace_model = TraceLatency::from_records(TraceMeta::default(), records, zero_knob(), 8192)
+    let trace_model = TraceLatency::from_records(records, zero_knob(), 8192)
         .context("building TraceLatency for replay")?;
     let (_, replay_ttft, replay_itl) =
         sample_model_to_buckets(&trace_model, records, samples_per_record, seed);
@@ -634,7 +634,7 @@ pub fn calibrate(
     let source = quantiles_from_buckets(&source_buckets, &source_pooled_ttft, &source_pooled_itl);
 
     // REPLAY: build TraceLatency with a zero KnobLatency fallback
-    let trace_model = TraceLatency::from_records(TraceMeta::default(), records, zero_knob(), 8192)
+    let trace_model = TraceLatency::from_records(records, zero_knob(), 8192)
         .context("building TraceLatency for replay")?;
 
     let (replay_buckets, replay_pooled_ttft, replay_pooled_itl) =
@@ -1259,7 +1259,6 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use clap::Parser as _;
     use tokio_util::sync::CancellationToken;
     use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
@@ -1308,7 +1307,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         cfg.ipc_tag
     );
     let mut args: Vec<String> = vec![
-        "inference-sim".to_string(),
+        "play".to_string(),
         "--handshake-address".to_string(),
         addr.clone(),
     ];
@@ -1915,8 +1914,7 @@ mod tests {
 
         // Build TraceLatency from original records, but compare against shifted source.
         // The replay (from original records) should NOT match shifted source quantiles.
-        let replay_model =
-            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob(), 8192).unwrap();
+        let replay_model = TraceLatency::from_records(&records, zero_knob(), 8192).unwrap();
 
         // Sample from the replay model using the shifted records' contexts
         let samples_per_record = 200;

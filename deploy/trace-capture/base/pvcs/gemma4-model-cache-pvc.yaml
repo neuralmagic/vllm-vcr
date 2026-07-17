@@ -1,0 +1,13 @@
+# RWX weight cache for gemma-4-26B-A4B-it-FP8-Dynamic (~27 GB).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gemma4-model-cache
+  labels:
+    llm-d.ai/rig: gemma4
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: shared-vast
+  resources:
+    requests:
+      storage: 100Gi

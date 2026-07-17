@@ -12,10 +12,9 @@ ARG NIXL_REF=41685d39
 # frontend, the tap, and the real engine must all come from the same wire (do not mix
 # revs). docker.yml passes this line's source: the wseaton/vllm fork for the 0.21/0.22
 # lines (the serde-defaults backport), else upstream vllm.git at the line's protocol_rev.
-# The default below matches compat.toml's default line (0.23 head); CI always overrides
-# it per line.
+# CI always overrides this; manual builds should pass --build-arg VLLM_REF=<sha from compat.toml>.
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG VLLM_REF=17bc1445562435b608041d434e9738440954159c
+ARG VLLM_REF=ee0da84ab9e04ac7610e28580af62c365e898389
 
 # Which compat.toml line this image speaks. Stamped into build.rs so it emits the right
 # capability cfgs (e.g. vllm_lora_typed) and advertised vllm_version; without it build.rs
@@ -84,19 +83,17 @@ RUN git clone ${VLLM_REPO} /src/vllm \
     && cd rust && cargo build --release --bin vllm-rs \
     && cp target/release/vllm-rs /usr/local/bin/vllm-rs
 
-# 3. Build our mock engine against the real libnixl, plus the engine-core recording tap.
-#    The context's Cargo.toml is already pinned to this line's rev/fork by
-#    ci/pin-vllm-rev.py (so no --locked: the rev no longer matches Cargo.lock).
-COPY . /src/inference-simulator-rs
-# The nixl feature lives on the root package; the tap is its own workspace
-# member, so build them in one invocation (-p selects packages, --features
-# applies to the root package that defines it). VLLM_TARGET_VERSION drives the
-# per-line capability cfgs in build.rs (else it falls back to the compat default).
-RUN cd /src/inference-simulator-rs \
+# 3. Build the unified vllm-vcr binary (record/play/inspect) against the real
+#    libnixl. The context's Cargo.toml is already pinned to this line's rev/fork
+#    by cargo xtask pin-vllm (so no --locked: the rev no longer matches Cargo.lock).
+COPY . /src/vllm-vcr
+# The nixl feature lives on the root package, which owns the single vllm-vcr
+# binary. VLLM_TARGET_VERSION drives the per-line capability cfgs in build.rs
+# (else it falls back to the compat default).
+RUN cd /src/vllm-vcr \
     && VLLM_TARGET_VERSION="${VLLM_TARGET_VERSION}" \
-       cargo build --release -p inference-simulator-rs -p sim-tap --features nixl \
-    && cp target/release/inference-sim /usr/local/bin/inference-sim \
-    && cp target/release/inference-sim-tap /usr/local/bin/inference-sim-tap
+       cargo build --release -p vllm-vcr --features nixl \
+    && cp target/release/vllm-vcr /usr/local/bin/vllm-vcr
 
 # ---------------------------------------------------------------------------------------
 FROM fedora:${FEDORA_VERSION} AS runtime
@@ -106,13 +103,13 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         libstdc++ rdma-core numactl-libs ca-certificates bash \
     && dnf clean all
 
-# Source-built UCX, libnixl + its UCX plugin, and the three binaries.
+# Source-built UCX, libnixl + its UCX plugin, the vLLM frontend, and the unified
+# vllm-vcr binary (record/play/inspect).
 COPY --from=builder /usr/local/ucx/ /usr/local/ucx/
 COPY --from=builder /usr/local/lib64/ /usr/local/lib64/
 COPY --from=builder /usr/local/lib/ /usr/local/lib/
 COPY --from=builder /usr/local/bin/vllm-rs /usr/local/bin/vllm-rs
-COPY --from=builder /usr/local/bin/inference-sim /usr/local/bin/inference-sim
-COPY --from=builder /usr/local/bin/inference-sim-tap /usr/local/bin/inference-sim-tap
+COPY --from=builder /usr/local/bin/vllm-vcr /usr/local/bin/vllm-vcr
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN echo /usr/local/ucx/lib > /etc/ld.so.conf.d/nixl.conf \
     && echo /usr/local/lib64 >> /etc/ld.so.conf.d/nixl.conf \
