@@ -295,6 +295,7 @@ pub fn generate_edge_cases_trace(_seed: u64) -> (TraceMeta, Vec<TraceRecord>) {
 
 /// Generate a trace with prefix sharing (multi-turn conversation).
 /// Uses block hashes to simulate cache hits across turns.
+#[allow(dead_code)]
 pub fn generate_prefix_sharing_trace(
     num_turns: usize,
     block_size: usize,

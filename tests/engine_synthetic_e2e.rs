@@ -79,8 +79,7 @@ async fn test_basic_trace_token_replay() {
     let (client, _guard) = harness("basic_token_replay", &["--replay-tokens", trace_path]).await;
 
     // Replay first 3 records
-    for i in 0..3 {
-        let record = &records[i];
+    for (i, record) in records.iter().enumerate().take(3) {
         let req = make_request(
             &format!("replay-{}", i),
             record.prompt_tokens,
@@ -123,8 +122,7 @@ async fn test_basic_trace_latency_replay() {
     let (client, _guard) = harness("basic_latency_replay", &["--latency-trace", trace_path]).await;
 
     // Just validate that requests complete with the correct token count
-    for i in 0..3 {
-        let record = &records[i];
+    for (i, record) in records.iter().enumerate().take(3) {
         let req = make_request(
             &format!("latency-{}", i),
             record.prompt_tokens,
@@ -159,8 +157,7 @@ async fn test_batch_context_replay() {
     let (client, _guard) = harness("batch_context", &["--replay-tokens", trace_path]).await;
 
     // Validate a few requests complete successfully
-    for i in 0..3 {
-        let record = &records[i];
+    for (i, record) in records.iter().enumerate().take(3) {
         let req = make_request(
             &format!("replay-{}", i),
             record.prompt_tokens,
@@ -295,8 +292,7 @@ async fn test_gzip_compressed_trace() {
     let (client, _guard) = harness("compressed", &["--replay-tokens", trace_path]).await;
 
     // Validate first few records work with compressed trace
-    for i in 0..3 {
-        let record = &records[i];
+    for (i, record) in records.iter().enumerate().take(3) {
         let req = make_request(
             &format!("replay-{}", i),
             record.prompt_tokens,
@@ -327,8 +323,7 @@ async fn test_mixed_concurrency_levels() {
     let (client, _guard) = harness("mixed_concurrency", &["--replay-tokens", trace_path]).await;
 
     // Test a few records with different concurrency levels
-    for i in 0..4 {
-        let record = &records[i];
+    for (i, record) in records.iter().enumerate().take(4) {
         let req = make_request(
             &format!("replay-{}", i),
             record.prompt_tokens,
