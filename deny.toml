@@ -57,7 +57,7 @@ allow = ["MPL-2.0"]
 
 [[licenses.exceptions]]
 name = "webpki-roots"
-allow = ["MPL-2.0"]
+allow = ["CDLA-Permissive-2.0"]
 
 [bans]
 # Duplicate versions are a warning, not a gate (the AWS SDK + git deps pull a
