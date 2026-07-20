@@ -104,7 +104,7 @@ jobs:
           key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
 
       - name: Run synthetic E2E tests
-        run: cargo test --test engine_synthetic_e2e --locked -- --nocapture --test-threads=4
+        run: cargo test --test engine_synthetic_e2e --locked -- --nocapture --test-threads=1
         env:
           RUST_BACKTRACE: "1"
           # Use faster synthetic traces in CI
