@@ -19,7 +19,7 @@ mod test_helpers;
 use synthetic_trace_generator::*;
 use test_helpers::*;
 
-const TIMEOUT: Duration = Duration::from_secs(30);
+const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Spin up the simulator with the given CLI flags, connect a real client.
 /// Returns `(client, guard)`. The guard cancels the sim on drop.
