@@ -236,7 +236,7 @@ pub struct TapConfig {
     pub input_address: String,
     /// Address the tap binds for engine output (PULL socket, upstream).
     pub output_address: String,
-    
+
     /// Token-block size for prompt prefix fingerprints (should match the
     /// engine's prefix-cache block size).
     pub block_size: usize,
