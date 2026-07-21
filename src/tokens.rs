@@ -4,15 +4,24 @@
 //! that paces them. The default `RandomTokens` reproduces the original behavior: uniform
 //! random draws from `0..vocab_size` using the per-request seeded rng. `ReplayTokens`
 //! serves the output ids recorded in a trace (tap `--record-tokens`), making replayed
-//! streams content-identical to the capture.
+//! streams content-identical to the capture. `HFDatasetTokens` loads a HuggingFace dataset
+//! in memory (via `--replay-tokens`) and serves tokenized responses, matching rows by
+//! request id or prompt block-hash prefix per `--replay-match`. Prompts and responses are
+//! tokenized with the HuggingFace model named by `--model-name` / `MODEL` (default
+//! `Qwen/Qwen3-0.6B`) so block-hash prefix matching aligns with the vLLM frontend.
 
 use std::collections::HashMap;
+use std::path::Path;
 
+use anyhow::{Context as _, Result};
+use hf_hub::api::sync::Api;
 use rand::Rng as _;
 use rand::rngs::StdRng;
-use tracing::{debug, warn};
+use tokenizers::Tokenizer;
+use tracing::{debug, info, warn};
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
+use crate::ReplayMatch;
 use crate::trace::TraceRecord;
 
 /// Context passed to `TokenSource::next_tokens` so implementations can condition on
@@ -105,7 +114,7 @@ impl ReplayTokens {
 
     /// The replay-subset index encoded in a request id: everything after the
     /// last `-` parsed as an integer (the whole id when there is no `-`).
-    fn record_index(request_id: &str) -> Option<usize> {
+    pub(crate) fn record_index(request_id: &str) -> Option<usize> {
         let tail = request_id.rsplit_once('-').map_or(request_id, |(_, t)| t);
         tail.parse().ok()
     }
@@ -279,6 +288,303 @@ impl TokenSource for PrefixMatchTokens {
     }
 }
 
+/// One dataset row with tokenized prompt and response.
+struct DatasetRow {
+    #[allow(dead_code)]
+    prompt_token_ids: Vec<u32>,
+    block_hashes: Option<Vec<u64>>,
+    response_tokens: Vec<u32>,
+}
+
+/// Default HuggingFace model id for tokenizing dataset rows when `--model-name` is unset.
+pub(crate) const DEFAULT_DATASET_TOKENIZER: &str = "Qwen/Qwen3-0.6B";
+
+/// Download and load a HuggingFace `tokenizer.json` for `model_id`.
+fn load_hf_tokenizer(model_id: &str) -> Result<Tokenizer> {
+    info!(
+        model = model_id,
+        "loading dataset tokenizer from HuggingFace"
+    );
+    let api = Api::new().map_err(|e| anyhow::anyhow!("initializing HuggingFace API: {e}"))?;
+    let repo = api.model(model_id.to_string());
+    let tokenizer_file = repo
+        .get("tokenizer.json")
+        .map_err(|e| anyhow::anyhow!("downloading tokenizer for {model_id}: {e}"))?;
+    info!(
+        model = model_id,
+        tokenizer_cache = %tokenizer_file.display(),
+        "dataset tokenizer cached"
+    );
+    Tokenizer::from_file(tokenizer_file)
+        .map_err(|e| anyhow::anyhow!("loading tokenizer for {model_id}: {e}"))
+}
+
+/// Serves tokens from a HuggingFace dataset loaded in memory at init.
+///
+/// Prompt and response text are tokenized with the HuggingFace model named by
+/// `tokenizer_model`. Requests resolve to rows via [`ReplayMatch`]: by trailing
+/// request-id index (`index`) or by longest block-hash prefix of the incoming prompt
+/// (`prefix`).
+pub(crate) struct HFDatasetTokens {
+    rows: Vec<DatasetRow>,
+    assignments: HashMap<String, usize>,
+    positions: HashMap<String, usize>,
+    by_hash: HashMap<u64, Vec<usize>>,
+    consumed: Vec<bool>,
+    replay_match: ReplayMatch,
+    block_size: usize,
+    fallback: RandomTokens,
+}
+
+impl HFDatasetTokens {
+    /// Load a dataset file and tokenize prompts and responses with `tokenizer_model`.
+    pub(crate) fn from_file(
+        dataset_path: &Path,
+        block_size: usize,
+        replay_match: ReplayMatch,
+        tokenizer_model: &str,
+    ) -> Result<Self> {
+        info!(
+            dataset = %dataset_path.display(),
+            replay_match = ?replay_match,
+            tokenizer_model,
+            "loading HuggingFace dataset for replay"
+        );
+
+        let tokenizer = load_hf_tokenizer(tokenizer_model)?;
+        let vocab_size = tokenizer.get_vocab_size(true) as u32;
+
+        let json_rows = sim_trace::dataset_convert::parse_dataset(dataset_path)
+            .with_context(|| format!("parsing dataset {}", dataset_path.display()))?;
+
+        if json_rows.is_empty() {
+            anyhow::bail!("dataset {} contains no rows", dataset_path.display());
+        }
+
+        let mut rows = Vec::with_capacity(json_rows.len());
+        for (idx, row) in json_rows.iter().enumerate() {
+            let prompt_text = sim_trace::dataset_convert::extract_prompt(row)
+                .with_context(|| format!("extracting prompt from row {idx}"))?;
+            let response_text = sim_trace::dataset_convert::extract_response(row)
+                .with_context(|| format!("extracting response from row {idx}"))?;
+
+            let prompt_encoding = tokenizer
+                .encode(prompt_text.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("tokenizing prompt for row {idx}: {e}"))?;
+            let prompt_token_ids: Vec<u32> = prompt_encoding.get_ids().to_vec();
+
+            let response_encoding = tokenizer
+                .encode(response_text.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("tokenizing response for row {idx}: {e}"))?;
+            let response_tokens: Vec<u32> = response_encoding.get_ids().to_vec();
+
+            if response_tokens.is_empty() {
+                warn!(
+                    row = idx,
+                    "row has empty response after tokenization, skipping"
+                );
+                continue;
+            }
+
+            let block_hashes = crate::trace::prompt_block_hashes(&prompt_token_ids, block_size);
+
+            rows.push(DatasetRow {
+                prompt_token_ids,
+                block_hashes,
+                response_tokens,
+            });
+        }
+
+        if rows.is_empty() {
+            anyhow::bail!(
+                "dataset {} has no rows with tokenizable responses",
+                dataset_path.display()
+            );
+        }
+
+        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+        if replay_match == ReplayMatch::Prefix {
+            for (i, row) in rows.iter().enumerate() {
+                for &hash in row.block_hashes.iter().flatten() {
+                    by_hash.entry(hash).or_default().push(i);
+                }
+            }
+            if by_hash.is_empty() {
+                anyhow::bail!(
+                    "dataset {} has no rows with a full prompt block (block_size={}); \
+                     prefix matching requires at least one block of prompt tokens per row",
+                    dataset_path.display(),
+                    block_size,
+                );
+            }
+        }
+
+        info!(
+            rows = rows.len(),
+            tokenizer_model, vocab_size, "loaded dataset with tokenized prompts and responses"
+        );
+
+        let row_count = rows.len();
+        Ok(HFDatasetTokens {
+            rows,
+            assignments: HashMap::new(),
+            positions: HashMap::new(),
+            by_hash,
+            consumed: vec![false; row_count],
+            replay_match,
+            block_size,
+            fallback: RandomTokens { vocab_size },
+        })
+    }
+
+    fn row(&self, request_id: &str) -> Option<&DatasetRow> {
+        self.assignments
+            .get(request_id)
+            .and_then(|&idx| self.rows.get(idx))
+    }
+
+    fn assign_index(&mut self, request_id: &str, row_idx: usize) -> Option<usize> {
+        self.assignments.insert(request_id.to_string(), row_idx);
+        self.positions.insert(request_id.to_string(), 0);
+        debug!(
+            request_id,
+            dataset_row = row_idx,
+            tokens = self.rows[row_idx].response_tokens.len(),
+            "assigned request to dataset row by index"
+        );
+        Some(self.rows[row_idx].response_tokens.len())
+    }
+
+    fn match_prefix(&mut self, request_id: &str, prompt_token_ids: &[u32]) -> Option<usize> {
+        info!(
+            request_id,
+            prompt_len = prompt_token_ids.len(),
+            block_size = self.block_size,
+            "match_prefix called"
+        );
+        let chain = crate::trace::prompt_block_hashes(prompt_token_ids, self.block_size)?;
+        info!(
+            request_id,
+            prompt_blocks = chain.len(),
+            hashes = ?chain,
+            "computed prompt hash chain"
+        );
+        for (depth, hash) in chain.iter().enumerate().rev() {
+            let Some(candidates) = self.by_hash.get(hash) else {
+                continue;
+            };
+            let idx = candidates
+                .iter()
+                .copied()
+                .find(|&i| !self.consumed[i])
+                .or_else(|| candidates.first().copied())?;
+            self.consumed[idx] = true;
+            self.assignments.insert(request_id.to_string(), idx);
+            self.positions.insert(request_id.to_string(), 0);
+            info!(
+                request_id,
+                dataset_row = idx,
+                matched_blocks = depth + 1,
+                prompt_blocks = chain.len(),
+                "prefix-matched request to dataset row"
+            );
+            return Some(self.rows[idx].response_tokens.len());
+        }
+        warn!(
+            request_id,
+            prompt_blocks = chain.len(),
+            "no dataset row shares a prompt prefix; serving random tokens"
+        );
+        None
+    }
+
+    #[cfg(test)]
+    fn from_rows_for_test(
+        rows: Vec<DatasetRow>,
+        block_size: usize,
+        vocab_size: u32,
+        replay_match: ReplayMatch,
+    ) -> Self {
+        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+        if replay_match == ReplayMatch::Prefix {
+            for (i, row) in rows.iter().enumerate() {
+                for &hash in row.block_hashes.iter().flatten() {
+                    by_hash.entry(hash).or_default().push(i);
+                }
+            }
+        }
+        let consumed_len = rows.len();
+        HFDatasetTokens {
+            rows,
+            assignments: HashMap::new(),
+            positions: HashMap::new(),
+            by_hash,
+            consumed: vec![false; consumed_len],
+            replay_match,
+            block_size,
+            fallback: RandomTokens { vocab_size },
+        }
+    }
+}
+
+impl TokenSource for HFDatasetTokens {
+    fn on_request_added(&mut self, request_id: &str, prompt_token_ids: &[u32]) -> Option<usize> {
+        match self.replay_match {
+            ReplayMatch::Index => {
+                let row_idx = ReplayTokens::record_index(request_id)?;
+                if row_idx >= self.rows.len() {
+                    return None;
+                }
+                self.assign_index(request_id, row_idx)
+            }
+            ReplayMatch::Prefix => self.match_prefix(request_id, prompt_token_ids),
+        }
+    }
+
+    fn next_tokens(&mut self, ctx: &TokenCtx<'_>, n: usize, rng: &mut StdRng) -> Vec<u32> {
+        let row = match self.row(ctx.request_id) {
+            Some(r) => r,
+            None => {
+                return self.fallback.next_tokens(ctx, n, rng);
+            }
+        };
+
+        let pos = self.positions.get(ctx.request_id).copied().unwrap_or(0);
+        let available = &row.response_tokens[pos.min(row.response_tokens.len())..];
+        let count = n.min(available.len());
+
+        let mut tokens = available[..count].to_vec();
+
+        // Update position
+        if let Some(p) = self.positions.get_mut(ctx.request_id) {
+            *p += count;
+        }
+
+        // Pad with fallback if we've exhausted the dataset row
+        if tokens.len() < n {
+            tokens.extend(self.fallback.next_tokens(ctx, n - tokens.len(), rng));
+        }
+
+        tokens
+    }
+
+    fn on_request_finished(&mut self, request_id: &str) {
+        self.assignments.remove(request_id);
+        self.positions.remove(request_id);
+    }
+
+    fn finish_reason(&self, request_id: &str) -> Option<EngineCoreFinishReason> {
+        let row = self.row(request_id)?;
+        let pos = self.positions.get(request_id).copied().unwrap_or(0);
+
+        if pos >= row.response_tokens.len() {
+            Some(EngineCoreFinishReason::Stop)
+        } else {
+            None
+        }
+    }
+}
+
 /// Replays the request's prompt tokens as output, cycling from the start when
 /// `max_tokens` exceeds the prompt length. Draws nothing from the rng.
 #[cfg(test)]
@@ -304,7 +610,7 @@ impl TokenSource for EchoTokens {
 mod tests {
     use rand::SeedableRng as _;
 
-    use crate::tokens::{RandomTokens, TokenCtx, TokenSource};
+    use super::{DatasetRow, HFDatasetTokens, RandomTokens, TokenCtx, TokenSource};
 
     #[test]
     fn random_tokens_draws_correct_count() {
@@ -620,5 +926,72 @@ mod tests {
         };
         let tokens = src.next_tokens(&ctx, 3, &mut rng);
         assert_eq!(tokens, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn hf_dataset_rows_carry_prompt_block_hashes() {
+        use crate::trace::prompt_block_hashes;
+        let prompt: Vec<u32> = (0..8).collect();
+        let row = DatasetRow {
+            prompt_token_ids: prompt.clone(),
+            block_hashes: prompt_block_hashes(&prompt, 4),
+            response_tokens: vec![1, 2, 3],
+        };
+        assert_eq!(row.prompt_token_ids.len(), 8);
+        assert_eq!(row.block_hashes.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn hf_dataset_index_match_serves_row_by_request_id() {
+        use crate::ReplayMatch;
+        let prompt0: Vec<u32> = (0..8).collect();
+        let prompt1: Vec<u32> = (100..108).collect();
+        let rows = vec![
+            DatasetRow {
+                prompt_token_ids: prompt0.clone(),
+                block_hashes: crate::trace::prompt_block_hashes(&prompt0, 4),
+                response_tokens: vec![10, 11, 12],
+            },
+            DatasetRow {
+                prompt_token_ids: prompt1.clone(),
+                block_hashes: crate::trace::prompt_block_hashes(&prompt1, 4),
+                response_tokens: vec![20, 21],
+            },
+        ];
+        let mut src = HFDatasetTokens::from_rows_for_test(rows, 4, 50, ReplayMatch::Index);
+        assert_eq!(src.on_request_added("replay-0", &prompt0), Some(3));
+        assert_eq!(drain(&mut src, "replay-0", &prompt0, 3), vec![10, 11, 12]);
+        assert_eq!(src.on_request_added("replay-1", &prompt1), Some(2));
+        assert_eq!(drain(&mut src, "replay-1", &prompt1, 2), vec![20, 21]);
+    }
+
+    #[test]
+    fn hf_dataset_prefix_match_serves_matching_row() {
+        use crate::ReplayMatch;
+        let prompt: Vec<u32> = (0..8).collect();
+        let rows = vec![DatasetRow {
+            prompt_token_ids: prompt.clone(),
+            block_hashes: crate::trace::prompt_block_hashes(&prompt, 4),
+            response_tokens: vec![42, 43],
+        }];
+        let mut src = HFDatasetTokens::from_rows_for_test(rows, 4, 50, ReplayMatch::Prefix);
+        assert_eq!(src.on_request_added("live", &prompt), Some(2));
+        assert_eq!(drain(&mut src, "live", &prompt, 2), vec![42, 43]);
+    }
+
+    #[test]
+    fn hf_dataset_index_unmatched_falls_back_to_random() {
+        use crate::ReplayMatch;
+        let prompt: Vec<u32> = (0..8).collect();
+        let rows = vec![DatasetRow {
+            prompt_token_ids: prompt.clone(),
+            block_hashes: crate::trace::prompt_block_hashes(&prompt, 4),
+            response_tokens: vec![1, 2],
+        }];
+        let mut src = HFDatasetTokens::from_rows_for_test(rows, 4, 50, ReplayMatch::Index);
+        assert_eq!(src.on_request_added("replay-99", &prompt), None);
+        let tokens = drain(&mut src, "replay-99", &prompt, 3);
+        assert_eq!(tokens.len(), 3);
+        assert!(tokens.iter().all(|&t| t < 50));
     }
 }

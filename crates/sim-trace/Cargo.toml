@@ -10,7 +10,10 @@ description = "JSONL trace schema, latency models, and guidellm conversion for t
 
 [dependencies]
 anyhow = { workspace = true }
+arrow = { workspace = true }
+csv = { workspace = true }
 flate2 = { workspace = true }
+parquet = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

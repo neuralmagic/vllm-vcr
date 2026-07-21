@@ -155,6 +155,12 @@ pub struct TraceRecord {
     /// `--record-tokens` (it carries no content).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<TraceFinishReason>,
+    /// Per-input multimodal processor hashes from the request's
+    /// `mm_features`, recording which image/audio/video was at each
+    /// placeholder position. Two requests with identical `block_hashes`
+    /// but different `mm_hashes` had different multimodal inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_hashes: Option<Vec<String>>,
 }
 
 fn default_concurrency() -> u64 {
@@ -179,6 +185,7 @@ impl Default for TraceRecord {
             block_hashes: None,
             output_token_ids: None,
             finish_reason: None,
+            mm_hashes: None,
         }
     }
 }
@@ -894,6 +901,42 @@ mod tests {
 
         let (_, records) = read_trace(io::BufReader::new(text.as_bytes())).unwrap();
         assert_eq!(records[0], record);
+    }
+
+    #[test]
+    fn mm_hashes_round_trip() {
+        let record = TraceRecord {
+            prompt_tokens: 259,
+            output_tokens: 3,
+            ttft_ms: 12.0,
+            itl_ms: Some(vec![5.0, 6.0]),
+            mm_hashes: Some(vec!["processor-hash".to_string()]),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        append_record(&mut buf, &record).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains(r#""mm_hashes":["processor-hash"]"#), "{text}");
+
+        let (_, records) = read_trace(io::BufReader::new(text.as_bytes())).unwrap();
+        assert_eq!(records[0], record);
+    }
+
+    #[test]
+    fn mm_hashes_absent_omitted_from_wire() {
+        let mut buf = Vec::new();
+        append_record(
+            &mut buf,
+            &TraceRecord {
+                prompt_tokens: 10,
+                output_tokens: 1,
+                ttft_ms: 5.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(!text.contains("mm_hashes"), "{text}");
     }
 
     #[test]
