@@ -58,6 +58,7 @@ fn diffusion_record() -> TraceRecord {
         block_hashes: prompt_block_hashes(&prompt, BLOCK_SIZE),
         output_token_ids: Some(output_token_ids),
         finish_reason: Some(TraceFinishReason::Stop),
+        mm_hashes: None,
     }
 }
 

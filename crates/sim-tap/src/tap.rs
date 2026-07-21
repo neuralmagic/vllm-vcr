@@ -76,6 +76,8 @@ struct RequestState {
     /// Chained per-block prefix fingerprints of the prompt (see
     /// `trace::prompt_block_hashes`).
     block_hashes: Option<Vec<u64>>,
+    /// Per-input multimodal processor hashes (`mm_features[*].mm_hash`).
+    mm_hashes: Option<Vec<String>>,
     /// `do_remote_prefill` request (P/D decode side): its first output reflects a
     /// KV pull, not local prefill compute, so it never counts as interference.
     remote_prefill: bool,
@@ -103,6 +105,10 @@ impl RequestState {
         let remote_prefill = extract_kv_params(req)
             .map(|kv| kv_flag(&kv, "do_remote_prefill"))
             .unwrap_or(false);
+        let mm_hashes = req.mm_features.as_ref().and_then(|features| {
+            let hashes: Vec<String> = features.iter().filter_map(|f| f.mm_hash.clone()).collect();
+            if hashes.is_empty() { None } else { Some(hashes) }
+        });
         Self {
             arrival,
             prompt_tokens: req.prompt_token_ids.as_ref().map(Vec::len).unwrap_or(0),
@@ -110,6 +116,7 @@ impl RequestState {
                 .prompt_token_ids
                 .as_deref()
                 .and_then(|tokens| sim_trace::trace::prompt_block_hashes(tokens, block_size)),
+            mm_hashes,
             remote_prefill,
             last_output: None,
             output_tokens: 0,
@@ -205,6 +212,7 @@ impl RequestState {
             output_token_ids: (record_tokens == TokenRecording::On)
                 .then_some(self.output_token_ids),
             finish_reason: Some(trace_finish_reason(finish_reason)),
+            mm_hashes: self.mm_hashes,
         }
     }
 }
@@ -980,6 +988,7 @@ mod tests {
             arrival,
             prompt_tokens: 10,
             block_hashes: None,
+            mm_hashes: None,
             remote_prefill: false,
             last_output: None,
             output_tokens: 0,
@@ -1061,5 +1070,10 @@ mod tests {
         let state = requests.get("req-mm-large").expect("request_id tracked");
         // 2 text + 256 image placeholders + 1 text (matches the groundtruth test).
         assert_eq!(state.prompt_tokens, 259);
+        assert_eq!(
+            state.mm_hashes.as_deref(),
+            Some(&["processor-hash".to_string()][..]),
+            "mm_hash from mm_features must be captured"
+        );
     }
 }
