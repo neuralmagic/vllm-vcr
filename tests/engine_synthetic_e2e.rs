@@ -31,16 +31,16 @@ async fn harness(test_name: &str, extra_flags: &[&str]) -> (EngineCoreClient, Si
 
     let opt = Opt::parse_from(&args);
     let token = CancellationToken::new();
-    let guard = SimGuard {
-        token: token.clone(),
-    };
 
-    // Spawn the simulator task.
+    // Spawn the simulator task, keeping the handle to detect early exits.
     let sim_opt = opt.clone();
     let sim_token = token.clone();
-    tokio::spawn(async move {
-        let _ = run(sim_opt, sim_token).await;
-    });
+    let sim_handle = tokio::spawn(async move { run(sim_opt, sim_token).await });
+
+    let mut guard = SimGuard {
+        token: token.clone(),
+        sim_handle: Some(sim_handle),
+    };
 
     // Connect the real client.
     let config = EngineCoreClientConfig::new_single(&addr);
@@ -48,6 +48,9 @@ async fn harness(test_name: &str, extra_flags: &[&str]) -> (EngineCoreClient, Si
         .await
         .expect("client connect timed out")
         .expect("client connect failed");
+
+    // Fail fast if the simulator already exited (e.g. bad trace file).
+    guard.assert_sim_running();
 
     (client, guard)
 }

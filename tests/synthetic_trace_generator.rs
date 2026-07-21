@@ -16,15 +16,36 @@ fn is_fast_mode() -> bool {
     std::env::var("SYNTHETIC_E2E_FAST_MODE").is_ok()
 }
 
+/// Enrich records with `arrival_ms` and `output_token_ids` so they work with
+/// `--replay-tokens`. The replay path filters out records missing these fields.
+fn make_replayable(records: &mut [TraceRecord], seed: u64) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut arrival = 0.0_f64;
+    for r in records.iter_mut() {
+        if r.arrival_ms.is_none() {
+            r.arrival_ms = Some(arrival);
+            arrival += rng.random_range(50.0..500.0);
+        }
+        if r.output_token_ids.is_none() {
+            r.output_token_ids = Some(
+                (0..r.output_tokens)
+                    .map(|_| rng.random_range(100..50000_u32))
+                    .collect(),
+            );
+        }
+    }
+}
+
 /// Generate a basic synthetic trace with varying prompt/output lengths.
 /// Uses realistic lognormal distributions for timing (via calibrate::gen_demo).
 pub fn generate_basic_trace(num_records: usize, seed: u64) -> (TraceMeta, Vec<TraceRecord>) {
-    // Use the existing gen_demo functions which already have lognormal distributions
-    if is_fast_mode() {
+    let (meta, mut records) = if is_fast_mode() {
         vllm_vcr::calibrate::gen_demo_fast(num_records, seed)
     } else {
         vllm_vcr::calibrate::gen_demo(num_records, seed)
-    }
+    };
+    make_replayable(&mut records, seed.wrapping_add(1));
+    (meta, records)
 }
 
 /// Generate a trace with batch context (itl_ctx) data.
@@ -86,6 +107,7 @@ pub fn generate_batch_context_trace(
         });
     }
 
+    make_replayable(&mut records, seed.wrapping_add(1));
     (meta, records)
 }
 
@@ -141,6 +163,7 @@ pub fn generate_speculative_trace(num_records: usize, seed: u64) -> (TraceMeta, 
         });
     }
 
+    make_replayable(&mut records, seed.wrapping_add(1));
     (meta, records)
 }
 
@@ -189,11 +212,12 @@ pub fn generate_diffusion_trace(num_records: usize, seed: u64) -> (TraceMeta, Ve
         });
     }
 
+    make_replayable(&mut records, seed.wrapping_add(1));
     (meta, records)
 }
 
 /// Generate a trace with various edge cases.
-pub fn generate_edge_cases_trace(_seed: u64) -> (TraceMeta, Vec<TraceRecord>) {
+pub fn generate_edge_cases_trace(seed: u64) -> (TraceMeta, Vec<TraceRecord>) {
     let meta = TraceMeta {
         model: Some("synthetic-edge-cases".to_string()),
         source: Some("synthetic-e2e".to_string()),
@@ -290,6 +314,7 @@ pub fn generate_edge_cases_trace(_seed: u64) -> (TraceMeta, Vec<TraceRecord>) {
         ..Default::default()
     });
 
+    make_replayable(&mut records, seed.wrapping_add(1));
     (meta, records)
 }
 
@@ -460,5 +485,6 @@ pub fn generate_mixed_concurrency_trace(
         });
     }
 
+    make_replayable(&mut records, seed.wrapping_add(1));
     (meta, records)
 }
