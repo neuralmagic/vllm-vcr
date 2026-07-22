@@ -144,6 +144,12 @@ pub struct TraceRecord {
     /// overlap (and thus prefix-cache behavior) matches the capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_hashes: Option<Vec<u64>>,
+    /// Per-multimodal-input content hashes from `MmFeatureSpec::mm_hash`,
+    /// preserving the order of the request's `mm_features` vec. Two requests
+    /// sharing a token prefix but carrying different images will have
+    /// identical `block_hashes` but distinct `mm_hashes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_hashes: Option<Vec<String>>,
     /// The request's actual output token ids, recorded only when the capture
     /// opts in (tap `--record-tokens`). Length must equal `output_tokens`.
     /// CAUTION: with the same tokenizer these decode back to the generated
@@ -177,6 +183,7 @@ impl Default for TraceRecord {
             arrival_ms: None,
             itl_ctx: None,
             block_hashes: None,
+            mm_hashes: None,
             output_token_ids: None,
             finish_reason: None,
         }
@@ -912,6 +919,32 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(!text.contains("output_token_ids"), "{text}");
         assert!(!text.contains("finish_reason"), "{text}");
+        assert!(!text.contains("mm_hashes"), "{text}");
+    }
+
+    #[test]
+    fn mm_hashes_round_trip() {
+        let record = TraceRecord {
+            prompt_tokens: 10,
+            output_tokens: 1,
+            ttft_ms: 5.0,
+            mm_hashes: Some(vec!["hash_a".into(), "hash_b".into()]),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        append_record(&mut buf, &record).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains(r#""mm_hashes":["hash_a","hash_b"]"#), "{text}");
+
+        let (_, records) = read_trace(io::BufReader::new(text.as_bytes())).unwrap();
+        assert_eq!(records[0], record);
+    }
+
+    #[test]
+    fn legacy_record_without_mm_hashes_deserializes() {
+        let input = br#"{"prompt_tokens":10,"output_tokens":1,"ttft_ms":5.0}"#;
+        let (_, records) = read_trace(io::BufReader::new(input.as_slice())).unwrap();
+        assert_eq!(records[0].mm_hashes, None);
     }
 
     #[test]

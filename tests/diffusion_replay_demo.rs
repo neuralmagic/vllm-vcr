@@ -56,6 +56,7 @@ fn diffusion_record() -> TraceRecord {
         arrival_ms: Some(0.0),
         itl_ctx: None,
         block_hashes: prompt_block_hashes(&prompt, BLOCK_SIZE),
+        mm_hashes: None,
         output_token_ids: Some(output_token_ids),
         finish_reason: Some(TraceFinishReason::Stop),
     }
