@@ -934,7 +934,10 @@ mod tests {
         let mut buf = Vec::new();
         append_record(&mut buf, &record).unwrap();
         let text = String::from_utf8(buf).unwrap();
-        assert!(text.contains(r#""mm_hashes":["hash_a","hash_b"]"#), "{text}");
+        assert!(
+            text.contains(r#""mm_hashes":["hash_a","hash_b"]"#),
+            "{text}"
+        );
 
         let (_, records) = read_trace(io::BufReader::new(text.as_bytes())).unwrap();
         assert_eq!(records[0], record);

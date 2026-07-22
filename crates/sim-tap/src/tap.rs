@@ -113,11 +113,13 @@ impl RequestState {
                 .as_deref()
                 .and_then(|tokens| sim_trace::trace::prompt_block_hashes(tokens, block_size)),
             mm_hashes: req.mm_features.as_deref().and_then(|features| {
-                let hashes: Vec<String> = features
-                    .iter()
-                    .filter_map(|f| f.mm_hash.clone())
-                    .collect();
-                if hashes.is_empty() { None } else { Some(hashes) }
+                let hashes: Vec<String> =
+                    features.iter().filter_map(|f| f.mm_hash.clone()).collect();
+                if hashes.is_empty() {
+                    None
+                } else {
+                    Some(hashes)
+                }
             }),
             remote_prefill,
             last_output: None,
