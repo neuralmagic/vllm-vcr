@@ -288,10 +288,8 @@ impl TokenSource for PrefixMatchTokens {
     }
 }
 
-/// One dataset row with tokenized prompt and response.
+/// One dataset row: the tokenized prompt's block-hash chain and tokenized response.
 struct DatasetRow {
-    #[allow(dead_code)]
-    prompt_token_ids: Vec<u32>,
     block_hashes: Option<Vec<u64>>,
     response_tokens: Vec<u32>,
 }
@@ -299,22 +297,35 @@ struct DatasetRow {
 /// Default HuggingFace model id for tokenizing dataset rows when `--model-name` is unset.
 pub(crate) const DEFAULT_DATASET_TOKENIZER: &str = "Qwen/Qwen3-0.6B";
 
-/// Download and load a HuggingFace `tokenizer.json` for `model_id`.
+/// Load a HuggingFace `tokenizer.json` for `model_id`: a local `tokenizer.json`
+/// path or a directory holding one is used as-is (keeps the sim hermetic);
+/// anything else is treated as a Hub model id and downloaded.
 fn load_hf_tokenizer(model_id: &str) -> Result<Tokenizer> {
-    info!(
-        model = model_id,
-        "loading dataset tokenizer from HuggingFace"
-    );
-    let api = Api::new().map_err(|e| anyhow::anyhow!("initializing HuggingFace API: {e}"))?;
-    let repo = api.model(model_id.to_string());
-    let tokenizer_file = repo
-        .get("tokenizer.json")
-        .map_err(|e| anyhow::anyhow!("downloading tokenizer for {model_id}: {e}"))?;
-    info!(
-        model = model_id,
-        tokenizer_cache = %tokenizer_file.display(),
-        "dataset tokenizer cached"
-    );
+    let as_path = Path::new(model_id);
+    let local = if as_path.is_dir() {
+        Some(as_path.join("tokenizer.json"))
+    } else if as_path.is_file() {
+        Some(as_path.to_path_buf())
+    } else {
+        None
+    };
+    let tokenizer_file = match local {
+        Some(path) => {
+            info!(tokenizer = %path.display(), "loading dataset tokenizer from disk");
+            path
+        }
+        None => {
+            info!(
+                model = model_id,
+                "loading dataset tokenizer from HuggingFace"
+            );
+            let api =
+                Api::new().map_err(|e| anyhow::anyhow!("initializing HuggingFace API: {e}"))?;
+            let repo = api.model(model_id.to_string());
+            repo.get("tokenizer.json")
+                .map_err(|e| anyhow::anyhow!("downloading tokenizer for {model_id}: {e}"))?
+        }
+    };
     Tokenizer::from_file(tokenizer_file)
         .map_err(|e| anyhow::anyhow!("loading tokenizer for {model_id}: {e}"))
 }
@@ -389,7 +400,6 @@ impl HFDatasetTokens {
             let block_hashes = crate::trace::prompt_block_hashes(&prompt_token_ids, block_size);
 
             rows.push(DatasetRow {
-                prompt_token_ids,
                 block_hashes,
                 response_tokens,
             });
@@ -456,19 +466,7 @@ impl HFDatasetTokens {
     }
 
     fn match_prefix(&mut self, request_id: &str, prompt_token_ids: &[u32]) -> Option<usize> {
-        info!(
-            request_id,
-            prompt_len = prompt_token_ids.len(),
-            block_size = self.block_size,
-            "match_prefix called"
-        );
         let chain = crate::trace::prompt_block_hashes(prompt_token_ids, self.block_size)?;
-        info!(
-            request_id,
-            prompt_blocks = chain.len(),
-            hashes = ?chain,
-            "computed prompt hash chain"
-        );
         for (depth, hash) in chain.iter().enumerate().rev() {
             let Some(candidates) = self.by_hash.get(hash) else {
                 continue;
@@ -481,7 +479,7 @@ impl HFDatasetTokens {
             self.consumed[idx] = true;
             self.assignments.insert(request_id.to_string(), idx);
             self.positions.insert(request_id.to_string(), 0);
-            info!(
+            debug!(
                 request_id,
                 dataset_row = idx,
                 matched_blocks = depth + 1,
@@ -933,11 +931,9 @@ mod tests {
         use crate::trace::prompt_block_hashes;
         let prompt: Vec<u32> = (0..8).collect();
         let row = DatasetRow {
-            prompt_token_ids: prompt.clone(),
             block_hashes: prompt_block_hashes(&prompt, 4),
             response_tokens: vec![1, 2, 3],
         };
-        assert_eq!(row.prompt_token_ids.len(), 8);
         assert_eq!(row.block_hashes.as_ref().unwrap().len(), 2);
     }
 
@@ -948,12 +944,10 @@ mod tests {
         let prompt1: Vec<u32> = (100..108).collect();
         let rows = vec![
             DatasetRow {
-                prompt_token_ids: prompt0.clone(),
                 block_hashes: crate::trace::prompt_block_hashes(&prompt0, 4),
                 response_tokens: vec![10, 11, 12],
             },
             DatasetRow {
-                prompt_token_ids: prompt1.clone(),
                 block_hashes: crate::trace::prompt_block_hashes(&prompt1, 4),
                 response_tokens: vec![20, 21],
             },
@@ -970,7 +964,6 @@ mod tests {
         use crate::ReplayMatch;
         let prompt: Vec<u32> = (0..8).collect();
         let rows = vec![DatasetRow {
-            prompt_token_ids: prompt.clone(),
             block_hashes: crate::trace::prompt_block_hashes(&prompt, 4),
             response_tokens: vec![42, 43],
         }];
@@ -984,7 +977,6 @@ mod tests {
         use crate::ReplayMatch;
         let prompt: Vec<u32> = (0..8).collect();
         let rows = vec![DatasetRow {
-            prompt_token_ids: prompt.clone(),
             block_hashes: crate::trace::prompt_block_hashes(&prompt, 4),
             response_tokens: vec![1, 2],
         }];

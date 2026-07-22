@@ -1656,7 +1656,12 @@ impl SimEngine {
             side_channel_port: opt.side_channel_port + engine_index,
         };
         let latency: Box<dyn LatencyModel> = opt.build_latency()?;
-        let token_source: Box<dyn TokenSource> = opt.build_token_source()?;
+        let token_source: Box<dyn TokenSource> = {
+            let opt = opt.clone();
+            tokio::task::spawn_blocking(move || opt.build_token_source())
+                .await
+                .map_err(|e| anyhow::anyhow!("token source build task panicked: {e}"))??
+        };
         let step_source: Option<Box<dyn StepSource>> = opt.build_step_source()?;
         // Verbatim replay carries its own burst budget; otherwise the modeled
         // latency model reports K. Either source emits spec_decoding_stats.

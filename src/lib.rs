@@ -460,6 +460,13 @@ impl Opt {
 
         let path = local_input(uri, "--replay-tokens")?;
         if sim_trace::dataset_convert::is_dataset_file(path)? {
+            if self.replay_match == ReplayMatch::Prefix && self.model_name.is_empty() {
+                bail!(
+                    "--replay-tokens with a dataset and --replay-match prefix requires \
+                     --model-name (or MODEL) so dataset rows are tokenized with the same \
+                     vocabulary as incoming prompts"
+                );
+            }
             return Ok(Box::new(tokens::HFDatasetTokens::from_file(
                 path,
                 self.tokens_per_block,
