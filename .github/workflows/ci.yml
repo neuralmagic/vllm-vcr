@@ -52,6 +52,7 @@ jobs:
           components: rustfmt, clippy
 
       - uses: ./.github/actions/setup-sccache
+        if: ${{ vars.SCCACHE_ROLE_ARN != '' }}
         with:
           role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
           bucket: ${{ vars.SCCACHE_BUCKET }}
@@ -78,6 +79,36 @@ jobs:
       # The nixl features live on the root package, so this stays root-scoped.
       - name: Check (nixl-stub)
         run: cargo check --all-targets --locked --features nixl-stub
+
+  # Synthetic E2E engine tests - validates engine behavior against programmatically
+  # generated traces covering all schema variants and edge cases. Fast (no real GPU
+  # captures), deterministic (seeded RNG), parallel-safe (unique IPC per test).
+  synthetic-e2e:
+    runs-on: ubuntu-latest
+    needs: build-and-test  # Run after main build passes
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      - uses: ./.github/actions/setup-sccache
+        if: ${{ vars.SCCACHE_ROLE_ARN != '' }}
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
+
+      - name: Run synthetic E2E tests
+        run: cargo test --test engine_synthetic_e2e --locked -- --nocapture --test-threads=4
+        env:
+          RUST_BACKTRACE: "1"
+          # Use faster synthetic traces in CI
+          SYNTHETIC_E2E_FAST_MODE: "1"
 
   # Supply-chain gate: RUSTSEC advisories, license compatibility, and source
   # allowlisting over the whole dependency graph (config in deny.toml). The
@@ -165,6 +196,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
 
       - uses: ./.github/actions/setup-sccache
+        if: ${{ vars.SCCACHE_ROLE_ARN != '' }}
         with:
           role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
           bucket: ${{ vars.SCCACHE_BUCKET }}

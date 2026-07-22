@@ -51,6 +51,14 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+[[licenses.exceptions]]
+name = "option-ext"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 # Duplicate versions are a warning, not a gate (the AWS SDK + git deps pull a
 # wide graph; surfacing dupes without blocking).

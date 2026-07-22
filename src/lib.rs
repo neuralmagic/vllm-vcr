@@ -121,13 +121,19 @@ pub struct Opt {
     #[arg(long, default_value_t = 32_000)]
     pub vocab_size: u32,
 
-    /// Path or `s3://bucket/key` URI to a JSONL trace whose recorded output
-    /// token ids (tap `--record-tokens`) are served verbatim instead of random tokens, making
-    /// replayed streams content-identical to the capture. A request resolves
-    /// to its record through the trailing `-<index>` of its request id, where
-    /// the index is the record's position in the arrival-ordered subset (the
-    /// arrival-replay harness names them `replay-{i}`). Unmatched requests
+    /// Path or `s3://bucket/key`/`hf://org/repo/file` URI to a JSONL trace whose
+    /// recorded output token ids (tap `--record-tokens`) are served verbatim instead
+    /// of random tokens, making replayed streams content-identical to the capture.
+    /// A request resolves to its record through the trailing `-<index>` of its request
+    /// id (the arrival-replay harness names them `replay-{i}`) or, with
+    /// `--replay-match prefix`, by longest block-hash prefix match. Unmatched requests
     /// fall back to random tokens.
+    ///
+    /// Also accepts HuggingFace-style dataset files (JSON/JSONL/CSV/Parquet): the
+    /// dataset is loaded in memory at startup, prompts and responses are tokenized
+    /// with the HuggingFace model named by `--model-name` / `MODEL` (default
+    /// [`tokens::DEFAULT_DATASET_TOKENIZER`]), and output tokens are served directly
+    /// via [`tokens::HFDatasetTokens`] — no trace conversion.
     #[arg(long)]
     pub replay_tokens: Option<TraceUri>,
 
@@ -315,7 +321,9 @@ pub struct Opt {
     #[arg(long, default_value = "")]
     pub kv_events_topic: String,
 
-    /// Served model name, used only to build the default KV-event topic.
+    /// Served model name: builds the default KV-event topic and tokenizes HuggingFace
+    /// dataset rows for `--replay-tokens` (defaults to [`tokens::DEFAULT_DATASET_TOKENIZER`
+    /// when unset).
     #[arg(long, env = "MODEL", default_value = "")]
     pub model_name: String,
 
@@ -391,6 +399,15 @@ impl Opt {
         Wrap::parse_from(args).opt
     }
 
+    /// HuggingFace model id used to tokenize dataset rows for `--replay-tokens`.
+    pub(crate) fn dataset_tokenizer_model(&self) -> &str {
+        if self.model_name.is_empty() {
+            tokens::DEFAULT_DATASET_TOKENIZER
+        } else {
+            &self.model_name
+        }
+    }
+
     /// Build the KV-cache event publisher config for one engine. The endpoint port and the
     /// topic's pod id are offset by `engine_index` so several engines in one process publish
     /// on distinct sockets/streams.
@@ -432,15 +449,33 @@ impl Opt {
         }
     }
 
-    /// Build the token source: replay recorded output ids (from `--replay-tokens`) or
-    /// random draws. Returns an error if the trace is unreadable or carries no tokens.
+    /// Build the token source: replay recorded output ids or dataset-driven tokens
+    /// (from `--replay-tokens`), or random draws.
     pub(crate) fn build_token_source(&self) -> Result<Box<dyn tokens::TokenSource>> {
         let Some(uri) = &self.replay_tokens else {
             return Ok(Box::new(tokens::RandomTokens {
                 vocab_size: self.vocab_size,
             }));
         };
-        let (meta, records) = trace::read_trace_file(local_input(uri, "--replay-tokens")?)?;
+
+        let path = local_input(uri, "--replay-tokens")?;
+        if sim_trace::dataset_convert::is_dataset_file(path)? {
+            if self.replay_match == ReplayMatch::Prefix && self.model_name.is_empty() {
+                bail!(
+                    "--replay-tokens with a dataset and --replay-match prefix requires \
+                     --model-name (or MODEL) so dataset rows are tokenized with the same \
+                     vocabulary as incoming prompts"
+                );
+            }
+            return Ok(Box::new(tokens::HFDatasetTokens::from_file(
+                path,
+                self.tokens_per_block,
+                self.replay_match,
+                self.dataset_tokenizer_model(),
+            )?));
+        }
+
+        let (meta, records) = trace::read_trace_file(path)?;
         let subset = trace::replay_subset(records);
         if subset.is_empty() {
             bail!(
