@@ -76,6 +76,8 @@ struct RequestState {
     /// Chained per-block prefix fingerprints of the prompt (see
     /// `trace::prompt_block_hashes`).
     block_hashes: Option<Vec<u64>>,
+    /// Per-multimodal-input content hashes (`MmFeatureSpec::mm_hash`).
+    mm_hashes: Option<Vec<String>>,
     /// `do_remote_prefill` request (P/D decode side): its first output reflects a
     /// KV pull, not local prefill compute, so it never counts as interference.
     remote_prefill: bool,
@@ -110,6 +112,15 @@ impl RequestState {
                 .prompt_token_ids
                 .as_deref()
                 .and_then(|tokens| sim_trace::trace::prompt_block_hashes(tokens, block_size)),
+            mm_hashes: req.mm_features.as_deref().and_then(|features| {
+                let hashes: Vec<String> =
+                    features.iter().filter_map(|f| f.mm_hash.clone()).collect();
+                if hashes.is_empty() {
+                    None
+                } else {
+                    Some(hashes)
+                }
+            }),
             remote_prefill,
             last_output: None,
             output_tokens: 0,
@@ -202,6 +213,7 @@ impl RequestState {
             arrival_ms: Some(ms_between(capture_start, self.arrival)),
             itl_ctx,
             block_hashes: self.block_hashes,
+            mm_hashes: self.mm_hashes,
             output_token_ids: (record_tokens == TokenRecording::On)
                 .then_some(self.output_token_ids),
             finish_reason: Some(trace_finish_reason(finish_reason)),
@@ -980,6 +992,7 @@ mod tests {
             arrival,
             prompt_tokens: 10,
             block_hashes: None,
+            mm_hashes: None,
             remote_prefill: false,
             last_output: None,
             output_tokens: 0,
