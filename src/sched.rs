@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 
-use vllm_engine_core_client::protocol::EngineCoreRequest;
+use sim_protocol::vllm::EngineCoreRequest;
 
 /// Strategy for picking the next waiting request to admit into the running batch.
 pub(crate) trait Scheduler: Send {
@@ -88,7 +88,7 @@ impl Scheduler for ShortestPromptFirst {
 mod tests {
     use std::collections::VecDeque;
 
-    use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
+    use sim_protocol::vllm::{EngineCoreRequest, EngineCoreSamplingParams};
 
     use crate::sched::{Fcfs, Priority, Scheduler};
 

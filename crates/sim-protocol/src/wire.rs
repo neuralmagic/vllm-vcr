@@ -5,8 +5,8 @@
 //! orphan rule forbids implementing `From<EngineCoreFinishReason>` for a type
 //! it owns from outside it. Free functions sidestep that entirely.
 
+use crate::vllm::{EngineCoreFinishReason, EngineCoreRequestType};
 use sim_trace::trace::TraceFinishReason;
-use vllm_engine_core_client::protocol::{EngineCoreFinishReason, EngineCoreRequestType};
 
 /// Decode the single-byte request-type frame on the engine input socket.
 ///

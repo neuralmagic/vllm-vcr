@@ -12,11 +12,9 @@
 #     v0.X-era main commits, not the tagged releases; the `tag` is the line label.
 #   - `patch_repo`/`patch_rev` (optional, both-or-neither): a fork that
 #     `[patch]`-overrides the crate for fixes not yet upstream (a DIFFERENT source
-#     than vllm.git). Omit when the line builds against upstream directly. NOTE:
-#     the older lines below pin the external `wseaton/vllm` serde-defaults fork;
-#     building those lines needs that fork to stay reachable (mirror it into the
-#     org if you want them to survive the fork going away). The default line
-#     builds against upstream and has no such dependency.
+#     than vllm.git). Omit when the line builds against upstream directly. No line
+#     in the current window needs one: every supported line builds against
+#     upstream, so the repo has no external-fork dependency.
 #   - Exactly one line has `default = true`. That line is `:latest` / unsuffixed.
 #     It is always the newest stable release.
 #   - A line enters with `fidelity_validated = false` and is promoted to `true`
@@ -26,81 +24,63 @@
 #       * `nightly` tracks vLLM main (post-merge commits); its `tag` is the literal
 #         `"nightly"`. protocol_rev is bumped to the latest main sha by the canary.
 #       * `rc` tracks the newest upstream release candidate newer than the current
-#         stable (e.g. `v0.24.0rc1`); both its `tag` and `protocol_rev` are bumped
+#         stable (e.g. `v0.26.1rc0`); both its `tag` and `protocol_rev` are bumped
 #         by the release watcher. build.rs parses the rc tag's `major.minor` like
 #         any release, so the right capability cfgs turn on.
 #     build.rs treats a non-`vX.Y` tag (i.e. `nightly`) as the newest line (all
 #     capability cfgs on).
-#   - The stable window holds up to four lines (newest default + three back). A
-#     new stable release rolls in as the default, demotes the old default, and
-#     drops the oldest once the window is full. The `nightly`/`rc` trackers and the
-#     stable roll are automated by .github/workflows/vllm-release-watch.yml (build-
-#     gated PRs); the manifest stays the source of truth, the watcher just edits it.
+#   - The stable window holds up to three lines (N, N-1, N-2). A new stable
+#     release rolls in as the default, demotes the old default, and drops the
+#     oldest once the window is full. The `nightly`/`rc` trackers and the stable
+#     roll are automated by .github/workflows/vllm-release-watch.yml (build-gated
+#     PRs); the manifest stays the source of truth, the watcher just edits it.
 
 [[vllm]]
 # Bleeding edge: tracks vLLM main so the build/conformance matrix flags wire drift
-# the day a post-merge commit breaks it. No fork (main already carries #45848).
-# protocol_rev is bumped to the latest green main sha by the canary's weekly
-# (Monday / on-demand) PR. See .github/workflows/nightly-canary.yml.
+# the day a post-merge commit breaks it. protocol_rev is bumped to the latest green
+# main sha by the canary's weekly (Monday / on-demand) PR.
+# See .github/workflows/nightly-canary.yml.
 line = "nightly"
 tag = "nightly"
-protocol_rev = "8dd1b702f27edeed24a4336f531b01c346e04253"
+protocol_rev = "62a86318de3655f970baf7c2ff89c81a72c1a1b3"
 fidelity_validated = false
 
 [[vllm]]
 # Latest upstream release candidate, ahead of the newest stable. Tracked by the
 # release watcher (`cargo xtask watch-rc`), which bumps BOTH tag and protocol_rev
-# to the highest `vX.Y.ZrcN` tag newer than the default line. v0.24.0rc1 is the
-# rc for the upcoming 0.24; builds clean against upstream (>=0.23 carries #45848),
-# so no fork. fidelity_validated stays false (RCs never get goldens).
+# to the highest `vX.Y.ZrcN` tag newer than the default line. fidelity_validated
+# stays false (RCs never get goldens).
 line = "rc"
-tag = "v0.24.0rc1"
-protocol_rev = "7b3d595eb197d714052ce296cc8b124f0dc8af31"
+tag = "v0.26.1rc0"
+protocol_rev = "53f6dd5c6f7725df4e5ac9441569860023100870"
 fidelity_validated = false
 
-# Auto-rolled in by vllm-release-watch as the new default. Review the
-# protocol_rev (pinned to the release tag's commit, not a post-release main
-# sha) and whether this line needs a [patch] fork before promoting fidelity.
 [[vllm]]
-line = "0.24"
-tag = "v0.24.0"
-protocol_rev = "ee0da84ab9e04ac7610e28580af62c365e898389"
-fidelity_validated = false
+# N (head). The 0.25 protocol restructure is upstream here: the engine-core
+# output envelope is the `protocol::output::EngineCoreOutputs` enum and the flat
+# wire struct is private, so the engine builds its envelope through
+# `sim_protocol::vllm` (see docs/multi-version-shim.md). 0.26 also adds
+# `EngineCoreOutput.ec_transfer_params`.
+line = "0.26"
+tag = "v0.26.0"
+protocol_rev = "568afb3a13806beb53bb2e6bd518269357b237c0"
+fidelity_validated = true
 default = true
 
 [[vllm]]
-# N (head). 17bc1445 is the post-#45848 main commit (serde-default fix upstream
-# as of 2026-06-17), so no fork patch. Builds + conformance + unit tests green.
-line = "0.23"
-tag = "v0.23.0"
-protocol_rev = "17bc1445562435b608041d434e9738440954159c"
-fidelity_validated = false
+# N-1. Same protocol layout as 0.26 (submodule paths + the outputs enum), minus
+# `ec_transfer_params`.
+line = "0.25"
+tag = "v0.25.1"
+protocol_rev = "752a3a504485790a2e8491cacbb35c137339ad34"
+fidelity_validated = true
 
 [[vllm]]
-# N-1. Builds against the 0.22 crate (0decac0d), patched to the wseaton/vllm
-# serde-defaults fork. The compat shim absorbs the build-time API drift (absent
-# mock_engine, untyped lora, no ready vllm_version, client-only utility); the
-# fork backports vllm-project/vllm#45848 so the *capture* path can decode real
-# msgspec omit_defaults requests (the upstream 0.22 EngineCoreSamplingParams has
-# no field defaults). fidelity_validated stays false until captures exist.
-line = "0.22"
-tag = "v0.22.1"                                                # released 2026-06-04
-protocol_rev = "0decac0d96c42b49572498019f0a0e3600f50398"
-patch_repo = "https://github.com/wseaton/vllm.git"
-patch_rev = "b48f2434d7f523840a74e9f4b96b4499c1323a8f"
-fidelity_validated = false
-
-[[vllm]]
-# N-2. The Rust `vllm-engine-core-client` crate did not exist at the v0.21.0 tag
-# (the rust/ tree was added after 0.21), so there is no 0.21 rev to build against.
-# 0.21 is therefore capture-driven: it builds against the SAME 0.22 crate + fork
-# as the 0.22 line (identical wire as far as the client types go), and is
-# distinguished only by its tag label and its own goldens. The capture proves
-# whether the 0.21 engine's wire actually matches; if it diverges, this line gets
-# its own shim. fidelity_validated stays false until a 0.21 golden validates.
-line = "0.21"
-tag = "v0.21.0"
-protocol_rev = "0decac0d96c42b49572498019f0a0e3600f50398"
-patch_repo = "https://github.com/wseaton/vllm.git"
-patch_rev = "b48f2434d7f523840a74e9f4b96b4499c1323a8f"
-fidelity_validated = false
+# N-2. The last line before the 0.25 restructure: protocol types are re-exported
+# from `protocol` directly and `EngineCoreOutputs` is still the flat wire struct.
+# The `vllm_outputs_enum` cfg is off here, which is the whole reason the outputs
+# shim exists.
+line = "0.24"
+tag = "v0.24.0"
+protocol_rev = "ee0da84ab9e04ac7610e28580af62c365e898389"
+fidelity_validated = true

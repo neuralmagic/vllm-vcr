@@ -84,7 +84,7 @@ pub fn assert_same_line(build_target: &str, captured_version: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use rmpv::Value;
-    use vllm_engine_core_client::protocol::ModelDtype;
+    use sim_protocol::vllm::ModelDtype;
 
     use crate::conformance::{assert_ready_response_schema, assert_same_line};
     use crate::frontend_connect::SimReadyResponse;

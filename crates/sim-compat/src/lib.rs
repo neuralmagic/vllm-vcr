@@ -12,7 +12,9 @@
 //!   - the conformance runner, which replays each line's goldens.
 //!
 //! The manifest diff *is* the release: adding/removing a `[[vllm]]` line or
-//! flipping `fidelity_validated` is what advances the N-3 window.
+//! flipping `fidelity_validated` is what advances the N-2 window.
+
+pub mod capabilities;
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -20,7 +22,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// One supported vLLM line in the rolling N-3 window.
+/// One supported vLLM line in the rolling N-2 window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VllmLine {
     /// Minor line, e.g. `"0.10"`. The grouping key the build matrix and image
@@ -37,9 +39,9 @@ pub struct VllmLine {
     pub protocol_rev: String,
     /// Optional fork that `[patch]`-overrides `vllm-engine-core-client` for this
     /// line (a DIFFERENT source than `vllm.git`, e.g. a fork carrying a fix not
-    /// yet upstream). The head line uses one for vllm-project/vllm#45848; lines
-    /// without a fork build against `protocol_rev` upstream directly. Both must
-    /// be set together or both omitted.
+    /// yet upstream). No line in the current window needs one; lines without a
+    /// fork build against `protocol_rev` upstream directly. Both must be set
+    /// together or both omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch_repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

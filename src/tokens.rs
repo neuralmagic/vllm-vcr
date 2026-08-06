@@ -17,9 +17,9 @@ use anyhow::{Context as _, Result};
 use hf_hub::api::sync::Api;
 use rand::Rng as _;
 use rand::rngs::StdRng;
+use sim_protocol::vllm::EngineCoreFinishReason;
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
-use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
 use crate::ReplayMatch;
 use crate::trace::TraceRecord;
@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     fn replay_tokens_reports_recorded_finish_reasons() {
-        use vllm_engine_core_client::protocol::EngineCoreFinishReason;
+        use sim_protocol::vllm::EngineCoreFinishReason;
         let src = replay_source();
         assert_eq!(
             src.finish_reason("replay-0"),
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn prefix_match_serves_recorded_ids_and_reports_length() {
-        use vllm_engine_core_client::protocol::EngineCoreFinishReason;
+        use sim_protocol::vllm::EngineCoreFinishReason;
         let (turn1, _, mut src) = prefix_records();
         assert_eq!(src.on_request_added("live-abc", &turn1), Some(3));
         assert_eq!(drain(&mut src, "live-abc", &turn1, 3), vec![100, 101, 102]);

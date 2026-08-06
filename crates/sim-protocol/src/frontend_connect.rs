@@ -15,12 +15,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::mock_engine::{MockCoordinatorSockets, MockEngineDataSockets, MockEngineSockets};
+use crate::vllm::{ModelDtype, decode_msgpack, encode_msgpack};
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::time::timeout;
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::protocol::handshake::{HandshakeInitMessage, ReadyMessage};
-use vllm_engine_core_client::protocol::{ModelDtype, decode_msgpack, encode_msgpack};
 use zeromq::prelude::{Socket as _, SocketRecv as _, SocketSend as _};
 use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, SubSocket, ZmqMessage};
@@ -222,7 +222,7 @@ pub async fn connect_to_frontend_raw(
 #[cfg(test)]
 mod tests {
     use crate::frontend_connect::SimReadyResponse;
-    use vllm_engine_core_client::protocol::ModelDtype;
+    use crate::vllm::ModelDtype;
 
     /// The frontends decode the registration payload into required-field
     /// structs (msgspec dataclass in python, serde in the Rust client); every

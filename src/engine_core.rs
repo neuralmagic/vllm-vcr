@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_tuple::Deserialize_tuple;
+use sim_protocol::vllm::{EngineCoreRequest, Envelope};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
-use vllm_engine_core_client::protocol::{EngineCoreOutputs, EngineCoreRequest};
 
 /// The engine-core utility request (`add_lora` / `remove_lora` /
 /// `reset_prefix_cache`).
@@ -43,7 +43,7 @@ pub(crate) enum EngineInput {
 /// Message sent from the engine task to the IO loop for one engine output batch.
 pub(crate) struct EngineOutput {
     pub client_index: u32,
-    pub outputs: EngineCoreOutputs,
+    pub outputs: Envelope,
 }
 
 /// The contract an engine implementation must satisfy to plug into the generic loop.
@@ -179,12 +179,12 @@ pub(crate) async fn run_loop<E: EngineCore>(
 mod tests {
     use std::collections::BTreeSet;
 
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
-    use vllm_engine_core_client::protocol::{
-        EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
+    use sim_protocol::vllm::{
+        self as vllm, EngineCoreFinishReason, EngineCoreOutput, EngineCoreRequest,
         EngineCoreSamplingParams,
     };
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     use crate::engine_core::{EngineCore, EngineInput, EngineOutput, run_loop};
 
@@ -222,12 +222,13 @@ mod tests {
                     };
                     Ok(vec![EngineOutput {
                         client_index,
-                        outputs: EngineCoreOutputs {
-                            engine_index: 0,
-                            outputs: vec![output],
-                            finished_requests: Some(BTreeSet::from([request_id])),
-                            ..Default::default()
-                        },
+                        outputs: vllm::request_batch(
+                            0,
+                            vec![output],
+                            None,
+                            0.0,
+                            Some(BTreeSet::from([request_id])),
+                        ),
                     }])
                 }
                 _ => Ok(Vec::new()),
@@ -275,12 +276,13 @@ mod tests {
         };
         EngineOutput {
             client_index: request.client_index,
-            outputs: EngineCoreOutputs {
-                engine_index: 0,
-                outputs: vec![output],
-                finished_requests: Some(BTreeSet::from([request.request_id])),
-                ..Default::default()
-            },
+            outputs: vllm::request_batch(
+                0,
+                vec![output],
+                None,
+                0.0,
+                Some(BTreeSet::from([request.request_id])),
+            ),
         }
     }
 
@@ -309,12 +311,13 @@ mod tests {
             };
             EngineOutput {
                 client_index,
-                outputs: EngineCoreOutputs {
-                    engine_index: 0,
-                    outputs: vec![output],
-                    finished_requests: Some(BTreeSet::from([request_id])),
-                    ..Default::default()
-                },
+                outputs: vllm::request_batch(
+                    0,
+                    vec![output],
+                    None,
+                    0.0,
+                    Some(BTreeSet::from([request_id])),
+                ),
             }
         }
     }
@@ -369,12 +372,13 @@ mod tests {
             };
             vec![EngineOutput {
                 client_index: client,
-                outputs: EngineCoreOutputs {
-                    engine_index: 0,
-                    outputs: vec![output],
-                    finished_requests: Some(BTreeSet::from([id])),
-                    ..Default::default()
-                },
+                outputs: vllm::request_batch(
+                    0,
+                    vec![output],
+                    None,
+                    0.0,
+                    Some(BTreeSet::from([id])),
+                ),
             }]
         }
 
@@ -419,8 +423,8 @@ mod tests {
                 .expect("timeout")
                 .expect("recv");
 
-            assert_eq!(out.outputs.outputs.len(), 1);
-            let o = &out.outputs.outputs[0];
+            assert_eq!(vllm::request_outputs(&out.outputs).len(), 1);
+            let o = &vllm::request_outputs(&out.outputs)[0];
             assert_eq!(o.request_id, id);
             assert_eq!(o.new_token_ids, vec![42]);
             assert_eq!(o.finish_reason, Some(EngineCoreFinishReason::Length));
@@ -458,9 +462,9 @@ mod tests {
             .await
             .expect("abort output timed out")
             .expect("abort output");
-        assert_eq!(out.outputs.outputs[0].request_id, "slow-1");
+        assert_eq!(vllm::request_outputs(&out.outputs)[0].request_id, "slow-1");
         assert_eq!(
-            out.outputs.outputs[0].finish_reason,
+            vllm::request_outputs(&out.outputs)[0].finish_reason,
             Some(EngineCoreFinishReason::Abort)
         );
 
@@ -506,9 +510,12 @@ mod tests {
             .await
             .expect("rejection timed out")
             .expect("rejection output");
-        assert_eq!(rejected.outputs.outputs[0].request_id, "late-1");
         assert_eq!(
-            rejected.outputs.outputs[0].finish_reason,
+            vllm::request_outputs(&rejected.outputs)[0].request_id,
+            "late-1"
+        );
+        assert_eq!(
+            vllm::request_outputs(&rejected.outputs)[0].finish_reason,
             Some(EngineCoreFinishReason::Abort)
         );
 
@@ -517,9 +524,12 @@ mod tests {
             .await
             .expect("drain output timed out")
             .expect("drain output");
-        assert_eq!(finished.outputs.outputs[0].request_id, "drain-1");
         assert_eq!(
-            finished.outputs.outputs[0].finish_reason,
+            vllm::request_outputs(&finished.outputs)[0].request_id,
+            "drain-1"
+        );
+        assert_eq!(
+            vllm::request_outputs(&finished.outputs)[0].finish_reason,
             Some(EngineCoreFinishReason::Length)
         );
 
@@ -553,9 +563,9 @@ mod tests {
             .await
             .expect("deadline abort timed out")
             .expect("deadline abort output");
-        assert_eq!(out.outputs.outputs[0].request_id, "stuck-1");
+        assert_eq!(vllm::request_outputs(&out.outputs)[0].request_id, "stuck-1");
         assert_eq!(
-            out.outputs.outputs[0].finish_reason,
+            vllm::request_outputs(&out.outputs)[0].finish_reason,
             Some(EngineCoreFinishReason::Abort)
         );
 

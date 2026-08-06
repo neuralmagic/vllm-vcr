@@ -1160,7 +1160,7 @@ fn source_completion_ms(r: &TraceRecord) -> f64 {
 /// burst structure; a None ttft means the request failed or timed out.
 async fn measure_one(
     client: &vllm_engine_core_client::EngineCoreClient,
-    request: vllm_engine_core_client::protocol::EngineCoreRequest,
+    request: sim_protocol::vllm::EngineCoreRequest,
     timeout_dur: std::time::Duration,
 ) -> (Option<f64>, Vec<f64>, Vec<u32>) {
     use std::time::Instant;
@@ -1259,8 +1259,8 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use sim_protocol::vllm::{EngineCoreRequest, EngineCoreSamplingParams};
     use tokio_util::sync::CancellationToken;
-    use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
     let (meta, all_records) = crate::trace::read_trace_file(cfg.trace_path)?;

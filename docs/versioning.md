@@ -1,7 +1,7 @@
 # vLLM version mapping and release automation
 
-Goal: support a rolling window of **up to four stable lines** (latest vLLM release
-plus three back) from a single repo, with automation that catches protocol drift
+Goal: support a rolling window of **three stable lines** (latest vLLM release
+plus two back, i.e. N-2) from a single repo, with automation that catches protocol drift
 the day a new vLLM lands and ships one clearly-labelled artifact per supported
 line. Two non-stable "tracker" lines ride ahead of the window so drift shows up
 before a release pins us to it: `nightly` (vLLM main) and `rc` (the newest
@@ -21,7 +21,7 @@ caught by tests, not the compiler.
 | **Scheduler / step model** | `src/` step engine | Soft. Doesn't break the build, shifts replay error (chunked-prefill defaults etc.). Re-validated per line via the figure/gate harness. |
 
 The trace and modeling crates (`sim-trace`, `src/` model) are already
-vLLM-protocol-free. So "support N-3" is almost entirely a `sim-protocol` +
+vLLM-protocol-free. So "support N-2" is almost entirely a `sim-protocol` +
 build-matrix problem, which is what makes the matrix approach cheap.
 
 ## Decision: build matrix, one artifact per line
@@ -49,42 +49,32 @@ release.
 [[vllm]]
 line = "nightly"              # tracks vLLM main for drift detection
 tag  = "nightly"
-protocol_rev = "9c7c74bf..."
+protocol_rev = "62a86318..."
 fidelity_validated = false
 
 [[vllm]]
-line = "rc"                   # tracks the newest release candidate (e.g. v0.24.0rc1)
-tag  = "v0.24.0rc1"           # bumped (tag + rev) by the release watcher
-protocol_rev = "7b3d595e..."
+line = "rc"                   # tracks the newest release candidate
+tag  = "v0.26.1rc0"           # bumped (tag + rev) by the release watcher
+protocol_rev = "53f6dd5c..."
 fidelity_validated = false
 
 [[vllm]]
-line = "0.24"                 # current default line
-tag  = "v0.24.0"              # vLLM release tag; also the e2e frontend version
-protocol_rev = "ee0da84a..."  # rev for vllm-engine-core-client at this line
+line = "0.26"                 # current default line
+tag  = "v0.26.0"              # vLLM release tag; also the e2e frontend version
+protocol_rev = "568afb3a..."  # rev for vllm-engine-core-client at this line
 fidelity_validated = false    # flips true once replay gates validate goldens
 default = true                # what :latest / unsuffixed builds point at
 
 [[vllm]]
-line = "0.23"                 # N-1 supported release line
-tag  = "v0.23.0"
-protocol_rev = "17bc1445..."
+line = "0.25"                 # N-1 supported release line
+tag  = "v0.25.1"
+protocol_rev = "752a3a50..."
 fidelity_validated = false
 
 [[vllm]]
-line = "0.22"                 # N-2 supported release line
-tag  = "v0.22.1"
-protocol_rev = "0decac0d..."
-patch_repo = "https://github.com/wseaton/vllm.git"
-patch_rev = "b48f2434..."
-fidelity_validated = false
-
-[[vllm]]
-line = "0.21"                 # N-3 supported release line
-tag  = "v0.21.0"
-protocol_rev = "0decac0d..."
-patch_repo = "https://github.com/wseaton/vllm.git"
-patch_rev = "b48f2434..."
+line = "0.24"                 # N-2 supported release line
+tag  = "v0.24.0"
+protocol_rev = "ee0da84a..."
 fidelity_validated = false
 ```
 
@@ -106,9 +96,9 @@ Conflating them is the classic mistake.
 
 Image tags:
 
-- `vllm-vcr:0.3.0-vllm0.23` — immutable, the real artifact (sim version ×
+- `vllm-vcr:0.2.0-vllm0.26` — immutable, the real artifact (sim version ×
   vLLM line).
-- `vllm-vcr:vllm0.23` — floating, latest sim for that line.
+- `vllm-vcr:vllm0.26` — floating, latest sim for that line.
 - `vllm-vcr:latest` — sim-head × the `default = true` line.
 
 ## CI matrix mechanics
@@ -151,7 +141,7 @@ When vLLM cuts N+1:
 1. Add it to `compat.toml` with `fidelity_validated = false`.
 2. Matrix builds it; run capture + replay to validate fidelity.
 3. Flip `fidelity_validated = true`, move `default` to the new line.
-4. Drop the now-N-4 line from the manifest.
+4. Drop the now-N-3 line from the manifest.
 
 ## Build order
 
@@ -173,8 +163,8 @@ When vLLM cuts N+1:
 5. Release watcher (`.github/workflows/vllm-release-watch.yml`). The tag-driven
    counterpart to the canary, run daily. It keeps the `rc` line on the newest
    release candidate (`cargo xtask watch-rc`) and rolls the stable window when a
-   new final release lands (`cargo xtask watch-stable --max-stable 4`: new default,
-   oldest stable dropped past four). A patch release on a line already in the
+   new final release lands (`cargo xtask watch-stable --max-stable 3`: new default,
+   oldest stable dropped past three). A patch release on a line already in the
    window (v0.23.0 -> v0.23.1) bumps that line's tag/rev in place and resets its
    `fidelity_validated` (old captures were taken against the old rev). Both pin +
    build + run the protocol e2e against the new tag and only open a build-gated
@@ -209,7 +199,7 @@ captures with a GPU-free replay in CI. The capture runbook is
 
 Three artifacts cooperate:
 
-- **`compat.toml`** — the four-line stable window plus the `nightly`/`rc` trackers
+- **`compat.toml`** — the three-line stable window plus the `nightly`/`rc` trackers
   (above). Each line carries `fidelity_validated`,
   which gates whether its conformance failures block promotion.
 - **`conformance/manifest.toml`** — one `[[golden]]` entry per captured trace, with

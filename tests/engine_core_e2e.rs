@@ -18,16 +18,11 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::json;
+use sim_protocol::vllm::{EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams};
 use tokio_util::sync::CancellationToken;
-use vllm_vcr::{Opt, run};
-// The typed lora client API (LoraRequest, client.add_lora/remove_lora) only
-// exists on 0.23+; the lora lifecycle test below is gated to match.
-#[cfg(vllm_lora_typed)]
 use vllm_engine_core_client::protocol::lora::LoraRequest;
-use vllm_engine_core_client::protocol::{
-    EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams,
-};
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
+use vllm_vcr::{Opt, run};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -397,7 +392,6 @@ async fn reset_prefix_cache_busy_vs_idle() {
     );
 }
 
-#[cfg(vllm_lora_typed)]
 #[tokio::test]
 async fn lora_load_unload_lifecycle() {
     let (client, _guard) = harness("lora_load_unload_lifecycle", &[]).await;

@@ -9,7 +9,7 @@
 //! mirror the head crate's definitions field-for-field, and the constant/dtype
 //! match its `DEFAULT_MOCK_MAX_MODEL_LEN` / `default_ready_response().dtype`.
 
-use vllm_engine_core_client::protocol::ModelDtype;
+use crate::vllm::ModelDtype;
 use vllm_engine_core_client::protocol::handshake::HandshakeInitMessage;
 use zeromq::{DealerSocket, PushSocket, SubSocket};
 
@@ -25,7 +25,7 @@ pub fn default_dtype() -> ModelDtype {
 pub struct MockCoordinatorSockets {
     /// Receives coordinator broadcasts such as `START_DP_WAVE`.
     pub input_sub: SubSocket,
-    /// Sends coordinator-only `EngineCoreOutputs` back to the frontend.
+    /// Sends coordinator-only `Envelope` back to the frontend.
     pub output_push: PushSocket,
 }
 

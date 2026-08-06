@@ -36,16 +36,16 @@ use std::io::Write;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use sim_protocol::mock_engine::MockEngineSockets;
+use sim_protocol::vllm::{
+    EngineCoreFinishReason, EngineCoreRequest, EngineCoreRequestType, decode_engine_core_outputs,
+    decode_msgpack, encode_msgpack, request_outputs, scheduler_stats,
+};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::protocol::handshake::{
     HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
-};
-use vllm_engine_core_client::protocol::{
-    EngineCoreFinishReason, EngineCoreRequest, EngineCoreRequestType, decode_engine_core_outputs,
-    decode_msgpack, encode_msgpack,
 };
 use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::{PullSocket, RouterSocket, ZmqMessage};
@@ -748,11 +748,11 @@ fn observe_output<W: Write, S: Write, F: AsRef<[u8]>>(
     };
 
     if let Some(step_writer) = step_writer
-        && let Some(stats) = &outputs.scheduler_stats
+        && let Some(stats) = scheduler_stats(&outputs)
     {
         let record = StepStatsRecord {
             ts_ms: ms_between(capture_start, arrival),
-            scheduler: stats.as_ref().clone(),
+            scheduler: stats.clone(),
         };
         // Flush per line for the same crash-safety the trace writer gets: a
         // killed pod keeps everything observed so far.
@@ -767,13 +767,10 @@ fn observe_output<W: Write, S: Write, F: AsRef<[u8]>>(
     // own running count when it attaches scheduler stats (tap in-flight count as
     // fallback), and the prompt tokens that finished prefill in this step (the
     // requests receiving their first tokens here).
-    let step_running = outputs
-        .scheduler_stats
-        .as_ref()
+    let step_running = scheduler_stats(&outputs)
         .map(|s| s.num_running_reqs as u32)
         .unwrap_or(requests.len() as u32);
-    let step_prefill_tokens: u32 = outputs
-        .outputs
+    let step_prefill_tokens: u32 = request_outputs(&outputs)
         .iter()
         .filter(|o| !o.new_token_ids.is_empty())
         .filter_map(|o| requests.get(&o.request_id))
@@ -781,7 +778,7 @@ fn observe_output<W: Write, S: Write, F: AsRef<[u8]>>(
         .map(|s| s.prompt_tokens as u32)
         .sum();
 
-    for output in &outputs.outputs {
+    for output in request_outputs(&outputs) {
         let request_id = &output.request_id;
 
         let Some(state) = requests.get_mut(request_id) else {

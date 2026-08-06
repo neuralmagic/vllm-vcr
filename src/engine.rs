@@ -27,8 +27,8 @@ use vllm_engine_core_client::protocol::utility::{
 };
 
 use crate::engine_core::UtilityRequestSpec;
-use vllm_engine_core_client::protocol::{
-    EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
+use sim_protocol::vllm::{
+    self as vllm, EngineCoreFinishReason, EngineCoreOutput, EngineCoreRequest, Envelope,
 };
 
 use crate::blockpool::BlockPool;
@@ -79,17 +79,17 @@ fn empty_finish_outputs(
     engine_index: u32,
     request_id: String,
     finish_reason: EngineCoreFinishReason,
-) -> EngineCoreOutputs {
+) -> Envelope {
     let output = request_output(request_id, Vec::new(), Some(finish_reason));
     let finished_requests = BTreeSet::from([output.request_id.clone()]);
 
-    EngineCoreOutputs {
+    vllm::request_batch(
         engine_index,
-        outputs: vec![output],
-        timestamp: now_secs(),
-        finished_requests: Some(finished_requests),
-        ..Default::default()
-    }
+        vec![output],
+        None,
+        now_secs(),
+        Some(finished_requests),
+    )
 }
 
 /// Encode a utility result into the protocol's msgpack value envelope.
@@ -102,27 +102,26 @@ where
     ))
 }
 
-/// Wrap a utility result envelope in the `EngineCoreOutputs` the frontend awaits for `call_id`.
+/// Wrap a utility result envelope in the `Envelope` the frontend awaits for `call_id`.
 fn utility_result_outputs(
     engine_index: u32,
     call_id: UtilityCallId,
     result: UtilityResultEnvelope,
-) -> EngineCoreOutputs {
-    EngineCoreOutputs {
+) -> Envelope {
+    vllm::utility(
         engine_index,
-        utility_output: Some(UtilityOutput {
+        now_secs(),
+        UtilityOutput {
             call_id,
             failure_message: None,
             result: Some(result),
-        }),
-        timestamp: now_secs(),
-        ..Default::default()
-    }
+        },
+    )
 }
 
 /// Produce the minimal utility responses needed by a real frontend. Stateful utilities
 /// (`add_lora`/`remove_lora`, `reset_prefix_cache`) are handled on `Engine` instead.
-fn utility_response(engine_index: u32, request: UtilityRequestSpec) -> Result<EngineCoreOutputs> {
+fn utility_response(engine_index: u32, request: UtilityRequestSpec) -> Result<Envelope> {
     let result = match request.method_name.as_str() {
         "get_supported_tasks" => utility_envelope(vec!["generate"]),
         "is_sleeping" => utility_envelope(false),
@@ -480,13 +479,24 @@ impl ActiveRequest {
             0
         };
         let cached = local + external;
-        PrefillStats {
+        #[cfg_attr(not(vllm_cache_creation_tokens), allow(unused_mut))]
+        let mut stats = PrefillStats {
             num_prompt_tokens: prompt,
             num_computed_tokens: prompt.saturating_sub(cached),
             num_cached_tokens: cached,
             num_local_cached_tokens: local,
             num_external_cached_tokens: external,
+            ..Default::default()
+        };
+        // 0.26+ splits out what this prefill *adds* to the local prefix cache:
+        // everything the local cache didn't already hold, whether it was computed
+        // here or pulled from the prefill peer (a remote pull lands in local KV
+        // too). Absent before 0.26, hence the cfg rather than a plain field.
+        #[cfg(vllm_cache_creation_tokens)]
+        {
+            stats.num_cache_creation_tokens = prompt.saturating_sub(local);
         }
+        stats
     }
 }
 
@@ -616,10 +626,7 @@ impl SimEngine {
     /// the caller falls back to the generic `utility_response`). The frontend encodes both
     /// methods' args as a one-element tuple: `(LoraRequest,)` for `add_lora`, `(lora_int_id,)`
     /// for `remove_lora`.
-    fn lora_utility_outputs(
-        &mut self,
-        request: &UtilityRequestSpec,
-    ) -> Result<Option<EngineCoreOutputs>> {
+    fn lora_utility_outputs(&mut self, request: &UtilityRequestSpec) -> Result<Option<Envelope>> {
         let ok = match request.method_name.as_str() {
             "add_lora" => {
                 // args is the one-element tuple `(LoraRequest,)`; the LoraRequest itself
@@ -662,7 +669,7 @@ impl SimEngine {
     fn reset_prefix_cache_outputs(
         &mut self,
         request: &UtilityRequestSpec,
-    ) -> Result<Option<EngineCoreOutputs>> {
+    ) -> Result<Option<Envelope>> {
         if request.method_name != "reset_prefix_cache" {
             return Ok(None);
         }
@@ -843,13 +850,13 @@ impl SimEngine {
         for (client_index, (client_outputs, finished_requests)) in by_client {
             outputs.push(EngineOutput {
                 client_index,
-                outputs: EngineCoreOutputs {
-                    engine_index: self.engine_index,
-                    outputs: client_outputs,
-                    timestamp: now_secs(),
-                    finished_requests: Some(finished_requests),
-                    ..Default::default()
-                },
+                outputs: vllm::request_batch(
+                    self.engine_index,
+                    client_outputs,
+                    None,
+                    now_secs(),
+                    Some(finished_requests),
+                ),
             });
         }
         // Aborting running requests frees batch slots; admit any waiting requests.
@@ -1546,15 +1553,13 @@ impl SimEngine {
             .filter_map(|(client_index, (outputs, finished_requests))| {
                 (!outputs.is_empty()).then(|| EngineOutput {
                     client_index,
-                    outputs: EngineCoreOutputs {
-                        engine_index: self.engine_index,
+                    outputs: vllm::request_batch(
+                        self.engine_index,
                         outputs,
-                        scheduler_stats: Some(Box::new(stats.clone())),
-                        timestamp: now_secs(),
-                        finished_requests: (!finished_requests.is_empty())
-                            .then_some(finished_requests),
-                        ..Default::default()
-                    },
+                        Some(Box::new(stats.clone())),
+                        now_secs(),
+                        (!finished_requests.is_empty()).then_some(finished_requests),
+                    ),
                 })
             })
             .collect();
@@ -1779,16 +1784,13 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
+    use sim_protocol::vllm::{EngineCoreRequest, EngineCoreSamplingParams};
 
     use super::*;
     use crate::dataplane::{NixlConfig, PdRole, make_data_plane};
     use crate::engine_core::{EngineInput, EngineOutput};
 
-    /// Build a value for `EngineCoreRequest.lora_request`. The field type is a
-    /// typed `LoraRequest` on 0.23+ and opaque `rmpv::Value` on 0.22, so this
-    /// helper gates on the same `vllm_lora_typed` capability as the engine code.
-    #[cfg(vllm_lora_typed)]
+    /// Build a value for `EngineCoreRequest.lora_request`.
     fn lora_field(name: &str, id: u64) -> vllm_engine_core_client::protocol::lora::LoraRequest {
         vllm_engine_core_client::protocol::lora::LoraRequest::new(
             name.to_string(),
@@ -1797,13 +1799,6 @@ mod tests {
             false,
             false,
         )
-    }
-    #[cfg(not(vllm_lora_typed))]
-    fn lora_field(name: &str, id: u64) -> rmpv::Value {
-        rmpv::Value::Map(vec![
-            (rmpv::Value::from("lora_name"), rmpv::Value::from(name)),
-            (rmpv::Value::from("lora_int_id"), rmpv::Value::from(id)),
-        ])
     }
 
     fn test_opt() -> Opt {
@@ -1912,7 +1907,7 @@ mod tests {
         let mut all = Vec::new();
         while !engine.active_requests.is_empty() || !engine.pending_pulls.is_empty() {
             for out in settle_pulls(engine, rx) {
-                all.extend(out.outputs.outputs);
+                all.extend(vllm::request_outputs(&out.outputs).to_vec());
             }
             // settle_pulls emptied pending_pulls, so the batch is non-empty whenever the
             // loop condition held: an empty batch here means a stall.
@@ -1922,7 +1917,7 @@ mod tests {
                 "instant model must make progress each step"
             );
             for output in batch {
-                all.extend(output.outputs.outputs);
+                all.extend(vllm::request_outputs(&output.outputs).to_vec());
             }
         }
         all
@@ -2097,11 +2092,7 @@ mod tests {
         let (mut engine, mut rx) = test_engine(test_opt());
         add(&mut engine, &mut rx, request("r1", 4, 1)); // single output token, finishes in one step
         let batch = engine.step();
-        let stats = batch[0]
-            .outputs
-            .scheduler_stats
-            .as_ref()
-            .expect("stats on batch");
+        let stats = vllm::scheduler_stats(&batch[0].outputs).expect("stats on batch");
         // Computed after the finished request is removed, so the gauge drops to 0.
         assert_eq!(stats.num_running_reqs, 0);
         assert!(engine.active_requests.is_empty());
@@ -2239,11 +2230,7 @@ mod tests {
         // Cold request: its single step reports 2 queries and 0 hits (delta since last drain).
         add(&mut engine, &mut rx, request("r1", 8, 1));
         let batch = engine.step();
-        let stats = batch[0]
-            .outputs
-            .scheduler_stats
-            .as_ref()
-            .expect("stats on batch");
+        let stats = vllm::scheduler_stats(&batch[0].outputs).expect("stats on batch");
         assert_eq!(stats.prefix_cache_stats.base.requests, 1);
         assert_eq!(stats.prefix_cache_stats.base.queries, 2);
         assert_eq!(stats.prefix_cache_stats.base.hits, 0);
@@ -2323,7 +2310,9 @@ mod tests {
 
     /// The finish reason on a single-output engine batch (used to inspect rejections/aborts).
     fn finish_reason(out: &EngineOutput) -> Option<EngineCoreFinishReason> {
-        out.outputs.outputs.first().and_then(|o| o.finish_reason)
+        vllm::request_outputs(&out.outputs)
+            .first()
+            .and_then(|o| o.finish_reason)
     }
 
     #[test]
@@ -2575,7 +2564,7 @@ mod tests {
                 );
             }
             for output in engine.step() {
-                for o in output.outputs.outputs {
+                for o in vllm::request_outputs(&output.outputs) {
                     if !o.new_token_ids.is_empty() {
                         chunks.push(o.new_token_ids.len());
                     }
@@ -2674,7 +2663,7 @@ mod tests {
             // Within one step() call every client sees the same stats clone;
             // count it once.
             if let Some(out) = outputs.first()
-                && let Some(stats) = &out.outputs.scheduler_stats
+                && let Some(stats) = vllm::scheduler_stats(&out.outputs)
                 && let Some(spec) = &stats.spec_decoding_stats
             {
                 spec_steps += 1;
@@ -2768,10 +2757,9 @@ mod tests {
         let mut out = engine
             .handle_input(EngineInput::Utility(request))
             .expect("handle_input");
-        out.remove(0)
-            .outputs
-            .utility_output
+        vllm::utility_output(&out.remove(0).outputs)
             .expect("utility output")
+            .clone()
             .into_typed_result::<T>(method)
             .expect("typed result")
     }
@@ -2942,8 +2930,7 @@ mod tests {
 
         // The abort output must carry the abort finish reason.
         let has_abort = abort_out.iter().any(|o| {
-            o.outputs
-                .outputs
+            vllm::request_outputs(&o.outputs)
                 .iter()
                 .any(|out| out.finish_reason == Some(EngineCoreFinishReason::Abort))
         });

@@ -28,10 +28,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use tokio_util::sync::CancellationToken;
-use vllm_engine_core_client::protocol::{
+use sim_protocol::vllm::{
     EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams, ModelDtype,
 };
+use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
 use sim_compat::{GoldenManifest, GoldenRole};

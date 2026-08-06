@@ -599,8 +599,8 @@ async fn calibrate_e2e_impl(
     use futures::StreamExt;
     use rand::Rng;
     use rand::SeedableRng as _;
+    use sim_protocol::vllm::{EngineCoreRequest, EngineCoreSamplingParams};
     use tokio_util::sync::CancellationToken;
-    use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
     use vllm_vcr::latency::{NUM_CONCURRENCY_BUCKETS, concurrency_bucket};
     use vllm_vcr::trace::TraceRecord;

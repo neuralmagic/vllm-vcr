@@ -75,8 +75,8 @@ async fn calibrate_e2e_smoke() {
     use futures::StreamExt;
     use rand::Rng;
     use rand::SeedableRng as _;
+    use sim_protocol::vllm::{EngineCoreRequest, EngineCoreSamplingParams};
     use tokio_util::sync::CancellationToken;
-    use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
     use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
     use vllm_vcr::{Opt, run};
 
