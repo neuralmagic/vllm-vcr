@@ -81,12 +81,33 @@ pub fn assert_same_line(build_target: &str, captured_version: &str) -> Result<()
     }
 }
 
+/// The `compat.toml` line a build belongs to, which is the key golden entries are
+/// filed under.
+///
+/// Resolved by exact `tag` match against the manifest, NOT by the tag's
+/// `major.minor`. The tracker lines share a minor with a stable line whenever
+/// they ride just ahead of it (`rc` = `v0.26.1rc0` against a `v0.26.0` default),
+/// so deriving the line from the tag alone hands the tracker the stable line's
+/// goldens: it fails on a config_hash captured from a different engine, or on a
+/// golden-fetch it has no credentials for. Falls back to `major.minor` for a tag
+/// the manifest doesn't list (a one-off local build).
+pub fn compat_line(manifest: &sim_compat::CompatManifest, build_target: &str) -> String {
+    manifest
+        .lines
+        .iter()
+        .find(|l| l.tag == build_target)
+        .map(|l| l.line.clone())
+        .or_else(|| sim_compat::minor_line(build_target))
+        .unwrap_or_else(|| build_target.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use rmpv::Value;
+    use sim_compat::CompatManifest;
     use sim_protocol::vllm::ModelDtype;
 
-    use crate::conformance::{assert_ready_response_schema, assert_same_line};
+    use crate::conformance::{assert_ready_response_schema, assert_same_line, compat_line};
     use crate::frontend_connect::SimReadyResponse;
 
     /// Encode a msgpack map with the given keys (nil values) as a stand-in for a
@@ -166,5 +187,49 @@ mod tests {
         // captured engine reported (here a main dev build).
         assert_same_line("nightly", "0.24.0.dev1+gABCDEF").expect("nightly matches main");
         assert_same_line("nightly", "0.23.0").expect("nightly matches a release too");
+    }
+
+    /// The window as it actually ships: an `rc` tracker one patch ahead of the
+    /// stable default, sharing its `major.minor`.
+    const WINDOW: &str = r#"
+[[vllm]]
+line = "nightly"
+tag = "nightly"
+protocol_rev = "aaaa"
+
+[[vllm]]
+line = "rc"
+tag = "v0.26.1rc0"
+protocol_rev = "bbbb"
+
+[[vllm]]
+line = "0.26"
+tag = "v0.26.0"
+protocol_rev = "cccc"
+default = true
+
+[[vllm]]
+line = "0.25"
+tag = "v0.25.1"
+protocol_rev = "dddd"
+"#;
+
+    #[test]
+    fn compat_line_resolves_by_tag_not_minor() {
+        let m = CompatManifest::parse(WINDOW).expect("parse");
+        // The bug this guards: v0.26.1rc0's major.minor is 0.26, so a minor-based
+        // lookup would hand the rc tracker the 0.26 line's goldens.
+        assert_eq!(compat_line(&m, "v0.26.1rc0"), "rc");
+        assert_eq!(compat_line(&m, "v0.26.0"), "0.26");
+        assert_eq!(compat_line(&m, "v0.25.1"), "0.25");
+        assert_eq!(compat_line(&m, "nightly"), "nightly");
+    }
+
+    #[test]
+    fn compat_line_falls_back_to_minor_for_unlisted_tags() {
+        let m = CompatManifest::parse(WINDOW).expect("parse");
+        // A patch release not yet rolled into the manifest still resolves to its line.
+        assert_eq!(compat_line(&m, "v0.25.2"), "0.25");
+        assert_eq!(compat_line(&m, "garbage"), "garbage");
     }
 }
