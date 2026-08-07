@@ -8,8 +8,8 @@
 //! that role. Both the engine loop and the recording tap need to read these, so
 //! the extraction lives in its own module.
 
+use crate::vllm::EngineCoreRequest;
 use serde_json::Value as JsonValue;
-use vllm_engine_core_client::protocol::EngineCoreRequest;
 
 /// Pull the `kv_transfer_params` object out of a request, if present.
 pub fn extract_kv_params(request: &EngineCoreRequest) -> Option<JsonValue> {

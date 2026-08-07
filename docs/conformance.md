@@ -6,7 +6,7 @@ bucket, register it in `conformance/manifest.toml`, and let CI flip that line to
 profile-once/replay-many model. The "replay-many" half is GPU-free and runs in CI
 and on the offline replay rig.
 
-For the version-mapping strategy this runbook serves (the N-3 window, `compat.toml`,
+For the version-mapping strategy this runbook serves (the N-2 window, `compat.toml`,
 the build matrix, image tagging), see [versioning.md](versioning.md). For the trace
 schema, see `crates/sim-trace/src/trace.rs`.
 

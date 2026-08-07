@@ -18,5 +18,9 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 zeromq = { workspace = true }
 
+# build.rs emits the per-line capability cfgs the outputs shim gates on.
+[build-dependencies]
+sim-compat = { workspace = true }
+
 [dev-dependencies]
 rmpv = { workspace = true }

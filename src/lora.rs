@@ -18,12 +18,11 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
 use serde_tuple::Serialize_tuple;
-use vllm_engine_core_client::protocol::EngineCoreRequest;
+use sim_protocol::vllm::EngineCoreRequest;
 
 /// The lora identity (name + int id) the engine needs, off an `add_lora` utility
 /// call. Our own subset of the wire's `LoraRequest`, read the same way at every
-/// supported line: the crate's typed `protocol::lora::LoraRequest` only exists on
-/// 0.23+ (lora is opaque rmpv on 0.22).
+/// supported line.
 ///
 /// The wire form is a **positional** msgpack array, not a map: both the crate's
 /// `LoraRequest` (`serde_tuple`) and Python's msgspec `LoRARequest` encode as
@@ -62,23 +61,9 @@ impl LoraSpec {
 }
 
 /// The adapter name a request runs against, read from
-/// `EngineCoreRequest.lora_request`. That field is a typed `LoraRequest` on
-/// 0.23+ and opaque `rmpv::Value` on 0.22, so this is the one access that gates
-/// on the `vllm_lora_typed` capability (emitted by build.rs).
+/// `EngineCoreRequest.lora_request`.
 pub(crate) fn request_lora_name(request: &EngineCoreRequest) -> Option<&str> {
-    #[cfg(vllm_lora_typed)]
-    {
-        request.lora_request.as_ref().map(|l| l.lora_name.as_str())
-    }
-    #[cfg(not(vllm_lora_typed))]
-    {
-        let value = request.lora_request.as_ref()?;
-        value
-            .as_map()?
-            .iter()
-            .find(|(k, _)| k.as_str() == Some("lora_name"))
-            .and_then(|(_, v)| v.as_str())
-    }
+    request.lora_request.as_ref().map(|l| l.lora_name.as_str())
 }
 
 /// The set of adapters the frontend has loaded into this engine, plus the running-batch slot

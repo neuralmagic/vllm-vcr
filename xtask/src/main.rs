@@ -124,8 +124,9 @@ enum Command {
         /// The latest stable release tag (e.g. `v0.24.0`), from `releases/latest`.
         #[arg(long)]
         latest_stable: String,
-        /// Maximum stable lines to keep (oldest dropped beyond this).
-        #[arg(long, default_value_t = 4)]
+        /// Maximum stable lines to keep (oldest dropped beyond this). Three is
+        /// the supported window: N, N-1, N-2.
+        #[arg(long, default_value_t = 3)]
         max_stable: usize,
     },
     /// Emit one `[[golden]]` TOML entry for a captured nightly trace.

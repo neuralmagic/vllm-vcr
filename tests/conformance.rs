@@ -28,15 +28,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use tokio_util::sync::CancellationToken;
-use vllm_engine_core_client::protocol::{
+use sim_protocol::vllm::{
     EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams, ModelDtype,
 };
+use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
 use sim_compat::{GoldenManifest, GoldenRole};
 use sim_s3::TraceUri;
-use vllm_vcr::conformance::{assert_ready_response_schema, assert_same_line};
+use vllm_vcr::conformance::{assert_ready_response_schema, assert_same_line, compat_line};
 use vllm_vcr::frontend_connect::SimReadyResponse;
 use vllm_vcr::trace::{TraceMeta, read_trace_file, replay_subset};
 use vllm_vcr::{Opt, VLLM_TARGET_VERSION, run};
@@ -213,15 +213,21 @@ fn verify_sha256(path: &Path, expected_hex: &str) {
     );
 }
 
+/// The repo's `compat.toml`, the source of truth for which line a build belongs to.
+fn compat_manifest() -> sim_compat::CompatManifest {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("compat.toml");
+    sim_compat::CompatManifest::load(&path).expect("load compat.toml")
+}
+
 /// Run conformance against a manifest. Returns the number of goldens actually
 /// checked (0 means cleanly skipped: none listed for this line).
 async fn run_conformance(manifest_path: &Path, bucket: Option<&str>) -> usize {
     let manifest = GoldenManifest::load(manifest_path).expect("load conformance manifest");
-    // The build's compat line: the major.minor for a release tag (v0.23.0 -> 0.23), or
-    // the tag verbatim when it has no major.minor (e.g. "nightly", which tracks main).
-    // Matches the `line` field on golden entries (compat.toml uses "0.23" / "nightly").
-    let line = sim_compat::minor_line(VLLM_TARGET_VERSION)
-        .unwrap_or_else(|| VLLM_TARGET_VERSION.to_string());
+    // The build's compat line, resolved through compat.toml by exact tag (see
+    // `compat_line`): the tracker lines share a major.minor with the stable line
+    // they ride ahead of, so a minor-derived lookup would hand `rc` the stable
+    // line's goldens.
+    let line = compat_line(&compat_manifest(), VLLM_TARGET_VERSION);
 
     let goldens: Vec<_> = manifest.for_line(&line).collect();
     if goldens.is_empty() {
@@ -278,14 +284,14 @@ async fn build_conforms_to_its_vllm_line_goldens() {
 async fn synthetic_schema_golden_passes_the_static_checks() {
     use std::io::Write as _;
 
-    let line = sim_compat::minor_line(VLLM_TARGET_VERSION)
-        .unwrap_or_else(|| VLLM_TARGET_VERSION.to_string());
-    // A release line (0.23) needs a captured version on that line; nightly tracks main,
-    // so assert_same_line accepts any version there (use a representative dev build).
-    let captured_version = if sim_compat::minor_line(VLLM_TARGET_VERSION).is_some() {
-        format!("{line}.0.dev1+gTEST")
-    } else {
-        "0.99.0.dev1+gTEST".to_string()
+    let line = compat_line(&compat_manifest(), VLLM_TARGET_VERSION);
+    // A release line needs a captured version on that line; nightly tracks main, so
+    // assert_same_line accepts any version there (use a representative dev build).
+    // This is the tag's major.minor, not the compat line: `rc` files goldens under
+    // "rc" but still targets a real vX.Y engine.
+    let captured_version = match sim_compat::minor_line(VLLM_TARGET_VERSION) {
+        Some(minor) => format!("{minor}.0.dev1+gTEST"),
+        None => "0.99.0.dev1+gTEST".to_string(),
     };
     let config_hash = "synthetic-config-hash";
 

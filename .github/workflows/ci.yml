@@ -126,7 +126,7 @@ jobs:
         with:
           command: check
 
-  # Read compat.toml and emit the N-3 support window as a JSON matrix. Keeping the
+  # Read compat.toml and emit the N-2 support window as a JSON matrix. Keeping the
   # parse in its own tiny job means the heavy per-line build job can `needs:` a
   # ready-made list instead of re-parsing the manifest per matrix leg.
   #

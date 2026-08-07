@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use futures::Stream;
+use sim_protocol::vllm::EngineCoreOutput;
 use tokio_util::sync::CancellationToken;
-use vllm_engine_core_client::protocol::EngineCoreOutput;
 
 use sim_trace::trace::{TraceMeta, TraceRecord, TraceWriter, write_trace};
 

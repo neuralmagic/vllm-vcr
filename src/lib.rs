@@ -12,13 +12,13 @@
 use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use sim_protocol::mock_engine::{DEFAULT_MOCK_MAX_MODEL_LEN, MockEngineSockets, default_dtype};
+use sim_protocol::vllm::EngineCoreFinishReason;
 use sim_s3::TraceUri;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use vllm_engine_core_client::EngineId;
-use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
 pub mod blockpool;
 pub mod calibrate;

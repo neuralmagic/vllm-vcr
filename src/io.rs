@@ -5,12 +5,12 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::{Stream, StreamExt as _, stream};
 use sim_protocol::mock_engine::MockEngineDataSockets;
+use sim_protocol::vllm::{
+    EngineCoreRequest, EngineCoreRequestType, decode_msgpack, encode_msgpack,
+};
 use sim_protocol::wire::request_type_from_frame;
 use tokio::sync::mpsc;
 use tracing::warn;
-use vllm_engine_core_client::protocol::{
-    EngineCoreRequest, EngineCoreRequestType, decode_msgpack, encode_msgpack,
-};
 use zeromq::{DealerSocket, PushSocket, SocketRecv as _, SocketSend as _, ZmqMessage};
 
 use crate::engine_core::{EngineInput, EngineOutput, UtilityRequestSpec};

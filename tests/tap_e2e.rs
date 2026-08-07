@@ -30,9 +30,7 @@ use tokio_util::sync::CancellationToken;
 use vllm_vcr::trace::{TraceFinishReason, TraceRecord, read_trace};
 use vllm_vcr::{Opt, run};
 
-use vllm_engine_core_client::protocol::{
-    EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams,
-};
+use sim_protocol::vllm::{EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams};
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 
 const TIMEOUT: Duration = Duration::from_secs(15);

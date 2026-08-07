@@ -12,7 +12,7 @@
 //! succeeds, the request path is sound and the blocker lives upstream of the tap
 //! (frontend mm-preprocessing stall / DP handshake wedge), not in serde.
 
-use vllm_engine_core_client::protocol::{EngineCoreRequest, decode_msgpack};
+use sim_protocol::vllm::{EngineCoreRequest, decode_msgpack};
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     let hex = hex.trim();

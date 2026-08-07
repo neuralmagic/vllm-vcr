@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::StreamExt;
+use sim_protocol::vllm::{EngineCoreRequest, EngineCoreSamplingParams};
 use sim_trace::trace::read_trace_file;
 use tokio_util::sync::CancellationToken;
-use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 use vllm_vcr::{Opt, run};
 
