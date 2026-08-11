@@ -32,6 +32,10 @@ tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllmnightly"
 # vllm-openai builds pinned by digest; that digest is the ground truth for which
 # vLLM a golden measures.
 
+[lines."v0.27.1"]
+engine_image = "docker.io/vllm/vllm-openai:v0.27.1@sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c"
+tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.27"
+
 [lines."v0.26.0"]
 engine_image = "docker.io/vllm/vllm-openai:v0.26.0@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52"
 tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.26"
@@ -128,6 +132,33 @@ max_model_len = 32768
 # Three per line: two prefix-cached multiturn seeds plus one nocache multiturn.
 # Multi-seed because a lone capture is an anomaly waiting to happen (3 of ~10
 # multiturn captures were anomalous when this was last measured).
+
+[[capture]]
+name = "v027-qwen3-8b-mt-s7"
+model = "Qwen/Qwen3-8B"
+vllm_tag = "v0.27.1"
+scenario = "baseline"
+phases = "multiturn"
+mt_seed = "7"
+workload = "multiturn-s7"
+
+[[capture]]
+name = "v027-qwen3-8b-mt-s13"
+model = "Qwen/Qwen3-8B"
+vllm_tag = "v0.27.1"
+scenario = "baseline"
+phases = "multiturn"
+mt_seed = "13"
+workload = "multiturn-s13"
+
+[[capture]]
+name = "v027-qwen3-8b-nocache-s7"
+model = "Qwen/Qwen3-8B"
+vllm_tag = "v0.27.1"
+scenario = "nocache"
+phases = "multiturn"
+mt_seed = "7"
+workload = "multiturn-nocache-s7"
 
 [[capture]]
 name = "v026-qwen3-8b-mt-s7"

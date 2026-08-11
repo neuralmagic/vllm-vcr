@@ -129,7 +129,7 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         max_stable: usize,
     },
-    /// Emit one `[[golden]]` TOML entry for a captured nightly trace.
+    /// Emit one `[[golden]]` TOML entry for a captured trace.
     NightlyGoldenEntry {
         /// Uncompressed trace JSONL path.
         #[arg(long)]
@@ -143,8 +143,11 @@ enum Command {
         /// Human-readable workload label.
         #[arg(long)]
         workload: String,
+        /// compat.toml line the golden validates.
+        #[arg(long, default_value = "nightly")]
+        line: String,
     },
-    /// Replace the generated nightly-goldens block in conformance/manifest.toml.
+    /// Replace a line's generated goldens block in conformance/manifest.toml.
     SetNightlyGoldens {
         /// TOML file containing generated `[[golden]]` entries.
         #[arg(long)]
@@ -152,6 +155,9 @@ enum Command {
         /// Manifest to update.
         #[arg(long, default_value = MANIFEST_TOML)]
         manifest: PathBuf,
+        /// compat.toml line whose generated block is replaced.
+        #[arg(long, default_value = "nightly")]
+        line: String,
     },
     /// Write a kubeconfig that authenticates through GitHub Actions OIDC.
     GithubOidcKubeconfig {
@@ -249,11 +255,13 @@ fn main() -> Result<()> {
             archive,
             bucket_path,
             workload,
-        } => nightly_golden_entry(&trace, &archive, &bucket_path, &workload),
+            line,
+        } => nightly_golden_entry(&trace, &archive, &bucket_path, &workload, &line),
         Command::SetNightlyGoldens {
             entries_file,
             manifest,
-        } => set_nightly_goldens(&entries_file, &manifest),
+            line,
+        } => set_nightly_goldens(&entries_file, &manifest, &line),
         Command::GithubOidcKubeconfig {
             cluster_url,
             plugin_path,
@@ -563,6 +571,7 @@ fn nightly_golden_entry(
     archive: &Path,
     bucket_path: &str,
     workload: &str,
+    line: &str,
 ) -> Result<()> {
     let meta = read_trace_meta(trace)?;
     let config_hash = meta
@@ -573,7 +582,7 @@ fn nightly_golden_entry(
 
     println!();
     println!("[[golden]]");
-    println!("line = \"nightly\"");
+    println!("line = {}", serde_json::to_string(line)?);
     println!("bucket_path = {}", serde_json::to_string(bucket_path)?);
     println!("sha256 = \"{sha256}\"");
     println!("config_hash = \"{config_hash}\"");
@@ -582,12 +591,12 @@ fn nightly_golden_entry(
     Ok(())
 }
 
-fn set_nightly_goldens(entries_file: &Path, manifest: &Path) -> Result<()> {
+fn set_nightly_goldens(entries_file: &Path, manifest: &Path, line: &str) -> Result<()> {
     let entries = std::fs::read_to_string(entries_file)
         .with_context(|| format!("reading {}", entries_file.display()))?;
     let mut text = std::fs::read_to_string(manifest)
         .with_context(|| format!("reading {}", manifest.display()))?;
-    text = replace_nightly_goldens_block(&text, &entries);
+    text = replace_goldens_block(&text, &entries, line);
     std::fs::write(manifest, text).with_context(|| format!("writing {}", manifest.display()))?;
     Ok(())
 }
@@ -746,15 +755,19 @@ fn sha256_hex(path: &Path) -> Result<String> {
         .collect())
 }
 
-fn replace_nightly_goldens_block(manifest: &str, entries: &str) -> String {
-    const START: &str = "# BEGIN NIGHTLY GOLDENS";
-    const END: &str = "# END NIGHTLY GOLDENS";
+/// Replace (or append) one line's generated goldens block, bounded by
+/// `# BEGIN <LINE> GOLDENS` / `# END <LINE> GOLDENS` markers. The nightly
+/// block's markers predate the per-line form and read `NIGHTLY GOLDENS`.
+fn replace_goldens_block(manifest: &str, entries: &str, line: &str) -> String {
+    let label = line.to_uppercase();
+    let start = format!("# BEGIN {label} GOLDENS");
+    let end = format!("# END {label} GOLDENS");
     let entries = entries.trim();
-    let block = format!("{START}\n{entries}\n{END}");
+    let block = format!("{start}\n{entries}\n{end}");
 
-    if let Some(start_idx) = manifest.find(START) {
-        if let Some(end_rel) = manifest[start_idx..].find(END) {
-            let end_idx = start_idx + end_rel + END.len();
+    if let Some(start_idx) = manifest.find(&start) {
+        if let Some(end_rel) = manifest[start_idx..].find(&end) {
+            let end_idx = start_idx + end_rel + end.len();
             let before = manifest[..start_idx].trim_end();
             let after = manifest[end_idx..].trim_start_matches('\n');
             return format!("{before}\n\n{block}\n{after}");
@@ -1189,15 +1202,15 @@ default = true
     }
 
     #[test]
-    fn nightly_golden_block_is_appended_when_missing() {
-        let out = replace_nightly_goldens_block("header\n", "[[golden]]\nline = \"nightly\"\n");
+    fn golden_block_is_appended_when_missing() {
+        let out = replace_goldens_block("header\n", "[[golden]]\nline = \"nightly\"\n", "nightly");
         assert!(out.contains("# BEGIN NIGHTLY GOLDENS"));
         assert!(out.contains("[[golden]]"));
         assert!(out.contains("# END NIGHTLY GOLDENS"));
     }
 
     #[test]
-    fn nightly_golden_block_replaces_existing_block() {
+    fn golden_block_replaces_existing_block() {
         let existing = "\
 header
 
@@ -1207,11 +1220,27 @@ stale-entry
 
 tail
 ";
-        let out = replace_nightly_goldens_block(existing, "new");
+        let out = replace_goldens_block(existing, "new", "nightly");
         assert!(out.contains("header"));
         assert!(out.contains("tail"));
         assert!(out.contains("new"));
         assert!(!out.contains("stale-entry"));
+    }
+
+    #[test]
+    fn golden_blocks_are_scoped_per_line() {
+        let existing = "\
+header
+
+# BEGIN NIGHTLY GOLDENS
+nightly-entry
+# END NIGHTLY GOLDENS
+";
+        let out = replace_goldens_block(existing, "v027-entry", "0.27");
+        assert!(out.contains("nightly-entry"));
+        assert!(out.contains("# BEGIN 0.27 GOLDENS"));
+        assert!(out.contains("v027-entry"));
+        assert!(out.contains("# END 0.27 GOLDENS"));
     }
 
     #[test]

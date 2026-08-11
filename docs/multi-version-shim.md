@@ -168,6 +168,4 @@ backported for the tap's capture-time decode). Both lines left the window in the
 
 ## Follow-ups
 
-- **`cargo xtask nightly-golden-entry` hardcodes `line = "nightly"`.** It was written
-  for the canary, so registering a release line's golden means hand-correcting the
-  emitted entry. Give it a `--line` flag.
+None currently.

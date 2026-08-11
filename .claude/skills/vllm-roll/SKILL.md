@@ -148,7 +148,7 @@ Capturing needs the cluster, not a dev box:
 just capture-up && just capture-status    # wait for "forwarding frames"
 just capture-run                          # drive load, fetch trace + reports
 just capture-down                         # release the GPU
-cargo xtask nightly-golden-entry --trace <trace.jsonl> --archive <trace.jsonl.gz> \
+cargo xtask nightly-golden-entry --line <line> --trace <trace.jsonl> --archive <trace.jsonl.gz> \
   --bucket-path conformance/<tag>/<gpu>/<model>/<workload>.jsonl.gz --workload <workload>
 ```
 
