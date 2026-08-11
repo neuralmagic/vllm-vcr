@@ -1,7 +1,8 @@
 name: Release
 
 # Publish the standalone `vllm-vcr` binary (record/play/inspect) as GitHub Release
-# assets, one per supported vLLM line x platform. These are the lightweight path for
+# assets, one per stable-window vLLM line x platform (the nightly/rc trackers are
+# CI drift detectors, not releasable targets). These are the lightweight path for
 # users who just want to replay a trace, run the mock engine, or run the tap to
 # capture, without pulling the multi-GB container (which carries UCX + libnixl + vllm-rs
 # for the full P/D + capture topology). The binary is pure Rust (no NIXL in the default
