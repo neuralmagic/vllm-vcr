@@ -155,6 +155,11 @@ jobs:
       - name: Install cosign
         if: ${{ github.ref_type == 'tag' }}
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          # cosign v3 sign-blob writes a sigstore bundle and errors on the detached
+          # --output-signature/--output-certificate flow the README documents; stay
+          # on the v2 line until the verify docs move to bundles.
+          cosign-release: 'v2.6.5'
 
       - name: Sign release blobs (cosign keyless)
         if: ${{ github.ref_type == 'tag' }}
