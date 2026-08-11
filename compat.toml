@@ -42,7 +42,7 @@
 # See .github/workflows/nightly-canary.yml.
 line = "nightly"
 tag = "nightly"
-protocol_rev = "62a86318de3655f970baf7c2ff89c81a72c1a1b3"
+protocol_rev = "0f0cb918b7c6d08aabb86ec4eff4bae05f6736d9"
 fidelity_validated = false
 
 [[vllm]]
@@ -56,31 +56,33 @@ protocol_rev = "53f6dd5c6f7725df4e5ac9441569860023100870"
 fidelity_validated = false
 
 [[vllm]]
-# N (head). The 0.25 protocol restructure is upstream here: the engine-core
-# output envelope is the `protocol::output::EngineCoreOutputs` enum and the flat
-# wire struct is private, so the engine builds its envelope through
-# `sim_protocol::vllm` (see docs/multi-version-shim.md). 0.26 also adds
-# `EngineCoreOutput.ec_transfer_params`.
+# N (head). 0.27 grew the handshake: `EngineCoreReadyResponse` added the
+# parallel-config sizes, the scheduler caps, `instance_id`, and an optional
+# `kv_events_config` (all required by 0.27 frontends). The sim's map-encoded
+# `SimReadyResponse` superset always emits them; older frontends skip the keys
+# they don't know, so no capability cfg was needed.
+line = "0.27"
+tag = "v0.27.1"
+protocol_rev = "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
+fidelity_validated = false
+default = true
+
+[[vllm]]
+# N-1. Same protocol layout as 0.27, minus the 0.27 handshake fields (which the
+# sim emits anyway, see above).
 line = "0.26"
 tag = "v0.26.0"
 protocol_rev = "568afb3a13806beb53bb2e6bd518269357b237c0"
 fidelity_validated = true
-default = true
 
 [[vllm]]
-# N-1. Same protocol layout as 0.26 (submodule paths + the outputs enum), minus
-# `ec_transfer_params`.
+# N-2. The 0.25 protocol restructure landed here: types moved into
+# `protocol::{request, output, sampling}` and `EngineCoreOutputs` became the
+# classified enum. Every line in the window shares that layout now, so the
+# outputs shim in `sim_protocol::vllm` is unconditional. This line lacks
+# `EngineCoreOutput.ec_transfer_params` and `PrefillStats.num_cache_creation_tokens`
+# (the `vllm_cache_creation_tokens` cfg, off here).
 line = "0.25"
 tag = "v0.25.1"
 protocol_rev = "752a3a504485790a2e8491cacbb35c137339ad34"
-fidelity_validated = true
-
-[[vllm]]
-# N-2. The last line before the 0.25 restructure: protocol types are re-exported
-# from `protocol` directly and `EngineCoreOutputs` is still the flat wire struct.
-# The `vllm_outputs_enum` cfg is off here, which is the whole reason the outputs
-# shim exists.
-line = "0.24"
-tag = "v0.24.0"
-protocol_rev = "ee0da84ab9e04ac7610e28580af62c365e898389"
 fidelity_validated = true

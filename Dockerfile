@@ -14,12 +14,12 @@ ARG NIXL_REF=41685d39
 # lines (the serde-defaults backport), else upstream vllm.git at the line's protocol_rev.
 # CI always overrides this; manual builds should pass --build-arg VLLM_REF=<sha from compat.toml>.
 ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG VLLM_REF=568afb3a13806beb53bb2e6bd518269357b237c0
+ARG VLLM_REF=6e448d0ea9bf3d88d898b65449ca6dc2aec170ac
 
 # Which compat.toml line this image speaks. Stamped into build.rs so it emits the right
 # capability cfgs (e.g. vllm_outputs_enum) and advertised vllm_version; without it build.rs
 # falls back to the compat.toml default for every line. docker.yml sets it to the line tag.
-ARG VLLM_TARGET_VERSION=v0.26.0
+ARG VLLM_TARGET_VERSION=v0.27.1
 
 # ---------------------------------------------------------------------------------------
 FROM fedora:${FEDORA_VERSION} AS builder

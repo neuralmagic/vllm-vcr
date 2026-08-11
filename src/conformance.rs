@@ -131,6 +131,14 @@ mod tests {
             data_parallel_size: 1,
             kv_cache_size_tokens: Some(16000),
             kv_cache_max_concurrency: Some(0.5),
+            tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
+            decode_context_parallel_size: 1,
+            data_parallel_rank: 0,
+            max_num_seqs: 256,
+            max_num_batched_tokens: 8192,
+            instance_id: "sim-test".to_string(),
+            kv_events_config: None,
         }
     }
 

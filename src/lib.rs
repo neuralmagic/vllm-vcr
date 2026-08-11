@@ -13,12 +13,12 @@ use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use sim_protocol::mock_engine::{DEFAULT_MOCK_MAX_MODEL_LEN, MockEngineSockets, default_dtype};
 use sim_protocol::vllm::EngineCoreFinishReason;
+use sim_protocol::vllm::engine_id_from_index;
 use sim_s3::TraceUri;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
-use vllm_engine_core_client::EngineId;
 
 pub mod blockpool;
 pub mod calibrate;
@@ -411,17 +411,23 @@ impl Opt {
     /// Build the KV-cache event publisher config for one engine. The endpoint port and the
     /// topic's pod id are offset by `engine_index` so several engines in one process publish
     /// on distinct sockets/streams.
+    /// Per-engine instance name: the engine id, suffixed with the engine index
+    /// when several engines run in one process. Names the KV-event topic's pod
+    /// id and the ready response's `instance_id`.
+    pub fn pod_id(&self, engine_index: u32) -> String {
+        if engine_index == 0 {
+            self.engine_id.clone()
+        } else {
+            format!("{}-{engine_index}", self.engine_id)
+        }
+    }
+
     pub fn kv_events_config(&self, engine_index: u32) -> kvevents::KvEventsConfig {
         let endpoint = offset_endpoint_port(&self.kv_events_endpoint, engine_index);
         let topic = if !self.kv_events_topic.is_empty() {
             self.kv_events_topic.clone()
         } else {
-            let pod = if engine_index == 0 {
-                self.engine_id.clone()
-            } else {
-                format!("{}-{engine_index}", self.engine_id)
-            };
-            format!("kv@{pod}@{}", self.model_name)
+            format!("kv@{}@{}", self.pod_id(engine_index), self.model_name)
         };
         kvevents::KvEventsConfig {
             enabled: self.enable_kv_cache_events,
@@ -673,6 +679,7 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
         DEFAULT_MOCK_MAX_MODEL_LEN
     };
     let kv_cache_size_tokens = opt.kv_cache_size * opt.tokens_per_block as u64;
+    let kv_events = opt.kv_events_config(engine_index);
     let ready_payload = frontend_connect::SimReadyResponse {
         max_model_len,
         num_gpu_blocks: opt.kv_cache_size,
@@ -685,13 +692,23 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
         data_parallel_size: opt.engine_count as u64,
         kv_cache_size_tokens: Some(kv_cache_size_tokens),
         kv_cache_max_concurrency: Some(kv_cache_size_tokens as f64 / max_model_len as f64),
+        tensor_parallel_size: 1,
+        pipeline_parallel_size: 1,
+        decode_context_parallel_size: 1,
+        data_parallel_rank: engine_index as u64,
+        max_num_seqs: opt.max_num_seqs,
+        max_num_batched_tokens: opt.max_num_batched_tokens,
+        instance_id: opt.pod_id(engine_index),
+        kv_events_config: kv_events
+            .enabled
+            .then(|| frontend_connect::SimKvEventsConfig::zmq(kv_events.endpoint, kv_events.topic)),
     }
     .encode()?;
 
     // A shutdown signal during the handshake means there is nothing to drain; just leave.
     let connect = frontend_connect::connect_to_frontend_raw(
         &opt.handshake_address,
-        EngineId::from_engine_index(engine_index),
+        engine_id_from_index(engine_index)?,
         false,
         true,
         &ready_payload,

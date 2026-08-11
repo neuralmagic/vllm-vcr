@@ -46,8 +46,8 @@ block first, so it's idempotent. After the rewrite the rev no longer matches
 older-line build must too:
 
 ```sh
-cargo xtask pin-vllm 0.24
-VLLM_TARGET_VERSION=v0.24.0 cargo build --workspace   # no --locked
+cargo xtask pin-vllm 0.25
+VLLM_TARGET_VERSION=v0.25.1 cargo build --workspace   # no --locked
 ```
 
 ## Capability cfgs
@@ -57,14 +57,17 @@ field whose *type* differs per line), the engine gates on a discrete capability,
 not a version number. `build.rs` maps the target line to cfgs and declares them
 with `cargo::rustc-check-cfg`:
 
-- `vllm_outputs_enum` — the 0.25 protocol restructure. The types moved out of
-  `protocol` into `protocol::{request, output, sampling}` (mod.rs stopped
-  re-exporting them), and `EngineCoreOutputs` was repurposed from the flat wire
-  struct into the classified enum 0.24 called `ClassifiedEngineCoreOutputs`, with
-  the flat struct made private. Both landed in the same release, so one cfg gates
-  both. On 0.25+.
 - `vllm_cache_creation_tokens` — `PrefillStats` gained
   `num_cache_creation_tokens`. On 0.26+.
+- `vllm_engine_id_u16` — `EngineId::from_engine_index` narrowed its parameter
+  from u32 to u16 on vLLM main (the wire encoding was always two-byte
+  little-endian). Gates `sim_protocol::vllm::engine_id_from_index`. On 0.28+.
+
+`vllm_outputs_enum` (the 0.25 protocol restructure: types moved into
+`protocol::{request, output, sampling}` and `EngineCoreOutputs` became the
+classified enum over a private flat struct) was retired when 0.24 left the
+window; every supported line now shares that layout and the outputs shim is
+unconditional.
 
 The capability list itself lives in `sim_compat::capabilities`, not in a build
 script: cfgs from `build.rs` only reach the crate that owns it, so both the root
@@ -86,10 +89,12 @@ deserialize the same wire on every line (serde ignores unknown fields).
 | Handshake harness types | `mock_engine` module absent before 0.23 (we never used its behavior, only structs) | `sim-protocol::mock_engine` owns `MockEngineSockets`/`MockEngineDataSockets`/`MockCoordinatorSockets` + `DEFAULT_MOCK_MAX_MODEL_LEN` + `default_dtype()` |
 | Request-type frame | `EngineCoreRequestType::from_frame` is head-only | `sim-protocol::wire::request_type_from_frame` (1-byte decode) |
 | Lora request | wire form is a positional array whose trailing fields differ per line | `LoraSpec{lora_int_id,lora_name}` (own, reads positions 0/1) for the add_lora call + registry |
-| Protocol type paths | `protocol::X` (<=0.24) vs `protocol::{request,output,sampling}::X` (0.25+) | `sim-protocol::vllm` re-exports the whole surface from the right path per line; every crate imports from there, never from `vllm_engine_core_client::protocol` directly |
-| Output envelope | flat public struct (<=0.24) vs classified enum over a private wire struct (0.25+) | `sim-protocol::vllm::Envelope` alias + `request_batch()`/`utility()` constructors and `request_outputs()`/`scheduler_stats()`/`utility_output()` accessors. The wire is the same 8-field tuple on both; only the Rust API moved |
+| Protocol type paths | none since 0.24 rolled off; every line uses `protocol::{request,output,sampling}` | `sim-protocol::vllm` re-exports the whole surface; every crate imports from there, never from `vllm_engine_core_client::protocol` directly, so the next path move lands in one file |
+| Output envelope | the classified enum serializes through a private flat struct, so it cannot be built inline | `sim-protocol::vllm::Envelope` alias + `request_batch()`/`utility()` constructors and `request_outputs()`/`scheduler_stats()`/`utility_output()` accessors |
+| Engine identity | `EngineId::from_engine_index` takes u32 (<=0.27) vs u16 (main) | `sim-protocol::vllm::engine_id_from_index(u32)`, `vllm_engine_id_u16`-gated; validates the two-byte wire range on every line |
 | Prefill stats | `num_cache_creation_tokens` added in 0.26 | `..Default::default()` plus a `vllm_cache_creation_tokens`-gated assignment in `engine::prefill_stats` |
-| Ready response | `EngineCoreReadyResponse.vllm_version` absent before 0.23 | tap decodes its own tolerant `CapturedReadyInfo{vllm_version:Option<String>}` |
+| Ready response (decode) | `EngineCoreReadyResponse.vllm_version` absent before 0.23 | tap decodes its own tolerant `CapturedReadyInfo{vllm_version:Option<String>}` |
+| Ready response (emit) | 0.27 frontends require the parallel-config sizes, scheduler caps, `instance_id`, and `kv_events_config` | sim-owned map-encoded `SimReadyResponse` superset: every field any line requires is always emitted, older frontends skip unknown keys, no cfg |
 | Utility request | `EngineCoreUtilityRequest` derives `Deserialize` only on 0.23+ (crate was client-only) | `engine_core::UtilityRequestSpec` (`Deserialize_tuple`, matches the wire tuple) |
 
 The wire types still come from the crate (the matrix's whole point: catch drift at
@@ -132,18 +137,21 @@ upstream, so the repo has no external-fork dependency.
   HEAD-client protocol e2e suite, and runs the conformance runner.
 - **rc** (`v0.26.1rc0`): the newest release candidate ahead of the stable window,
   bumped (tag + rev) by the release watcher. Never `default`, never fidelity-validated.
-- **0.26** (`v0.26.0`, default): builds against upstream `568afb3a`. Carries the 0.25
-  restructure plus `PrefillStats.num_cache_creation_tokens`.
-- **0.25** (`v0.25.1`): builds against upstream `752a3a50`. Same protocol layout as
-  0.26 minus the prefill-stats field.
-- **0.24** (`v0.24.0`): builds against upstream `ee0da84a`. The last line before the
-  restructure, and the reason `vllm_outputs_enum` exists: it is the only line in the
-  window where the cfg is off, so it is what keeps that branch honest.
+- **0.27** (`v0.27.1`, default): builds against upstream `6e448d0e`. Grew the
+  handshake: 0.27 frontends require the parallel-config sizes, the scheduler
+  caps, `instance_id`, and `kv_events_config` in the ready response (absorbed by
+  the `SimReadyResponse` superset, no cfg).
+- **0.26** (`v0.26.0`): builds against upstream `568afb3a`. Carries
+  `PrefillStats.num_cache_creation_tokens`.
+- **0.25** (`v0.25.1`): builds against upstream `752a3a50`. The oldest line and
+  the only one without `vllm_cache_creation_tokens`, so it is what keeps that
+  branch honest.
 
-Every line is `fidelity_validated = true`: each carries three goldens (two
+0.26 and 0.25 are `fidelity_validated = true`: each carries three goldens (two
 prefix-cached multiturn seeds plus one nocache multiturn, Qwen3-8B on H200),
 captured against that line's released engine image and replaying byte-identically.
-See `conformance.md` for the capture runbook.
+0.27 entered the window as `fidelity_validated = false` and is promoted once its
+goldens are captured and replaying. See `conformance.md` for the capture runbook.
 
 ### Fork patches
 
