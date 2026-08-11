@@ -56,6 +56,17 @@ pub struct VllmLine {
     pub default: bool,
 }
 
+impl VllmLine {
+    /// Whether this is a `nightly`/`rc` tracker rather than a stable release
+    /// line. Trackers ride ahead of the window to catch wire drift in CI; they
+    /// are never `default`, never fidelity-validated, and never released as
+    /// binaries (a "nightly" or "rc" asset frozen into a versioned release
+    /// names a moving target).
+    pub fn is_tracker(&self) -> bool {
+        matches!(self.line.as_str(), "nightly" | "rc")
+    }
+}
+
 /// The parsed `compat.toml` support window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompatManifest {

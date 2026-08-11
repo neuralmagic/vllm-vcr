@@ -309,9 +309,11 @@ fn docker_matrix() -> Result<()> {
 
 fn release_matrix() -> Result<()> {
     let compat = CompatManifest::load(COMPAT_TOML)?;
+    // Stable window only: tracker binaries would name moving targets.
     let rows: Vec<ReleaseRow> = compat
         .lines
         .iter()
+        .filter(|v| !v.is_tracker())
         .flat_map(|v| {
             PLATFORMS.iter().map(move |p| ReleaseRow {
                 line: v.line.clone(),
