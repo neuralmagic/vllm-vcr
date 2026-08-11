@@ -49,6 +49,55 @@ pub struct SimReadyResponse {
     /// Max request concurrency the KV cache supports (0.24+):
     /// `kv_cache_size_tokens / max_model_len`.
     pub kv_cache_max_concurrency: Option<f64>,
+    /// Tensor-parallel size from the parallel config. Required since 0.27.
+    pub tensor_parallel_size: u64,
+    /// Pipeline-parallel size from the parallel config. Required since 0.27.
+    pub pipeline_parallel_size: u64,
+    /// Decode-context-parallel size from the parallel config. Required since 0.27.
+    pub decode_context_parallel_size: u64,
+    /// This engine's data-parallel rank. Required since 0.27.
+    pub data_parallel_rank: u64,
+    /// Scheduler cap on concurrently running sequences. Required since 0.27.
+    pub max_num_seqs: u64,
+    /// Scheduler cap on batched tokens per step. Required since 0.27.
+    pub max_num_batched_tokens: u64,
+    /// Unique identifier for this server instance. Required since 0.27.
+    pub instance_id: String,
+    /// KV-event publisher configuration (0.27+). Optional on every line's
+    /// decoder; None when the sim isn't publishing KV events.
+    pub kv_events_config: Option<SimKvEventsConfig>,
+}
+
+/// KV-event publisher configuration in the ready response, matching python
+/// vLLM's `KVEventsConfig` field-for-field.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimKvEventsConfig {
+    pub enable_kv_cache_events: bool,
+    /// `"zmq"` or `"null"`; the sim only publishes over ZMQ.
+    pub publisher: String,
+    pub endpoint: String,
+    pub replay_endpoint: Option<String>,
+    pub buffer_steps: u32,
+    pub hwm: u32,
+    pub max_queue_size: u32,
+    pub topic: String,
+}
+
+impl SimKvEventsConfig {
+    /// Advertise the sim's ZMQ publisher with python vLLM's defaults for the
+    /// buffering knobs the sim does not model.
+    pub fn zmq(endpoint: String, topic: String) -> Self {
+        Self {
+            enable_kv_cache_events: true,
+            publisher: "zmq".to_string(),
+            endpoint,
+            replay_endpoint: None,
+            buffer_steps: 10_000,
+            hwm: 100_000,
+            max_queue_size: 100_000,
+            topic,
+        }
+    }
 }
 
 impl SimReadyResponse {
@@ -228,7 +277,8 @@ mod tests {
     /// structs (msgspec dataclass in python, serde in the Rust client); every
     /// key any supported line requires must be present in the msgpack map.
     /// 0.23 requires the first six; 0.24 added world_size/data_parallel_size
-    /// (required) and the two kv_cache_* fields.
+    /// (required) and the two kv_cache_* fields; 0.27 added the parallel-config
+    /// sizes, the scheduler caps, instance_id, and kv_events_config.
     #[test]
     fn sim_ready_response_carries_all_required_fields() {
         let payload = SimReadyResponse {
@@ -242,6 +292,14 @@ mod tests {
             data_parallel_size: 1,
             kv_cache_size_tokens: Some(16000),
             kv_cache_max_concurrency: Some(0.5),
+            tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
+            decode_context_parallel_size: 1,
+            data_parallel_rank: 0,
+            max_num_seqs: 256,
+            max_num_batched_tokens: 8192,
+            instance_id: "sim-test".to_string(),
+            kv_events_config: None,
         }
         .encode()
         .expect("encode");
@@ -259,6 +317,14 @@ mod tests {
             "data_parallel_size",
             "kv_cache_size_tokens",
             "kv_cache_max_concurrency",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "decode_context_parallel_size",
+            "data_parallel_rank",
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "instance_id",
+            "kv_events_config",
         ] {
             assert!(keys.contains(&required), "missing field {required}");
         }

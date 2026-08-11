@@ -17,7 +17,7 @@ use crate::{CompatManifest, minor_line};
 
 /// Every capability cfg this workspace can emit, declared to Rust's check-cfg so
 /// a typo in a `#[cfg(...)]` warns instead of silently compiling the other arm.
-const ALL: &[&str] = &["vllm_outputs_enum", "vllm_cache_creation_tokens"];
+const ALL: &[&str] = &["vllm_cache_creation_tokens", "vllm_engine_id_u16"];
 
 /// Resolve the vLLM tag this build targets.
 ///
@@ -49,21 +49,18 @@ pub fn emit(tag: &str) {
         println!("cargo::rustc-check-cfg=cfg({name})");
     }
 
-    // `vllm_outputs_enum`: the 0.25 protocol restructure. The protocol types moved
-    // out of `protocol` into `protocol::{request, output, sampling}` submodules
-    // (mod.rs stopped re-exporting them), and `EngineCoreOutputs` was repurposed
-    // from the flat wire struct into the classified enum that 0.24 called
-    // `ClassifiedEngineCoreOutputs` — the flat struct is now private. Both landed
-    // together, so one cfg gates both. See `sim_protocol::outputs`.
-    if line_at_least(tag, 0, 25) {
-        println!("cargo::rustc-cfg=vllm_outputs_enum");
-    }
-
     // `vllm_cache_creation_tokens`: `PrefillStats` gained
     // `num_cache_creation_tokens` (prompt tokens this prefill newly admits into
     // the local prefix cache) in 0.26.
     if line_at_least(tag, 0, 26) {
         println!("cargo::rustc-cfg=vllm_cache_creation_tokens");
+    }
+
+    // `vllm_engine_id_u16`: `EngineId::from_engine_index` narrowed its parameter
+    // from u32 to u16 on vLLM main (the wire encoding was always two-byte
+    // little-endian). Gates `sim_protocol::vllm::engine_id_from_index`.
+    if line_at_least(tag, 0, 28) {
+        println!("cargo::rustc-cfg=vllm_engine_id_u16");
     }
 }
 

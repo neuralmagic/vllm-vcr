@@ -59,22 +59,22 @@ protocol_rev = "53f6dd5c..."
 fidelity_validated = false
 
 [[vllm]]
-line = "0.26"                 # current default line
-tag  = "v0.26.0"              # vLLM release tag; also the e2e frontend version
-protocol_rev = "568afb3a..."  # rev for vllm-engine-core-client at this line
+line = "0.27"                 # current default line
+tag  = "v0.27.1"              # vLLM release tag; also the e2e frontend version
+protocol_rev = "6e448d0e..."  # rev for vllm-engine-core-client at this line
 fidelity_validated = false    # flips true once replay gates validate goldens
 default = true                # what :latest / unsuffixed builds point at
 
 [[vllm]]
-line = "0.25"                 # N-1 supported release line
-tag  = "v0.25.1"
-protocol_rev = "752a3a50..."
+line = "0.26"                 # N-1 supported release line
+tag  = "v0.26.0"
+protocol_rev = "568afb3a..."
 fidelity_validated = false
 
 [[vllm]]
-line = "0.24"                 # N-2 supported release line
-tag  = "v0.24.0"
-protocol_rev = "ee0da84a..."
+line = "0.25"                 # N-2 supported release line
+tag  = "v0.25.1"
+protocol_rev = "752a3a50..."
 fidelity_validated = false
 ```
 
@@ -96,9 +96,9 @@ Conflating them is the classic mistake.
 
 Image tags:
 
-- `vllm-vcr:0.2.0-vllm0.26` — immutable, the real artifact (sim version ×
+- `vllm-vcr:0.2.1-vllm0.27` — immutable, the real artifact (sim version ×
   vLLM line).
-- `vllm-vcr:vllm0.26` — floating, latest sim for that line.
+- `vllm-vcr:vllm0.27` — floating, latest sim for that line.
 - `vllm-vcr:latest` — sim-head × the `default = true` line.
 
 ## CI matrix mechanics

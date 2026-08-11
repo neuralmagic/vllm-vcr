@@ -36,6 +36,7 @@ use std::io::Write;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use sim_protocol::mock_engine::MockEngineSockets;
+use sim_protocol::vllm::engine_id_from_index;
 use sim_protocol::vllm::{
     EngineCoreFinishReason, EngineCoreRequest, EngineCoreRequestType, decode_engine_core_outputs,
     decode_msgpack, encode_msgpack, request_outputs, scheduler_stats,
@@ -43,7 +44,6 @@ use sim_protocol::vllm::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::protocol::handshake::{
     HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
 };
@@ -429,7 +429,7 @@ async fn downstream_connect(
 ) -> Result<MockEngineSockets> {
     sim_protocol::frontend_connect::connect_to_frontend_raw(
         frontend_handshake,
-        EngineId::from_engine_index(0),
+        engine_id_from_index(0)?,
         ready_message.local.unwrap_or(false),
         ready_message.headless.unwrap_or(true),
         ready_response_payload,
@@ -503,7 +503,7 @@ pub async fn run_tap<W: Write, S: Write>(
     let capture_start = Instant::now();
     // The engine registered with the engine_index 0 identity; the upstream
     // ROUTER socket needs it as the first frame of every forwarded request.
-    let engine_identity = EngineId::from_engine_index(0).to_frame();
+    let engine_identity = engine_id_from_index(0)?.to_frame();
 
     // Drain the two RECEIVE sockets in dedicated tasks rather than awaiting their
     // `recv()` directly in the `select!` below.

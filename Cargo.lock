@@ -1681,7 +1681,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1809,7 +1809,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2372,7 +2372,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2950,7 +2950,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3508,7 +3508,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.43",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -3546,9 +3546,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3865,7 +3865,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5120,7 +5120,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=568afb3a13806beb53bb2e6bd518269357b237c0#568afb3a13806beb53bb2e6bd518269357b237c0"
+source = "git+https://github.com/vllm-project/vllm.git?rev=6e448d0ea9bf3d88d898b65449ca6dc2aec170ac#6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -5154,7 +5154,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=568afb3a13806beb53bb2e6bd518269357b237c0#568afb3a13806beb53bb2e6bd518269357b237c0"
+source = "git+https://github.com/vllm-project/vllm.git?rev=6e448d0ea9bf3d88d898b65449ca6dc2aec170ac#6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
 dependencies = [
  "itertools 0.14.0",
  "prometheus-client",
