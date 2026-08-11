@@ -44,8 +44,10 @@ sha2 = "0.10.9"
 toml = "0.9.8"
 # Edits Cargo.toml in `cargo xtask pin-vllm` while preserving formatting/comments.
 toml_edit = "0.25.12"
-# HuggingFace tokenizers for dataset-driven token generation
-tokenizers = { version = "0.20", default-features = false, features = ["onig", "esaxx_fast"] }
+# HuggingFace tokenizers for dataset-driven token generation. fancy-regex instead of
+# onig/esaxx_fast: those pull C/C++ (onig_sys, esaxx.cpp) which breaks the static musl
+# release builds, and esaxx is only used for Unigram training, which we never do.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
