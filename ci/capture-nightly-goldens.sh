@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Submit nightly conformance capture jobs, upload their traces, and refresh the
-# generated nightly block in conformance/manifest.toml.
+# Submit conformance capture jobs, upload their traces, and refresh the
+# captured lines' generated blocks in conformance/manifest.toml. Targets may
+# span lines (nightly and release); each target's line, tag, and workload come
+# from models.toml + compat.toml.
 set -Eeuo pipefail
 
 : "${S3_BUCKET:?S3_BUCKET is required, e.g. llm-d-artifacts-783952637884}"
@@ -63,6 +65,15 @@ for target in targets:
 
 if missing:
     raise SystemExit(f"unknown capture target(s): {' '.join(missing)}")
+
+lines_by_tag = {v["tag"]: v["line"] for v in compat["vllm"]}
+for c in selected:
+    tag = c["vllm_tag"]
+    if tag not in lines_by_tag:
+        raise SystemExit(
+            f"capture {c['name']} pins vllm_tag {tag}, which matches no compat.toml "
+            f"line; goldens for an out-of-window line cannot gate anything"
+        )
 
 if any(c.get("vllm_tag") == "nightly" for c in selected):
     nightly = next(v for v in compat["vllm"] if v["line"] == "nightly")
@@ -173,14 +184,32 @@ wait_for_loadgen_done() {
     return 1
 }
 
-entry_file="${OUT_DIR}/nightly-manifest.toml"
-: > "${entry_file}"
+# Resolve a target's compat line, vllm_tag, and workload label from
+# models.toml + compat.toml. Workload defaults to the target name.
+target_metadata() {
+    python3 - "$1" <<'PY'
+import sys
+import tomllib
+
+target = sys.argv[1]
+with open("deploy/trace-capture/models.toml", "rb") as f:
+    models = tomllib.load(f)
+with open("compat.toml", "rb") as f:
+    compat = tomllib.load(f)
+
+capture = next(c for c in models["capture"] if c["name"] == target)
+tag = capture["vllm_tag"]
+line = next(v["line"] for v in compat["vllm"] if v["tag"] == tag)
+print(line, tag, capture.get("workload", target))
+PY
+}
 
 for target in ${TARGETS}; do
     job="trace-${target}"
     trace="${OUT_DIR}/${target}.jsonl"
     stats="${OUT_DIR}/${target}.step-stats.jsonl"
     gz="${trace}.gz"
+    read -r line_id vllm_tag workload <<<"$(target_metadata "${target}")"
 
     group_start "Capture ${target}"
     log "${target}: using Kubernetes Job ${job}"
@@ -214,18 +243,19 @@ for target in ${TARGETS}; do
     fi
     log "${target}: trace metadata model=${model} gpu=${gpu}"
 
-    key="conformance/nightly/${gpu}/${model}/${target}.jsonl.gz"
+    key="conformance/${vllm_tag}/${gpu}/${model}/${workload}.jsonl.gz"
     dest="s3://${S3_BUCKET}/${key}"
     log "${target}: uploading ${gz} -> ${dest}"
     aws s3 cp "${gz}" "${dest}"
     log "${target}: upload complete"
 
-    log "${target}: appending generated manifest entry"
+    log "${target}: appending generated manifest entry (line ${line_id})"
     cargo xtask nightly-golden-entry \
         --trace "${trace}" \
         --archive "${gz}" \
         --bucket-path "${key}" \
-        --workload "${target}" >> "${entry_file}"
+        --workload "${workload}" \
+        --line "${line_id}" >> "${OUT_DIR}/goldens-${line_id}.toml"
 
     kubectl exec -n "${NAMESPACE}" "job/${job}" -c loadgen -- touch /trace/fetched
     if kubectl wait -n "${NAMESPACE}" --for=condition=complete "job/${job}" --timeout=10m; then
@@ -237,9 +267,14 @@ for target in ${TARGETS}; do
 done
 
 group_start "Update conformance manifest"
-log "Updating ${MANIFEST} from ${entry_file}"
-cargo xtask set-nightly-goldens --entries-file "${entry_file}" --manifest "${MANIFEST}"
-
-log "Updated ${MANIFEST} with nightly golden entries"
-cat "${entry_file}"
+for entry_file in "${OUT_DIR}"/goldens-*.toml; do
+    line_id="$(basename "${entry_file}" .toml)"
+    line_id="${line_id#goldens-}"
+    log "Updating ${MANIFEST} line ${line_id} from ${entry_file}"
+    cargo xtask set-nightly-goldens \
+        --entries-file "${entry_file}" \
+        --manifest "${MANIFEST}" \
+        --line "${line_id}"
+    cat "${entry_file}"
+done
 group_end
