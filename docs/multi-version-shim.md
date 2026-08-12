@@ -147,11 +147,10 @@ upstream, so the repo has no external-fork dependency.
   the only one without `vllm_cache_creation_tokens`, so it is what keeps that
   branch honest.
 
-0.26 and 0.25 are `fidelity_validated = true`: each carries three goldens (two
+Every stable line is `fidelity_validated = true`: each carries three goldens (two
 prefix-cached multiturn seeds plus one nocache multiturn, Qwen3-8B on H200),
 captured against that line's released engine image and replaying byte-identically.
-0.27 entered the window as `fidelity_validated = false` and is promoted once its
-goldens are captured and replaying. See `conformance.md` for the capture runbook.
+See `conformance.md` for the capture runbook.
 
 ### Fork patches
 
