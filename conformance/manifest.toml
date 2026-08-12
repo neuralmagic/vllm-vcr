@@ -126,3 +126,29 @@ sha256 = "c0b6bfb7a302200be682b5e4651dd740492a212f87d0eb77ddfec960fd3c5f4c"
 config_hash = "17e60055a625292e67a354084204b1f7f0f3f196ee3d62363113d3de15aa20ec"
 workload = "multiturn-nocache-s7"
 role = "fidelity"
+
+# BEGIN 0.27 GOLDENS
+[[golden]]
+line = "0.27"
+bucket_path = "conformance/v0.27.1/H200/Qwen/Qwen3-8B/multiturn-s7.jsonl.gz"
+sha256 = "c00c776513d4efe24d582deaa8b2df216668558e547568119eff75a65675920a"
+config_hash = "008ec925f30d74759b6c62bd5e78b16efb7b450c687554c053726dad9740a9dd"
+workload = "multiturn-s7"
+role = "fidelity"
+
+[[golden]]
+line = "0.27"
+bucket_path = "conformance/v0.27.1/H200/Qwen/Qwen3-8B/multiturn-s13.jsonl.gz"
+sha256 = "7ab4e1b4179a2c6b3640205e1078b12329fd0d7d3d5a94f0d540a4429897d30b"
+config_hash = "008ec925f30d74759b6c62bd5e78b16efb7b450c687554c053726dad9740a9dd"
+workload = "multiturn-s13"
+role = "fidelity"
+
+[[golden]]
+line = "0.27"
+bucket_path = "conformance/v0.27.1/H200/Qwen/Qwen3-8B/multiturn-nocache-s7.jsonl.gz"
+sha256 = "a22632a40dfda911bd21bfab68fb1715306bfe8becf79112f4330dfc8581bdec"
+config_hash = "207648aeb128254e4e0c6d177c428abccd40a306478c04b0b8519a61b9c4ce8e"
+workload = "multiturn-nocache-s7"
+role = "fidelity"
+# END 0.27 GOLDENS
