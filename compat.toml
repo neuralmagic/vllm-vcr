@@ -42,7 +42,7 @@
 # See .github/workflows/nightly-canary.yml.
 line = "nightly"
 tag = "nightly"
-protocol_rev = "0f0cb918b7c6d08aabb86ec4eff4bae05f6736d9"
+protocol_rev = "53e211d2923192ea1f7442de93d59cfbb150e089"
 fidelity_validated = false
 
 [[vllm]]
