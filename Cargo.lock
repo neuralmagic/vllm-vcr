@@ -4384,7 +4384,7 @@ dependencies = [
 
 [[package]]
 name = "sim-compat"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -4393,7 +4393,7 @@ dependencies = [
 
 [[package]]
 name = "sim-protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "rmpv",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "sim-s3"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -4421,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "sim-tap"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4439,7 +4439,7 @@ dependencies = [
 
 [[package]]
 name = "sim-trace"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -5234,7 +5234,7 @@ dependencies = [
 
 [[package]]
 name = "vllm-vcr"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -5706,7 +5706,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
