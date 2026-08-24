@@ -215,6 +215,8 @@ Key env vars read by `entrypoint.sh`:
 | Variable | Default | Purpose |
 |---|---|---|
 | `MODEL` | *required* | Hugging Face model id (tokenizer) |
+| `SERVED_MODEL_NAME` | `$MODEL` | Model name clients put in requests (`--served-model-name`) |
+| `VLLM_EXTRA_ARGS` | | Extra `vllm-rs serve` flags, e.g. `--reasoning-parser none --tool-call-parser none` |
 | `MOCK_PD_ROLE` | `both` | `both` (monolithic), `prefill`, or `decode` (P/D split) |
 | `MOCK_HANDSHAKE_PORT` | `29550` | ZMQ handshake port |
 | `VLLM_PORT` | `8000` (`8200` for decode) | HTTP port for the frontend |
@@ -222,6 +224,7 @@ Key env vars read by `entrypoint.sh`:
 | `MOCK_ITL_MS` | `0` | Inter-token latency (ms, mean) |
 | `MOCK_MAX_NUM_SEQS` | `128` | Concurrent sequences (scheduler batch size) |
 | `MOCK_MAX_NUM_BATCHED_TOKENS` | `2048` | Per-step token budget |
+| `MOCK_CONTROL_PORT` | `8001` | HTTP [control API](./control-api.md): patch latency and failure knobs, read request counters, set the log filter |
 
 See `entrypoint.sh` for the full list (latency std-devs, KV-cache events, failure injection, NIXL side-channel).
 

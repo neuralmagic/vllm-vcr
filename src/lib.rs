@@ -23,6 +23,7 @@ use tracing::{debug, error, info};
 pub mod blockpool;
 pub mod calibrate;
 pub mod conformance;
+mod control;
 pub mod dataplane;
 mod engine;
 mod engine_core;
@@ -46,7 +47,10 @@ use latency::KnobLatency;
 
 /// A failure the engine can inject at the configured rate (Phase 5). Maps to the engine-core
 /// finish reason a real vLLM engine would return for that class of failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum FailureType {
     /// Retryable request-level internal error (the frontend may resubmit).
     Error,
@@ -202,6 +206,13 @@ pub struct Opt {
     /// Log a summary line for each request.
     #[arg(long)]
     pub log_requests: bool,
+
+    /// Bind address for the HTTP control API (`GET/PATCH /config`, `GET /stats`,
+    /// `POST /stats/reset`, `GET/PUT /log`), which reads and changes the latency,
+    /// scheduler-cap, failure-injection, and log-filter knobs at runtime and reports
+    /// per-request counters. Unset (default) disables the API.
+    #[arg(long, env = "MOCK_CONTROL_ADDRESS")]
+    pub control_address: Option<String>,
 
     // === Latency model (all milliseconds; 0 = instant, the default) ===
     // Ported from llm-d-inference-sim. The real frontend measures TTFT/ITL from when we
@@ -667,7 +678,13 @@ fn local_input<'a>(uri: &'a TraceUri, flag: &str) -> Result<&'a std::path::Path>
 /// Run one mock engine until shutdown completes or the transport fails. Shutdown is
 /// graceful: the engine loop drains or aborts in-flight requests per `--shutdown-timeout`
 /// (mirroring vLLM's engine core), and the IO loop flushes the final outputs before exit.
-async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) -> Result<()> {
+async fn run_engine(
+    engine_index: u32,
+    opt: Opt,
+    input_tx: mpsc::UnboundedSender<engine_core::EngineInput>,
+    input_rx: mpsc::UnboundedReceiver<engine_core::EngineInput>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     // Advertise the sim's actual configured limits in the registration ready
     // response so the frontend validates against what this engine enforces.
     // This is sim-owned (not the crate's EngineCoreReadyResponse) so the wire
@@ -726,7 +743,6 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
 
     info!(engine_index, role = ?opt.pd_role, "engine connected to frontend");
 
-    let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (output_tx, output_rx) = mpsc::unbounded_channel();
 
     let mut io_loop = tokio::spawn(io::run_io_loop(data_sockets, input_tx, output_rx));
@@ -865,8 +881,46 @@ async fn wait_for_signal() -> &'static str {
     "ctrl-c"
 }
 
+/// Handle to a process-wide reloadable `EnvFilter`, installed by the binary's
+/// subscriber setup and driven by the control API's `/log` route.
+#[derive(Clone)]
+pub struct LogFilter(
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>,
+);
+
+impl LogFilter {
+    pub fn new(
+        handle: tracing_subscriber::reload::Handle<
+            tracing_subscriber::EnvFilter,
+            tracing_subscriber::Registry,
+        >,
+    ) -> Self {
+        LogFilter(handle)
+    }
+
+    pub fn current(&self) -> Result<String, String> {
+        self.0
+            .with_current(|filter| filter.to_string())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn set(&self, filter: tracing_subscriber::EnvFilter) -> Result<(), String> {
+        self.0.reload(filter).map_err(|error| error.to_string())
+    }
+}
+
 /// Run all requested mock engines until cancellation or one engine task fails.
-pub async fn run(mut opt: Opt, shutdown: CancellationToken) -> Result<()> {
+pub async fn run(opt: Opt, shutdown: CancellationToken) -> Result<()> {
+    run_with_log_filter(opt, shutdown, None).await
+}
+
+/// [`run`] with a reloadable log filter for the control API's `/log` route. `None`
+/// leaves that route unimplemented.
+pub async fn run_with_log_filter(
+    mut opt: Opt,
+    shutdown: CancellationToken,
+    log_filter: Option<LogFilter>,
+) -> Result<()> {
     materialize_remote_inputs(&mut opt).await?;
 
     // Validate the latency configuration (knob/trace conflict, trace parse) before any
@@ -879,12 +933,21 @@ pub async fn run(mut opt: Opt, shutdown: CancellationToken) -> Result<()> {
     info!(?opt, "starting mock engine");
 
     let mut engines = JoinSet::new();
+    let mut control_senders = Vec::with_capacity(opt.engine_count);
     for engine_index in 0..opt.engine_count {
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        control_senders.push(input_tx.clone());
         engines.spawn(run_engine(
             engine_index as u32,
             opt.clone(),
+            input_tx,
+            input_rx,
             shutdown.clone(),
         ));
+    }
+    if let Some(addr) = opt.control_address.clone() {
+        let targets = control::Engines(control_senders);
+        engines.spawn(control::serve(addr, targets, log_filter, shutdown.clone()));
     }
 
     // No abort-on-shutdown here: each engine loop observes `shutdown` itself and drains

@@ -26,6 +26,7 @@ use vllm_engine_core_client::protocol::utility::{
     UtilityCallId, UtilityOutput, UtilityResultEnvelope,
 };
 
+use crate::control::{Config, ConfigPatch, ControlError, ControlReply, ControlRequest, Stats};
 use crate::engine_core::UtilityRequestSpec;
 use sim_protocol::vllm::{
     self as vllm, EngineCoreFinishReason, EngineCoreOutput, EngineCoreRequest, Envelope,
@@ -589,6 +590,8 @@ pub(crate) struct SimEngine {
     /// latency model paces multi-token steps; reset at the top of each `step()`
     /// and reported verbatim in `scheduler_stats`.
     pending_spec: Option<SpecDecodingStats>,
+    /// Control-API request counters (`GET /stats`).
+    stats: Stats,
 }
 
 impl SimEngine {
@@ -619,6 +622,100 @@ impl SimEngine {
             return Some(self.opt.failure_types[idx].finish_reason());
         }
         None
+    }
+
+    /// Answer a control-API call. A config patch can raise the batch cap, so it may
+    /// admit waiting requests; those outputs go to the frontend like any other.
+    fn handle_control(
+        &mut self,
+        request: ControlRequest,
+    ) -> (Result<ControlReply, ControlError>, Vec<EngineOutput>) {
+        match request {
+            ControlRequest::GetConfig => (Ok(ControlReply::Config(self.config())), Vec::new()),
+            ControlRequest::PatchConfig(patch) => match self.apply_patch(*patch) {
+                Ok(outputs) => (Ok(ControlReply::Config(self.config())), outputs),
+                Err(error) => (Err(error), Vec::new()),
+            },
+            ControlRequest::GetStats => (Ok(ControlReply::Stats(self.stats())), Vec::new()),
+            ControlRequest::ResetStats => {
+                self.stats = Stats::default();
+                (Ok(ControlReply::Stats(self.stats())), Vec::new())
+            }
+        }
+    }
+
+    fn config(&self) -> Config {
+        Config {
+            time_to_first_token: self.opt.time_to_first_token,
+            time_to_first_token_std_dev: self.opt.time_to_first_token_std_dev,
+            inter_token_latency: self.opt.inter_token_latency,
+            inter_token_latency_std_dev: self.opt.inter_token_latency_std_dev,
+            prefill_overhead: self.opt.prefill_overhead,
+            prefill_time_per_token: self.opt.prefill_time_per_token,
+            prefill_time_std_dev: self.opt.prefill_time_std_dev,
+            time_factor_under_load: self.opt.time_factor_under_load,
+            max_num_seqs: self.opt.max_num_seqs,
+            max_num_batched_tokens: self.opt.max_num_batched_tokens,
+            max_model_len: self.opt.max_model_len,
+            failure_injection_rate: self.opt.failure_injection_rate,
+            failure_types: self.opt.failure_types.clone(),
+            log_requests: self.opt.log_requests,
+        }
+    }
+
+    fn stats(&self) -> Stats {
+        Stats {
+            running: (self.active_requests.len() + self.pending_pulls.len()) as u64,
+            waiting: self.waiting.len() as u64,
+            ..self.stats
+        }
+    }
+
+    /// Apply a config patch. Latency knobs are refused while a `--latency-trace`
+    /// model is in use (the trace, not the knobs, paces those requests). The knob
+    /// latency model is rebuilt from the patched options, so the next arrival is
+    /// paced by the new values.
+    fn apply_patch(&mut self, patch: ConfigPatch) -> Result<Vec<EngineOutput>, ControlError> {
+        let rebuild_latency = patch.changes_latency();
+        if rebuild_latency && self.opt.latency_trace.is_some() {
+            return Err(ControlError::conflict(
+                "latency knobs cannot be patched while --latency-trace is in use",
+            ));
+        }
+        let mut opt = self.opt.clone();
+        macro_rules! set {
+            ($($field:ident),* $(,)?) => {
+                $(if let Some(value) = patch.$field { opt.$field = value; })*
+            };
+        }
+        set!(
+            time_to_first_token,
+            time_to_first_token_std_dev,
+            inter_token_latency,
+            inter_token_latency_std_dev,
+            prefill_overhead,
+            prefill_time_per_token,
+            prefill_time_std_dev,
+            time_factor_under_load,
+            max_num_seqs,
+            max_num_batched_tokens,
+            max_model_len,
+            failure_injection_rate,
+            log_requests,
+        );
+        if let Some(types) = patch.failure_types {
+            opt.failure_types = types;
+        }
+        if rebuild_latency {
+            self.latency = opt.build_latency().map_err(|error| {
+                ControlError::internal(format!("rebuilding latency model: {error:#}"))
+            })?;
+        }
+        self.opt = opt;
+        info!(engine_index = self.engine_index, config = ?self.config(), "config patched via control API");
+        let outputs = self.schedule();
+        self.ensure_step(Instant::now());
+        Ok(outputs)
     }
 
     /// Handle a LoRA load/unload utility call, mutating the adapter registry. Returns the
@@ -721,6 +818,7 @@ impl SimEngine {
             EngineInput::Request(request) => {
                 let request_id = request.request_id.clone();
                 let client_index = request.client_index;
+                self.stats.requests_received += 1;
 
                 // Dedup against the running batch, pending pulls, and the waiting queue.
                 if self.active_requests.contains_key(&request_id)
@@ -731,6 +829,7 @@ impl SimEngine {
                         engine_index = self.engine_index,
                         request_id, "duplicate request id"
                     );
+                    self.stats.requests_failed += 1;
                     return Ok(vec![EngineOutput {
                         client_index,
                         outputs: empty_finish_outputs(
@@ -744,6 +843,7 @@ impl SimEngine {
                 // Phase 5: fail the request on arrival if the context-length check trips or
                 // the injector rolls a failure. It never enters the queue or the pool.
                 if let Some(reason) = self.maybe_fail(&request) {
+                    self.stats.requests_failed += 1;
                     if self.opt.log_requests {
                         info!(request_id, ?reason, "request failed on arrival (injected)");
                     }
@@ -795,6 +895,14 @@ impl SimEngine {
                 });
             }
 
+            EngineInput::Control(call) => {
+                let (reply, control_outputs) = self.handle_control(call.request);
+                outputs.extend(control_outputs);
+                if call.reply.send(reply).is_err() {
+                    debug!(engine_index = self.engine_index, "control caller went away");
+                }
+            }
+
             EngineInput::StartDpWave => {
                 debug!(engine_index = self.engine_index, "ignoring START_DP_WAVE");
             }
@@ -837,6 +945,7 @@ impl SimEngine {
                     Vec::new(),
                     Some(EngineCoreFinishReason::Abort),
                 );
+                self.stats.requests_aborted += 1;
                 let (outs, finished) = by_client
                     .entry(client_index)
                     .or_insert_with(|| (Vec::new(), BTreeSet::new()));
@@ -847,20 +956,25 @@ impl SimEngine {
                 }
             }
         }
+        // Aborting running requests frees batch slots; admit any waiting requests.
+        outputs.extend(self.schedule());
+        // The frontend keeps the last scheduler stats it received until the next
+        // batch that carries some, so the abort batch reports the post-abort queue
+        // depth rather than leaving the frontend's gauges (and anything scraping
+        // them) at their pre-abort values.
+        let mut stats = Some(Box::new(self.scheduler_stats()));
         for (client_index, (client_outputs, finished_requests)) in by_client {
             outputs.push(EngineOutput {
                 client_index,
                 outputs: vllm::request_batch(
                     self.engine_index,
                     client_outputs,
-                    None,
+                    stats.take(),
                     now_secs(),
                     Some(finished_requests),
                 ),
             });
         }
-        // Aborting running requests frees batch slots; admit any waiting requests.
-        outputs.extend(self.schedule());
         self.ensure_step(Instant::now());
         outputs
     }
@@ -1061,6 +1175,7 @@ impl SimEngine {
             }
             Err(finish_reason) => {
                 // The request never runs, so release the pins we just took.
+                self.stats.requests_failed += 1;
                 self.pool.unpin(&block_ids);
                 Some(EngineOutput {
                     client_index,
@@ -1467,6 +1582,7 @@ impl SimEngine {
                 }
                 if finished {
                     finished_ids.insert(request.request_id.clone());
+                    self.stats.requests_completed += 1;
                     if request.prefill_advertise {
                         to_advertise.push((
                             request.client_index,
@@ -1711,6 +1827,7 @@ impl SimEngine {
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
             pending_spec: None,
+            stats: Stats::default(),
         })
     }
 }
@@ -1762,7 +1879,9 @@ impl EngineCore for SimEngine {
         self.abort_requests(request_ids)
     }
 
-    fn reject_request(&self, request: Box<EngineCoreRequest>) -> EngineOutput {
+    fn reject_request(&mut self, request: Box<EngineCoreRequest>) -> EngineOutput {
+        self.stats.requests_received += 1;
+        self.stats.requests_aborted += 1;
         debug!(
             engine_index = self.engine_index,
             request_id = request.request_id,
@@ -1850,6 +1969,7 @@ mod tests {
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
             pending_spec: None,
+            stats: Stats::default(),
             opt,
         };
         let rx = engine.pull_completion_rx.take().unwrap();
@@ -3187,5 +3307,175 @@ mod tests {
         assert!(engine.active_requests.contains_key("p5"));
         abort(&mut engine, &mut rx, &["p5"]);
         assert!(engine.active_requests.contains_key("p10"));
+    }
+
+    #[test]
+    fn abort_batch_carries_post_abort_scheduler_stats() {
+        let mut opt = test_opt();
+        opt.max_num_seqs = 1;
+        let (mut engine, mut rx) = test_engine(opt);
+        add(&mut engine, &mut rx, request("r1", 4, 5));
+        add(&mut engine, &mut rx, request("r2", 4, 5));
+        assert_eq!(engine.waiting.len(), 1);
+
+        let out = abort(&mut engine, &mut rx, &["r1", "r2"]);
+        let stats = out
+            .iter()
+            .find_map(|o| vllm::scheduler_stats(&o.outputs))
+            .expect("abort batch carries scheduler stats");
+        assert_eq!(stats.num_running_reqs, 0);
+        assert_eq!(stats.num_waiting_reqs, 0);
+    }
+
+    fn control(
+        engine: &mut SimEngine,
+        request: ControlRequest,
+    ) -> Result<ControlReply, ControlError> {
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        engine
+            .handle_input(EngineInput::Control(crate::control::ControlCall {
+                request,
+                reply: reply_tx,
+            }))
+            .expect("handle_input");
+        reply_rx
+            .try_recv()
+            .expect("engine answers control calls inline")
+    }
+
+    fn control_stats(engine: &mut SimEngine) -> Stats {
+        match control(engine, ControlRequest::GetStats) {
+            Ok(ControlReply::Stats(stats)) => stats,
+            other => panic!("expected stats, got {other:?}"),
+        }
+    }
+
+    fn control_config(engine: &mut SimEngine) -> Config {
+        match control(engine, ControlRequest::GetConfig) {
+            Ok(ControlReply::Config(config)) => config,
+            other => panic!("expected config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_patch_changes_the_latency_model_for_the_next_request() {
+        let (mut engine, mut rx) = test_engine(test_opt());
+        assert_eq!(control_config(&mut engine).time_to_first_token, 0);
+
+        let reply = control(
+            &mut engine,
+            ControlRequest::PatchConfig(Box::new(ConfigPatch {
+                time_to_first_token: Some(10_000),
+                ..ConfigPatch::default()
+            })),
+        );
+        assert!(
+            matches!(reply, Ok(ControlReply::Config(ref c)) if c.time_to_first_token == 10_000)
+        );
+        assert_eq!(control_config(&mut engine).time_to_first_token, 10_000);
+
+        let before = Instant::now();
+        add(&mut engine, &mut rx, request("r1", 4, 2));
+        assert!(engine.step().is_empty());
+        let deadline = engine.earliest_deadline().expect("a deadline");
+        assert!(deadline >= before + Duration::from_millis(9_000));
+    }
+
+    #[test]
+    fn control_patch_toggles_failure_injection() {
+        let (mut engine, mut rx) = test_engine(test_opt());
+        control(
+            &mut engine,
+            ControlRequest::PatchConfig(Box::new(ConfigPatch {
+                failure_injection_rate: Some(1.0),
+                failure_types: Some(vec![crate::FailureType::Error]),
+                ..ConfigPatch::default()
+            })),
+        )
+        .expect("patch");
+        let out = submit(&mut engine, &mut rx, request("doomed", 4, 5));
+        assert_eq!(finish_reason(&out[0]), Some(EngineCoreFinishReason::Error));
+
+        control(
+            &mut engine,
+            ControlRequest::PatchConfig(Box::new(ConfigPatch {
+                failure_injection_rate: Some(0.0),
+                ..ConfigPatch::default()
+            })),
+        )
+        .expect("patch");
+        submit(&mut engine, &mut rx, request("safe", 4, 5));
+        assert_eq!(engine.active_requests.len(), 1);
+
+        let stats = control_stats(&mut engine);
+        assert_eq!(stats.requests_received, 2);
+        assert_eq!(stats.requests_failed, 1);
+        assert_eq!(stats.running, 1);
+    }
+
+    #[test]
+    fn control_patch_raising_max_num_seqs_admits_waiting_requests() {
+        let mut opt = test_opt();
+        opt.max_num_seqs = 1;
+        let (mut engine, mut rx) = test_engine(opt);
+        add(&mut engine, &mut rx, request("r1", 4, 5));
+        add(&mut engine, &mut rx, request("r2", 4, 5));
+        assert_eq!(engine.waiting.len(), 1);
+        assert_eq!(control_stats(&mut engine).waiting, 1);
+
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        let outputs = engine
+            .handle_input(EngineInput::Control(crate::control::ControlCall {
+                request: ControlRequest::PatchConfig(Box::new(ConfigPatch {
+                    max_num_seqs: Some(2),
+                    ..ConfigPatch::default()
+                })),
+                reply: reply_tx,
+            }))
+            .expect("handle_input");
+        reply_rx.try_recv().expect("reply").expect("patch ok");
+        assert!(engine.waiting.is_empty(), "the second request was admitted");
+        assert_eq!(engine.active_requests.len(), 2);
+        // Admission of a local-KV request emits nothing until its first step.
+        assert!(
+            outputs
+                .iter()
+                .all(|o| vllm::request_outputs(&o.outputs).is_empty())
+        );
+    }
+
+    #[test]
+    fn control_stats_count_every_outcome_and_reset() {
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("done", 4, 2));
+        drain(&mut engine, &mut rx);
+        add(&mut engine, &mut rx, request("gone", 4, 2));
+        abort(&mut engine, &mut rx, &["gone"]);
+        submit(&mut engine, &mut rx, request("dup", 4, 2));
+        submit(&mut engine, &mut rx, request("dup", 4, 2));
+
+        let stats = control_stats(&mut engine);
+        assert_eq!(stats.requests_received, 4);
+        assert_eq!(stats.requests_completed, 1);
+        assert_eq!(stats.requests_aborted, 1);
+        assert_eq!(stats.requests_failed, 1, "the duplicate id");
+        assert_eq!(stats.running, 1);
+        assert_eq!(stats.waiting, 0);
+
+        let after_reset = match control(&mut engine, ControlRequest::ResetStats) {
+            Ok(ControlReply::Stats(stats)) => stats,
+            other => panic!("expected stats, got {other:?}"),
+        };
+        assert_eq!(after_reset.requests_received, 0);
+        assert_eq!(after_reset.running, 1, "gauges survive a reset");
+    }
+
+    #[test]
+    fn control_rejected_during_shutdown_is_counted_as_aborted() {
+        let (mut engine, _rx) = test_engine(test_opt());
+        engine.reject_request(Box::new(request("late", 4, 2)));
+        let stats = control_stats(&mut engine);
+        assert_eq!(stats.requests_received, 1);
+        assert_eq!(stats.requests_aborted, 1);
     }
 }

@@ -21,6 +21,7 @@
 - [LoRA simulation](./lora.md)
 - [NIXL data plane](./nixl.md)
 - [Engine internals](./engine-internals.md)
+- [Runtime control API](./control-api.md)
 
 # Trace replay & calibration
 
