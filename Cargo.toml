@@ -51,6 +51,8 @@ tokenizers = { version = "0.23", default-features = false, features = ["fancy-re
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
+# Control API (`--control-address`): runtime config patches and request counters.
+axum = "0.8.9"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 # Must match the engine-core-client's zeromq so socket types unify across the git dep.
@@ -122,6 +124,7 @@ tokenizers = { workspace = true }
 hf-hub = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zeromq = { workspace = true }
@@ -133,5 +136,7 @@ flate2 = { workspace = true }
 sim-compat = { workspace = true }
 
 [dev-dependencies]
+# `ServiceExt::oneshot` for driving the control router in tests without a socket.
+tower = { version = "0.5.3", features = ["util"] }
 # Conformance integrity gate: hash fetched goldens against the manifest sha256.
 sha2 = { workspace = true }

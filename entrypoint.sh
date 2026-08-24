@@ -7,6 +7,7 @@
 set -euo pipefail
 
 MODEL="${MODEL:?MODEL env required (HF model id, used for the tokenizer)}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"   # name clients use; defaults to MODEL
 ROLE="${MOCK_PD_ROLE:-both}"                 # prefill | decode | both
 ENGINE_ID="${POD_NAME:-mock-engine-0}"       # advertised as remote_engine_id
 SIDE_CHANNEL_HOST="${POD_IP:-0.0.0.0}"       # advertised as remote_host
@@ -69,6 +70,11 @@ if [ -n "${MOCK_FAILURE_TYPES:-}" ]; then
     FAILURE_ARGS+=(--failure-types "${MOCK_FAILURE_TYPES}")
 fi
 
+# Runtime control API (GET/PATCH /config, GET /stats, PUT /log) on its own port, so a
+# test harness can change latency or failure injection and read request counters
+# without a pod restart.
+CONTROL_ARGS=(--control-address "0.0.0.0:${MOCK_CONTROL_PORT:-8001}")
+
 # Decode sits behind the routing sidecar (sidecar :8000 -> vllm-rs :8200); prefill is
 # hit directly on :8000. Override with VLLM_PORT if needed.
 case "$ROLE" in
@@ -76,13 +82,24 @@ case "$ROLE" in
     *)      HTTP_PORT="${VLLM_PORT:-8000}" ;;
 esac
 
-echo "[entrypoint] role=$ROLE model=$MODEL engine_id=$ENGINE_ID http=:$HTTP_PORT nixl=$SIDE_CHANNEL_HOST:$SIDE_CHANNEL_PORT"
+echo "[entrypoint] role=$ROLE model=$MODEL served_as=${SERVED_MODEL_NAME:-$MODEL} engine_id=$ENGINE_ID http=:$HTTP_PORT control=:${MOCK_CONTROL_PORT:-8001} nixl=$SIDE_CHANNEL_HOST:$SIDE_CHANNEL_PORT"
 
 # Frontend: binds the engine-core handshake and waits for our engine to join.
+# SERVED_MODEL_NAME lets clients address the model by a name other than the HF
+# id; VLLM_EXTRA_ARGS passes further vllm-rs flags verbatim (e.g.
+# "--reasoning-parser none --tool-call-parser none" for tokenizers without the
+# parser special tokens).
+FRONTEND_ARGS=()
+if [ -n "$SERVED_MODEL_NAME" ]; then
+    FRONTEND_ARGS+=(--served-model-name "$SERVED_MODEL_NAME")
+fi
+# shellcheck disable=SC2206
+FRONTEND_ARGS+=(${VLLM_EXTRA_ARGS:-})
 vllm-rs serve "$MODEL" \
     --data-parallel-size 1 --data-parallel-size-local 0 \
     --handshake-port "$HANDSHAKE_PORT" \
-    --host 0.0.0.0 --port "$HTTP_PORT" &
+    --host 0.0.0.0 --port "$HTTP_PORT" \
+    "${FRONTEND_ARGS[@]}" &
 FRONTEND_PID=$!
 
 # Engine: connects as the headless DP engine, plays the NixlConnector role.
@@ -96,6 +113,7 @@ vllm-vcr play \
     "${SCHEDULER_ARGS[@]}" \
     "${EVENT_ARGS[@]}" \
     "${FAILURE_ARGS[@]}" \
+    "${CONTROL_ARGS[@]}" \
     --log-requests &
 ENGINE_PID=$!
 

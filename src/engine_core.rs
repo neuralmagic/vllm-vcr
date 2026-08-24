@@ -38,6 +38,8 @@ pub(crate) enum EngineInput {
     Abort(Vec<String>),
     Utility(UtilityRequestSpec),
     StartDpWave,
+    /// A control-API call (see `control.rs`), answered on its oneshot.
+    Control(crate::control::ControlCall),
 }
 
 /// Message sent from the engine task to the IO loop for one engine output batch.
@@ -65,7 +67,7 @@ pub(crate) trait EngineCore: Send {
     fn abort_all_requests(&mut self) -> Vec<EngineOutput>;
     /// Refuse a request that arrived during shutdown with an immediate Abort output,
     /// mirroring vLLM's `_reject_add_in_shutdown`.
-    fn reject_request(&self, request: Box<EngineCoreRequest>) -> EngineOutput;
+    fn reject_request(&mut self, request: Box<EngineCoreRequest>) -> EngineOutput;
 }
 
 /// Run the main loop for one engine, receiving `EngineInput` and sending `EngineOutput`
@@ -262,7 +264,7 @@ mod tests {
             Vec::new()
         }
 
-        fn reject_request(&self, request: Box<EngineCoreRequest>) -> EngineOutput {
+        fn reject_request(&mut self, request: Box<EngineCoreRequest>) -> EngineOutput {
             abort_output(request)
         }
     }
@@ -382,7 +384,7 @@ mod tests {
             }]
         }
 
-        fn reject_request(&self, request: Box<EngineCoreRequest>) -> EngineOutput {
+        fn reject_request(&mut self, request: Box<EngineCoreRequest>) -> EngineOutput {
             abort_output(request)
         }
     }

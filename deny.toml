@@ -29,6 +29,10 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "AWS SDK legacy rustls-0.21 connector, not our TLS path" },
     { id = "RUSTSEC-2026-0099", reason = "AWS SDK legacy rustls-0.21 connector, not our TLS path" },
     { id = "RUSTSEC-2026-0104", reason = "AWS SDK legacy rustls-0.21 connector, not our TLS path" },
+    # h2 0.3 (hyper 0.14) unbounded empty DATA frames; only 0.4.16+ is patched and
+    # 0.3 is reached solely through the same legacy AWS connector. Our own HTTP
+    # servers and clients are on hyper 1 / h2 0.4.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via AWS SDK legacy hyper-0.14 connector; h2 0.4 is patched" },
 ]
 
 [licenses]

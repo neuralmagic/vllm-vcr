@@ -53,20 +53,25 @@ enum Command {
 
 /// Logs go to stderr so `inspect`'s stdout stays clean for piping (Perfetto
 /// JSON, summaries). INFO default keeps `record`/`play` debuggable; override
-/// with `RUST_LOG`.
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
+/// with `RUST_LOG` at startup or through the control API's `PUT /log` while
+/// `play` is running.
+fn init_tracing() -> vllm_vcr::LogFilter {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
+    vllm_vcr::LogFilter::new(handle)
 }
 
 /// Run the mock engine-core backend on a multi-thread runtime until a shutdown
 /// signal (SIGINT/SIGTERM) or transport failure.
-fn play(opt: vllm_vcr::Opt) -> Result<()> {
+fn play(opt: vllm_vcr::Opt, log_filter: vllm_vcr::LogFilter) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -74,17 +79,17 @@ fn play(opt: vllm_vcr::Opt) -> Result<()> {
 
     runtime.block_on(async move {
         let shutdown: CancellationToken = vllm_vcr::shutdown_signal();
-        vllm_vcr::run(opt, shutdown).await
+        vllm_vcr::run_with_log_filter(opt, shutdown, Some(log_filter)).await
     })
 }
 
 fn main() -> ExitCode {
-    init_tracing();
+    let log_filter = init_tracing();
     let cli = Cli::parse();
 
     let result = match cli.command {
         Command::Record(args) => record::run(args).map(|()| ExitCode::SUCCESS),
-        Command::Play(opt) => play(*opt).map(|()| ExitCode::SUCCESS),
+        Command::Play(opt) => play(*opt, log_filter).map(|()| ExitCode::SUCCESS),
         Command::Inspect(command) => inspect::run(command),
         Command::Completions { shell } => {
             let mut cmd = <Cli as clap::CommandFactory>::command();
