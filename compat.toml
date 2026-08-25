@@ -51,8 +51,8 @@ fidelity_validated = false
 # to the highest `vX.Y.ZrcN` tag newer than the default line. fidelity_validated
 # stays false (RCs never get goldens).
 line = "rc"
-tag = "v0.26.1rc0"
-protocol_rev = "53f6dd5c6f7725df4e5ac9441569860023100870"
+tag = "v0.28.0rc2"
+protocol_rev = "74a6576b9b5832494c314405c3cae94db55801e1"
 fidelity_validated = false
 
 [[vllm]]
