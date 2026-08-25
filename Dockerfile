@@ -100,7 +100,7 @@ FROM fedora:${FEDORA_VERSION} AS runtime
 ARG FEDORA_VERSION
 
 RUN dnf install -y --setopt=install_weak_deps=False \
-        libstdc++ rdma-core numactl-libs ca-certificates bash \
+        libstdc++ rdma-core numactl-libs ca-certificates bash openssl-libs \
     && dnf clean all
 
 # Source-built UCX, libnixl + its UCX plugin, the vLLM frontend, and the unified

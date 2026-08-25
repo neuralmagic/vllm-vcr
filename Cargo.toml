@@ -18,7 +18,7 @@ sim-trace = { path = "crates/sim-trace" }
 sim-protocol = { path = "crates/sim-protocol" }
 sim-tap = { path = "crates/sim-tap" }
 sim-compat = { path = "crates/sim-compat" }
-sim-s3 = { path = "crates/sim-s3" }
+sim-s3 = { path = "crates/sim-s3", default-features = false }
 
 # The real vLLM engine-core protocol + reusable mock-engine handshake harness,
 # pulled straight from the in-tree Rust frontend so the wire format never drifts.
@@ -48,7 +48,7 @@ toml_edit = "0.25.12"
 # onig/esaxx_fast: those pull C/C++ (onig_sys, esaxx.cpp) which breaks the static musl
 # release builds, and esaxx is only used for Unigram training, which we never do.
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-hf-hub = { version = "0.5", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 # Control API (`--control-address`): runtime config patches and request counters.
@@ -86,7 +86,10 @@ name = "vllm-vcr"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["s3"]
+# s3:// trace I/O through the AWS SDK. Off in the FIPS build: the SDK is rustls-only
+# (ring + aws-lc-rs), while everything else links the system OpenSSL via native-tls.
+s3 = ["sim-s3/s3"]
 # Real NIXL KV data plane. Needs libnixl + UCX installed (Linux, RDMA or shared-memory).
 nixl = ["dep:nixl-sys", "dep:base64"]
 # Compile the NIXL bindings against stubs so the data-plane code typechecks on

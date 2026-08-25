@@ -48,6 +48,8 @@ allow = [
     "ISC",
     "Zlib",
     "Unicode-3.0",
+    # Mozilla root CA bundle (webpki-root-certs, via ureq native-tls); data, not code.
+    "CDLA-Permissive-2.0",
     "CC0-1.0",
     # Public-domain-equivalent, OSI-approved; pulled by a Windows-only zeromq
     # transitive (win_uds) we never actually build.

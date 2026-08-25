@@ -8,7 +8,10 @@ subcommands (the VCR metaphor):
 - **`play`** runs a mock engine-core backend that speaks the real ZMQ + msgpack
   protocol, replaying a trace or simulating from a latency model. No model weights,
   no GPU. With the `nixl` feature it also moves simulated KV-cache bytes between
-  prefill and decode over [NIXL](https://github.com/ai-dynamo/nixl).
+  prefill and decode over [NIXL](https://github.com/ai-dynamo/nixl). The `s3`
+  feature (default on) reads and writes `s3://` traces; build with
+  `--no-default-features` for a FIPS-enforcing host, where all TLS goes through
+  the system OpenSSL and the rustls-only AWS SDK is left out.
 - **`inspect`** converts benchmark reports, summarizes traces, renders Perfetto
   timelines, and runs calibration.
 

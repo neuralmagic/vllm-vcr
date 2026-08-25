@@ -8,10 +8,7 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::Client;
-use aws_sdk_s3::primitives::ByteStream;
-use tracing::{debug, info};
+use tracing::info;
 use url::Url;
 
 /// Whether a raw path string is an `s3://` or `hf://` URI rather than a local path.
@@ -34,6 +31,9 @@ impl FromStr for TraceUri {
     fn from_str(s: &str) -> Result<Self, String> {
         if is_remote(s) {
             if s.starts_with("s3://") || s.starts_with("S3://") {
+                if !cfg!(feature = "s3") {
+                    return Err("s3:// URIs need a vllm-vcr built with the s3 feature".to_string());
+                }
                 let (bucket, key) = parse_s3_uri(s).map_err(|e| format!("{e:#}"))?;
                 Ok(TraceUri::S3 { bucket, key })
             } else if s.starts_with("hf://") || s.starts_with("HF://") {
@@ -98,6 +98,18 @@ impl TraceUri {
         let TraceUri::S3 { bucket, key } = self else {
             return Ok(());
         };
+        self.put(bucket, key, local).await
+    }
+
+    #[cfg(not(feature = "s3"))]
+    async fn put(&self, _bucket: &str, _key: &str, _local: &Path) -> Result<()> {
+        bail!("{self}: built without the s3 feature")
+    }
+
+    #[cfg(feature = "s3")]
+    async fn put(&self, bucket: &str, key: &str, local: &Path) -> Result<()> {
+        use aws_sdk_s3::primitives::ByteStream;
+
         let size = std::fs::metadata(local).map(|m| m.len()).ok();
         info!(local = %local.display(), uri = %self, bucket, key, bytes = size, "S3 PUT: uploading trace");
         let started = Instant::now();
@@ -117,6 +129,12 @@ impl TraceUri {
         Ok(())
     }
 
+    #[cfg(not(feature = "s3"))]
+    async fn fetch(&self, _bucket: &str, _key: &str, _scratch_dir: &Path) -> Result<PathBuf> {
+        bail!("{self}: built without the s3 feature")
+    }
+
+    #[cfg(feature = "s3")]
     async fn fetch(&self, bucket: &str, key: &str, scratch_dir: &Path) -> Result<PathBuf> {
         let dest = scratch_path(&self.to_string(), key, scratch_dir);
         info!(uri = %self, bucket, key, dest = %dest.display(), "S3 GET: fetching trace to scratch");
@@ -143,7 +161,7 @@ impl TraceUri {
     }
 
     async fn fetch_hf(&self, repo: &str, filename: &str) -> Result<PathBuf> {
-        use hf_hub::api::tokio::Api;
+        use hf_hub::api::sync::Api;
 
         info!(
             uri = %self,
@@ -154,12 +172,15 @@ impl TraceUri {
 
         let started = Instant::now();
 
-        let api = Api::new().map_err(|e| anyhow::anyhow!("initializing HF API: {}", e))?;
-        let repo_api = api.dataset(repo.to_string());
-        let local_path = repo_api
-            .get(filename)
-            .await
-            .map_err(|e| anyhow::anyhow!("downloading {} from {}: {}", filename, repo, e))?;
+        let (repo, filename) = (repo.to_string(), filename.to_string());
+        let local_path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+            let api = Api::new().map_err(|e| anyhow::anyhow!("initializing HF API: {e}"))?;
+            api.dataset(repo.clone())
+                .get(&filename)
+                .map_err(|e| anyhow::anyhow!("downloading {filename} from {repo}: {e}"))
+        })
+        .await
+        .context("HF GET task")??;
 
         let elapsed = started.elapsed();
         let size = std::fs::metadata(&local_path).map(|m| m.len()).ok();
@@ -252,7 +273,11 @@ fn scratch_path(uri: &str, key: &str, scratch_dir: &Path) -> PathBuf {
     ))
 }
 
-async fn s3_client() -> Client {
+#[cfg(feature = "s3")]
+async fn s3_client() -> aws_sdk_s3::Client {
+    use aws_config::BehaviorVersion;
+    use tracing::debug;
+
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     // S3-compatible endpoints (MinIO/LocalStack) only serve path-style; real AWS
     // (no endpoint override) uses virtual-host style.
@@ -263,7 +288,7 @@ async fn s3_client() -> Client {
         force_path_style,
         "built S3 client from default credential chain"
     );
-    Client::from_conf(
+    aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Builder::from(&config)
             .force_path_style(force_path_style)
             .build(),
@@ -286,6 +311,7 @@ mod tests {
         assert!(!is_remote("s3:"));
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn parses_s3_uri_into_typed_variant() {
         let uri: TraceUri = "s3://my-bucket/traces/abc/tap-trace.jsonl.gz"
@@ -314,6 +340,14 @@ mod tests {
         assert_eq!(uri.local_path(), Some(Path::new("/tmp/trace.jsonl")));
     }
 
+    #[cfg(not(feature = "s3"))]
+    #[test]
+    fn rejects_s3_uri_without_feature() {
+        let err = "s3://bucket/key".parse::<TraceUri>().unwrap_err();
+        assert!(err.contains("s3 feature"), "{err}");
+    }
+
+    #[cfg(feature = "s3")]
     #[test]
     fn rejects_malformed_s3_uri() {
         assert!("s3://bucket".parse::<TraceUri>().is_err()); // no key
@@ -331,6 +365,7 @@ mod tests {
         assert_eq!(key_basename("trailing/"), "trailing");
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn write_path_is_stable_per_uri_and_collision_free() {
         let dir = Path::new("/tmp/scratch");
