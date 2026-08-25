@@ -80,19 +80,19 @@ jobs:
       - name: Check (nixl-stub)
         run: cargo check --all-targets --locked --features nixl-stub
 
-      # The FIPS build drops the `s3` feature: the AWS SDK is rustls-only (ring +
-      # aws-lc-rs) and cannot use the system OpenSSL that native-tls links.
-      - name: Clippy + test (no s3, FIPS lane)
+      # All TLS goes through the system OpenSSL (hf-hub over reqwest native-tls,
+      # the AWS SDK over sim-s3's hyper-tls HttpClient). deny.toml bans the
+      # rustls stacks; this proves the release feature set links libssl.
+      - name: Release features link no non-OpenSSL crypto
+        run: |
+          ! cargo tree -p vllm-vcr -e normal -i aws-lc-rs
+          ! cargo tree -p vllm-vcr -e normal -i ring
+          ! cargo tree -p vllm-vcr -e normal -i rustls
+          cargo tree -p vllm-vcr -e normal -i openssl-sys
+      - name: Clippy + test (no s3)
         run: |
           cargo clippy -p vllm-vcr -p sim-s3 --all-targets --no-default-features --locked --no-deps -- -D warnings
           cargo test -p vllm-vcr -p sim-s3 --no-default-features --locked
-      - name: FIPS lane links no non-OpenSSL crypto
-        run: |
-          ! cargo tree -p vllm-vcr --no-default-features -e normal -i aws-lc-rs
-          ! cargo tree -p vllm-vcr --no-default-features -e normal -i ring
-          ! cargo tree -p vllm-vcr --no-default-features -e normal -i rustls
-          ! cargo tree -p vllm-vcr --no-default-features -e normal -i aws-sdk-s3
-          cargo tree -p vllm-vcr --no-default-features -e normal -i openssl-sys
 
   # Synthetic E2E engine tests - validates engine behavior against programmatically
   # generated traces covering all schema variants and edge cases. Fast (no real GPU

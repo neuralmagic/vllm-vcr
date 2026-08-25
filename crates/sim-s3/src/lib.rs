@@ -11,6 +11,28 @@ use anyhow::{Context as _, Result, bail};
 use hf_hub::{HFClient, HFResult};
 use tracing::info;
 
+#[cfg(feature = "s3")]
+mod openssl_http_client;
+
+/// Whether the process's OpenSSL is running with its FIPS provider as the
+/// default (`EVP_default_properties_is_fips_enabled`). `None` where the
+/// binary does not link OpenSSL 3 (macOS uses Security.framework).
+pub fn openssl_fips_enabled() -> Option<bool> {
+    #[cfg(all(target_os = "linux", ossl300))]
+    {
+        // SAFETY: a NULL libctx selects the default library context; the call
+        // reads a flag and has no preconditions.
+        Some(
+            unsafe { openssl_sys::EVP_default_properties_is_fips_enabled(std::ptr::null_mut()) }
+                == 1,
+        )
+    }
+    #[cfg(not(all(target_os = "linux", ossl300)))]
+    {
+        None
+    }
+}
+
 /// A HuggingFace Hub client whose HTTP stack is reqwest over native-tls, so TLS
 /// goes through the system OpenSSL. Endpoint, token, and cache dir come from the
 /// usual `HF_*` environment variables.
@@ -134,7 +156,7 @@ impl TraceUri {
             .await
             .with_context(|| format!("opening {} for upload", local.display()))?;
         s3_client()
-            .await
+            .await?
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -157,7 +179,7 @@ impl TraceUri {
         info!(uri = %self, bucket, key, dest = %dest.display(), "S3 GET: fetching trace to scratch");
         let started = Instant::now();
         let response = s3_client()
-            .await
+            .await?
             .get_object()
             .bucket(bucket)
             .key(key)
@@ -289,11 +311,16 @@ fn scratch_path(uri: &str, key: &str, scratch_dir: &Path) -> PathBuf {
 }
 
 #[cfg(feature = "s3")]
-async fn s3_client() -> aws_sdk_s3::Client {
+async fn s3_client() -> Result<aws_sdk_s3::Client> {
     use aws_config::BehaviorVersion;
     use tracing::debug;
 
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let http_client = openssl_http_client::OpensslHttpClient::new()
+        .context("building the OpenSSL HTTP client")?;
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .http_client(http_client)
+        .load()
+        .await;
     // S3-compatible endpoints (MinIO/LocalStack) only serve path-style; real AWS
     // (no endpoint override) uses virtual-host style.
     let force_path_style = config.endpoint_url().is_some();
@@ -301,13 +328,14 @@ async fn s3_client() -> aws_sdk_s3::Client {
         region = config.region().map(|r| r.as_ref()),
         endpoint = config.endpoint_url(),
         force_path_style,
+        fips = ?openssl_fips_enabled(),
         "built S3 client from default credential chain"
     );
-    aws_sdk_s3::Client::from_conf(
+    Ok(aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Builder::from(&config)
             .force_path_style(force_path_style)
             .build(),
-    )
+    ))
 }
 
 #[cfg(test)]

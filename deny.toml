@@ -72,6 +72,18 @@ multiple-versions = "warn"
 # Deny `*` version requirements, except our own internal workspace path deps.
 wildcards = "deny"
 allow-wildcard-paths = true
+# TLS and crypto must be the system OpenSSL. Anything below would put a second,
+# non-validated implementation in the binary.
+deny = [
+    { crate = "ring" },
+    { crate = "aws-lc-rs" },
+    { crate = "aws-lc-sys" },
+    { crate = "rustls" },
+    { crate = "hyper-rustls" },
+    { crate = "tokio-rustls" },
+    { crate = "s2n-tls" },
+    { crate = "openssl-src" },
+]
 
 [sources]
 unknown-registry = "deny"
