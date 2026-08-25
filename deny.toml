@@ -48,6 +48,8 @@ allow = [
     "ISC",
     "Zlib",
     "Unicode-3.0",
+    # colored (via hf-xet's xet-runtime): file-scoped weak copyleft, unmodified.
+    "MPL-2.0",
     "CC0-1.0",
     # Public-domain-equivalent, OSI-approved; pulled by a Windows-only zeromq
     # transitive (win_uds) we never actually build.
@@ -70,12 +72,26 @@ multiple-versions = "warn"
 # Deny `*` version requirements, except our own internal workspace path deps.
 wildcards = "deny"
 allow-wildcard-paths = true
+# TLS and crypto must be the system OpenSSL. Anything below would put a second,
+# non-validated implementation in the binary.
+deny = [
+    { crate = "ring" },
+    { crate = "aws-lc-rs" },
+    { crate = "aws-lc-sys" },
+    { crate = "rustls" },
+    { crate = "hyper-rustls" },
+    { crate = "tokio-rustls" },
+    { crate = "s2n-tls" },
+    { crate = "openssl-src" },
+]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 # The git deps we pin on purpose (see compat.toml / Cargo.toml).
 allow-git = [
+    # hf-hub with selectable TLS, until huggingface/hf-hub#201 is released.
+    "https://github.com/wseaton/hf-hub",
     "https://github.com/vllm-project/vllm.git",
     "https://github.com/wseaton/vllm.git",
     "https://github.com/ai-dynamo/nixl.git",

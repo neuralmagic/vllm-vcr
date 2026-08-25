@@ -8,10 +8,46 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::Client;
-use aws_sdk_s3::primitives::ByteStream;
-use tracing::{debug, info};
+use hf_hub::{HFClient, HFResult};
+use tracing::info;
+
+#[cfg(feature = "s3")]
+mod openssl_http_client;
+
+/// Whether the process's OpenSSL is running with its FIPS provider as the
+/// default (`EVP_default_properties_is_fips_enabled`). `None` where the
+/// binary does not link OpenSSL 3 (macOS uses Security.framework).
+pub fn openssl_fips_enabled() -> Option<bool> {
+    #[cfg(all(target_os = "linux", ossl300))]
+    {
+        // SAFETY: a NULL libctx selects the default library context; the call
+        // reads a flag and has no preconditions.
+        Some(
+            unsafe { openssl_sys::EVP_default_properties_is_fips_enabled(std::ptr::null_mut()) }
+                == 1,
+        )
+    }
+    #[cfg(not(all(target_os = "linux", ossl300)))]
+    {
+        None
+    }
+}
+
+/// A HuggingFace Hub client whose HTTP stack is reqwest over native-tls, so TLS
+/// goes through the system OpenSSL. Endpoint, token, and cache dir come from the
+/// usual `HF_*` environment variables.
+pub fn hf_client() -> HFResult<HFClient> {
+    let http = reqwest::Client::builder().use_native_tls().build()?;
+    HFClient::builder().client(http).build()
+}
+
+/// Split a Hub repo id into `(owner, name)`, rejecting ids without an owner.
+pub fn hf_repo_parts(repo_id: &str) -> Result<(&str, &str)> {
+    match hf_hub::split_id(repo_id) {
+        ("", _) | (_, "") => bail!("HuggingFace repo id must be owner/name, got {repo_id:?}"),
+        parts => Ok(parts),
+    }
+}
 use url::Url;
 
 /// Whether a raw path string is an `s3://` or `hf://` URI rather than a local path.
@@ -34,6 +70,9 @@ impl FromStr for TraceUri {
     fn from_str(s: &str) -> Result<Self, String> {
         if is_remote(s) {
             if s.starts_with("s3://") || s.starts_with("S3://") {
+                if !cfg!(feature = "s3") {
+                    return Err("s3:// URIs need a vllm-vcr built with the s3 feature".to_string());
+                }
                 let (bucket, key) = parse_s3_uri(s).map_err(|e| format!("{e:#}"))?;
                 Ok(TraceUri::S3 { bucket, key })
             } else if s.starts_with("hf://") || s.starts_with("HF://") {
@@ -98,6 +137,18 @@ impl TraceUri {
         let TraceUri::S3 { bucket, key } = self else {
             return Ok(());
         };
+        self.put(bucket, key, local).await
+    }
+
+    #[cfg(not(feature = "s3"))]
+    async fn put(&self, _bucket: &str, _key: &str, _local: &Path) -> Result<()> {
+        bail!("{self}: built without the s3 feature")
+    }
+
+    #[cfg(feature = "s3")]
+    async fn put(&self, bucket: &str, key: &str, local: &Path) -> Result<()> {
+        use aws_sdk_s3::primitives::ByteStream;
+
         let size = std::fs::metadata(local).map(|m| m.len()).ok();
         info!(local = %local.display(), uri = %self, bucket, key, bytes = size, "S3 PUT: uploading trace");
         let started = Instant::now();
@@ -105,7 +156,7 @@ impl TraceUri {
             .await
             .with_context(|| format!("opening {} for upload", local.display()))?;
         s3_client()
-            .await
+            .await?
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -117,12 +168,18 @@ impl TraceUri {
         Ok(())
     }
 
+    #[cfg(not(feature = "s3"))]
+    async fn fetch(&self, _bucket: &str, _key: &str, _scratch_dir: &Path) -> Result<PathBuf> {
+        bail!("{self}: built without the s3 feature")
+    }
+
+    #[cfg(feature = "s3")]
     async fn fetch(&self, bucket: &str, key: &str, scratch_dir: &Path) -> Result<PathBuf> {
         let dest = scratch_path(&self.to_string(), key, scratch_dir);
         info!(uri = %self, bucket, key, dest = %dest.display(), "S3 GET: fetching trace to scratch");
         let started = Instant::now();
         let response = s3_client()
-            .await
+            .await?
             .get_object()
             .bucket(bucket)
             .key(key)
@@ -143,8 +200,6 @@ impl TraceUri {
     }
 
     async fn fetch_hf(&self, repo: &str, filename: &str) -> Result<PathBuf> {
-        use hf_hub::api::tokio::Api;
-
         info!(
             uri = %self,
             repo = repo,
@@ -154,12 +209,15 @@ impl TraceUri {
 
         let started = Instant::now();
 
-        let api = Api::new().map_err(|e| anyhow::anyhow!("initializing HF API: {}", e))?;
-        let repo_api = api.dataset(repo.to_string());
-        let local_path = repo_api
-            .get(filename)
+        let (owner, name) = hf_repo_parts(repo)?;
+        let client = hf_client().context("initializing HuggingFace client")?;
+        let local_path = client
+            .dataset(owner, name)
+            .download_file()
+            .filename(filename)
+            .send()
             .await
-            .map_err(|e| anyhow::anyhow!("downloading {} from {}: {}", filename, repo, e))?;
+            .with_context(|| format!("downloading {filename} from {repo}"))?;
 
         let elapsed = started.elapsed();
         let size = std::fs::metadata(&local_path).map(|m| m.len()).ok();
@@ -252,8 +310,17 @@ fn scratch_path(uri: &str, key: &str, scratch_dir: &Path) -> PathBuf {
     ))
 }
 
-async fn s3_client() -> Client {
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+#[cfg(feature = "s3")]
+async fn s3_client() -> Result<aws_sdk_s3::Client> {
+    use aws_config::BehaviorVersion;
+    use tracing::debug;
+
+    let http_client = openssl_http_client::OpensslHttpClient::new()
+        .context("building the OpenSSL HTTP client")?;
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .http_client(http_client)
+        .load()
+        .await;
     // S3-compatible endpoints (MinIO/LocalStack) only serve path-style; real AWS
     // (no endpoint override) uses virtual-host style.
     let force_path_style = config.endpoint_url().is_some();
@@ -261,13 +328,14 @@ async fn s3_client() -> Client {
         region = config.region().map(|r| r.as_ref()),
         endpoint = config.endpoint_url(),
         force_path_style,
+        fips = ?openssl_fips_enabled(),
         "built S3 client from default credential chain"
     );
-    Client::from_conf(
+    Ok(aws_sdk_s3::Client::from_conf(
         aws_sdk_s3::config::Builder::from(&config)
             .force_path_style(force_path_style)
             .build(),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -286,6 +354,7 @@ mod tests {
         assert!(!is_remote("s3:"));
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn parses_s3_uri_into_typed_variant() {
         let uri: TraceUri = "s3://my-bucket/traces/abc/tap-trace.jsonl.gz"
@@ -314,6 +383,14 @@ mod tests {
         assert_eq!(uri.local_path(), Some(Path::new("/tmp/trace.jsonl")));
     }
 
+    #[cfg(not(feature = "s3"))]
+    #[test]
+    fn rejects_s3_uri_without_feature() {
+        let err = "s3://bucket/key".parse::<TraceUri>().unwrap_err();
+        assert!(err.contains("s3 feature"), "{err}");
+    }
+
+    #[cfg(feature = "s3")]
     #[test]
     fn rejects_malformed_s3_uri() {
         assert!("s3://bucket".parse::<TraceUri>().is_err()); // no key
@@ -331,6 +408,7 @@ mod tests {
         assert_eq!(key_basename("trailing/"), "trailing");
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn write_path_is_stable_per_uri_and_collision_free() {
         let dir = Path::new("/tmp/scratch");
@@ -348,6 +426,17 @@ mod tests {
 
         let local: TraceUri = "/tmp/x.jsonl".parse().unwrap();
         assert_eq!(local.write_path(dir), PathBuf::from("/tmp/x.jsonl"));
+    }
+
+    #[test]
+    fn hf_repo_parts_requires_owner_and_name() {
+        assert_eq!(
+            hf_repo_parts("Qwen/Qwen3-0.6B").unwrap(),
+            ("Qwen", "Qwen3-0.6B")
+        );
+        assert!(hf_repo_parts("Qwen3-0.6B").is_err());
+        assert!(hf_repo_parts("Qwen/").is_err());
+        assert!(hf_repo_parts("/Qwen3").is_err());
     }
 
     #[test]

@@ -55,6 +55,21 @@ enum Command {
 /// JSON, summaries). INFO default keeps `record`/`play` debuggable; override
 /// with `RUST_LOG` at startup or through the control API's `PUT /log` while
 /// `play` is running.
+/// Log whether OpenSSL runs with its FIPS provider, and refuse to start
+/// without it when VLLM_VCR_REQUIRE_FIPS is set.
+fn check_fips() -> anyhow::Result<()> {
+    let fips = sim_s3::openssl_fips_enabled();
+    tracing::info!(fips = ?fips, "OpenSSL FIPS provider");
+    let required =
+        std::env::var_os("VLLM_VCR_REQUIRE_FIPS").is_some_and(|v| !v.is_empty() && v != "0");
+    if required && fips != Some(true) {
+        anyhow::bail!(
+            "VLLM_VCR_REQUIRE_FIPS is set but OpenSSL is not in FIPS mode (fips={fips:?})"
+        );
+    }
+    Ok(())
+}
+
 fn init_tracing() -> vllm_vcr::LogFilter {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
@@ -85,6 +100,10 @@ fn play(opt: vllm_vcr::Opt, log_filter: vllm_vcr::LogFilter) -> Result<()> {
 
 fn main() -> ExitCode {
     let log_filter = init_tracing();
+    if let Err(err) = check_fips() {
+        tracing::error!(%err);
+        return ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
 
     let result = match cli.command {

@@ -8,11 +8,42 @@ repository.workspace = true
 publish = false
 description = "S3 object I/O for vllm-vcr trace files: materialize a remote trace to a local scratch path before the sync readers run, and upload a finalized local trace after the gzip trailer is written. Kept separate from sim-trace so the schema crate stays free of the AWS SDK and an async runtime."
 
+[features]
+default = ["s3"]
+s3 = [
+    "dep:aws-config",
+    "dep:aws-sdk-s3",
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-smithy-types",
+    "dep:http",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:hyper-tls",
+    "dep:native-tls",
+    "dep:tower-service",
+]
+
 [dependencies]
 anyhow = { workspace = true }
-aws-config = { workspace = true }
-aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-smithy-runtime-api = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+hyper-tls = { workspace = true, optional = true }
+native-tls = { workspace = true, optional = true }
+tower-service = { workspace = true, optional = true }
 hf-hub = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl-sys = { workspace = true }
