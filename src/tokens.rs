@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
-use hf_hub::api::sync::Api;
+use hf_hub::HFClientSync;
 use rand::Rng as _;
 use rand::rngs::StdRng;
 use sim_protocol::vllm::EngineCoreFinishReason;
@@ -319,10 +319,15 @@ fn load_hf_tokenizer(model_id: &str) -> Result<Tokenizer> {
                 model = model_id,
                 "loading dataset tokenizer from HuggingFace"
             );
-            let api =
-                Api::new().map_err(|e| anyhow::anyhow!("initializing HuggingFace API: {e}"))?;
-            let repo = api.model(model_id.to_string());
-            repo.get("tokenizer.json")
+            let (owner, name) = sim_s3::hf_repo_parts(model_id)?;
+            let client = sim_s3::hf_client()
+                .and_then(HFClientSync::from_inner)
+                .map_err(|e| anyhow::anyhow!("initializing HuggingFace client: {e}"))?;
+            client
+                .model(owner, name)
+                .download_file()
+                .filename("tokenizer.json")
+                .send()
                 .map_err(|e| anyhow::anyhow!("downloading tokenizer for {model_id}: {e}"))?
         }
     };

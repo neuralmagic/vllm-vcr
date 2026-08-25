@@ -89,6 +89,8 @@ jobs:
       - name: FIPS lane links no non-OpenSSL crypto
         run: |
           ! cargo tree -p vllm-vcr --no-default-features -e normal -i aws-lc-rs
+          ! cargo tree -p vllm-vcr --no-default-features -e normal -i ring
+          ! cargo tree -p vllm-vcr --no-default-features -e normal -i rustls
           ! cargo tree -p vllm-vcr --no-default-features -e normal -i aws-sdk-s3
           cargo tree -p vllm-vcr --no-default-features -e normal -i openssl-sys
 

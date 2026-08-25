@@ -8,7 +8,24 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
+use hf_hub::{HFClient, HFResult};
 use tracing::info;
+
+/// A HuggingFace Hub client whose HTTP stack is reqwest over native-tls, so TLS
+/// goes through the system OpenSSL. Endpoint, token, and cache dir come from the
+/// usual `HF_*` environment variables.
+pub fn hf_client() -> HFResult<HFClient> {
+    let http = reqwest::Client::builder().use_native_tls().build()?;
+    HFClient::builder().client(http).build()
+}
+
+/// Split a Hub repo id into `(owner, name)`, rejecting ids without an owner.
+pub fn hf_repo_parts(repo_id: &str) -> Result<(&str, &str)> {
+    match hf_hub::split_id(repo_id) {
+        ("", _) | (_, "") => bail!("HuggingFace repo id must be owner/name, got {repo_id:?}"),
+        parts => Ok(parts),
+    }
+}
 use url::Url;
 
 /// Whether a raw path string is an `s3://` or `hf://` URI rather than a local path.
@@ -161,8 +178,6 @@ impl TraceUri {
     }
 
     async fn fetch_hf(&self, repo: &str, filename: &str) -> Result<PathBuf> {
-        use hf_hub::api::sync::Api;
-
         info!(
             uri = %self,
             repo = repo,
@@ -172,15 +187,15 @@ impl TraceUri {
 
         let started = Instant::now();
 
-        let (repo, filename) = (repo.to_string(), filename.to_string());
-        let local_path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
-            let api = Api::new().map_err(|e| anyhow::anyhow!("initializing HF API: {e}"))?;
-            api.dataset(repo.clone())
-                .get(&filename)
-                .map_err(|e| anyhow::anyhow!("downloading {filename} from {repo}: {e}"))
-        })
-        .await
-        .context("HF GET task")??;
+        let (owner, name) = hf_repo_parts(repo)?;
+        let client = hf_client().context("initializing HuggingFace client")?;
+        let local_path = client
+            .dataset(owner, name)
+            .download_file()
+            .filename(filename)
+            .send()
+            .await
+            .with_context(|| format!("downloading {filename} from {repo}"))?;
 
         let elapsed = started.elapsed();
         let size = std::fs::metadata(&local_path).map(|m| m.len()).ok();
@@ -383,6 +398,17 @@ mod tests {
 
         let local: TraceUri = "/tmp/x.jsonl".parse().unwrap();
         assert_eq!(local.write_path(dir), PathBuf::from("/tmp/x.jsonl"));
+    }
+
+    #[test]
+    fn hf_repo_parts_requires_owner_and_name() {
+        assert_eq!(
+            hf_repo_parts("Qwen/Qwen3-0.6B").unwrap(),
+            ("Qwen", "Qwen3-0.6B")
+        );
+        assert!(hf_repo_parts("Qwen3-0.6B").is_err());
+        assert!(hf_repo_parts("Qwen/").is_err());
+        assert!(hf_repo_parts("/Qwen3").is_err());
     }
 
     #[test]

@@ -48,7 +48,10 @@ toml_edit = "0.25.12"
 # onig/esaxx_fast: those pull C/C++ (onig_sys, esaxx.cpp) which breaks the static musl
 # release builds, and esaxx is only used for Unigram training, which we never do.
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"] }
+hf-hub = { version = "1", default-features = false, features = ["blocking", "native-tls"] }
+# Only to pick reqwest's native-tls (system OpenSSL) for the hf-hub client; hf-hub
+# itself leaves reqwest on its rustls default.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 # Control API (`--control-address`): runtime config patches and request counters.
@@ -143,3 +146,8 @@ sim-compat = { workspace = true }
 tower = { version = "0.5.3", features = ["util"] }
 # Conformance integrity gate: hash fetched goldens against the manifest sha256.
 sha2 = { workspace = true }
+
+# Selectable TLS backend (native-tls for FIPS builds), pending upstream release of
+# https://github.com/huggingface/hf-hub/pull/201.
+[patch.crates-io]
+hf-hub = { git = "https://github.com/wseaton/hf-hub", rev = "1c3d91c823ad2f64452cd16f376e2e86c46a89f4" }

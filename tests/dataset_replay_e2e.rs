@@ -16,10 +16,13 @@ const MODEL: &str = "Qwen/Qwen3-0.6B";
 const DATASET: &str = "tests/fixtures/datasets/hf_dataset_sample.jsonl";
 
 fn load_tokenizer() -> tokenizers::Tokenizer {
-    let api = hf_hub::api::sync::Api::new().expect("hf api");
-    let file = api
-        .model(MODEL.to_string())
-        .get("tokenizer.json")
+    let (owner, name) = sim_s3::hf_repo_parts(MODEL).expect("owner/name");
+    let file = hf_hub::HFClientSync::from_inner(sim_s3::hf_client().expect("hf client"))
+        .expect("hf client runtime")
+        .model(owner, name)
+        .download_file()
+        .filename("tokenizer.json")
+        .send()
         .expect("download tokenizer");
     tokenizers::Tokenizer::from_file(file).expect("load tokenizer")
 }
