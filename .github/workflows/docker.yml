@@ -1,7 +1,8 @@
 name: Docker
 
 # Build the GPU-free model-server image (UCX + libnixl + vllm-rs + the mock engine) and
-# push it to GHCR, one image per supported vLLM line. Kept off the fast CI lane: the
+# push it to GHCR, one multi-arch (linux/amd64 + linux/arm64) image per supported vLLM
+# line, each arch built on a native runner. Kept off the fast CI lane: the
 # from-source libnixl/UCX build is slow, so this only runs on the main line, release tags,
 # and manual dispatch (all trusted refs).
 #
@@ -32,6 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       include: ${{ steps.parse.outputs.include }}
+      lines: ${{ steps.parse.outputs.lines }}
       simver: ${{ steps.simver.outputs.simver }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,10 +44,15 @@ jobs:
 
       # `cargo xtask docker-matrix` emits one row per compat.toml line, carrying
       # the fork override (patch_repo/patch_rev, "" when the line builds upstream)
-      # so the tap and the vllm-rs frontend stay wire-identical.
+      # so the tap and the vllm-rs frontend stay wire-identical. `lines` is that
+      # list as-is (one manifest merge per line); `builds` crosses it with the
+      # platforms (one native build per line x arch).
       - name: Build matrix from compat.toml
         id: parse
-        run: echo "include=$(cargo xtask docker-matrix)" >> "$GITHUB_OUTPUT"
+        run: |
+          lines="$(cargo xtask docker-matrix)"
+          echo "lines=${lines}" >> "$GITHUB_OUTPUT"
+          echo "include=$(echo "${lines}" | jq -c '[.[] | . as $row | ("linux/amd64", "linux/arm64") | $row + {platform: .}]')" >> "$GITHUB_OUTPUT"
 
       # Sim semver is build metadata orthogonal to the vLLM line (docs/versioning.md
       # "keep the two axes orthogonal").
@@ -53,11 +60,14 @@ jobs:
         id: simver
         run: echo "simver=$(cargo xtask simver)" >> "$GITHUB_OUTPUT"
 
+  # One native build per line x platform, pushed by digest only; the merge job
+  # below stitches the per-arch images into one tagged manifest list. Native
+  # arm64 runners avoid cross-building libnixl/UCX under QEMU.
   build-push:
     needs: compat-matrix
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
-      # One image per line; don't cancel siblings if one line fails to build.
+      # Don't cancel siblings if one line or arch fails to build.
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.compat-matrix.outputs.include) }}
@@ -95,11 +105,79 @@ jobs:
           cargo xtask pin-vllm "${{ matrix.line }}"
           cargo update -p vllm-engine-core-client
 
-      # Per-line tag set. The immutable <simver>-vllm<line> and the floating vllm<line>
-      # always ship; :latest only attaches to the default=true line on the default branch.
-      # TODO(registry path): images publish under ghcr.io/<repo>; if a different registry
-      # or repo name is required, set it here.
-      - name: Image metadata (tags + labels)
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+
+      # The buildx GHA cache makes repeat builds reuse the heavy UCX/libnixl layers; the
+      # cache scope is per line and arch so legs don't clobber each other's layers.
+      #
+      # The tap's protocol rev is already pinned in the context (Cargo.toml rewritten by
+      # the pin step above). VLLM_TARGET_VERSION stamps build.rs so it emits the right
+      # capability cfgs + advertised version for this line (without it, build.rs falls
+      # back to the compat.toml default for every leg). VLLM_REPO/VLLM_REF point the
+      # vllm-rs frontend build at the same source as the tap.
+      - name: Build and push by digest (vLLM ${{ matrix.line }} @ ${{ matrix.tag }}, ${{ matrix.platform }})
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VLLM_TARGET_VERSION=${{ matrix.tag }}
+            VLLM_REPO=${{ env.FRONTEND_REPO }}
+            VLLM_REF=${{ env.FRONTEND_REF }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=vllm${{ matrix.line }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=vllm${{ matrix.line }}-${{ matrix.platform }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-vllm${{ matrix.line }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Per-line tag set applied to the multi-arch manifest. The immutable
+  # <simver>-vllm<line> and the floating vllm<line> always ship; :latest only
+  # attaches to the default=true line on the default branch.
+  # TODO(registry path): images publish under ghcr.io/<repo>; if a different registry
+  # or repo name is required, set it here.
+  merge:
+    needs: [compat-matrix, build-push]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.compat-matrix.outputs.lines) }}
+    env:
+      SIMVER: ${{ needs.compat-matrix.outputs.simver }}
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          path: /tmp/digests
+          pattern: digests-vllm${{ matrix.line }}-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags)
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
@@ -109,26 +187,12 @@ jobs:
             type=raw,value=vllm${{ matrix.line }}
             type=raw,value=latest,enable=${{ matrix.default && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
-      # linux/amd64 only for now: arm64 would cross-build libnixl/UCX under QEMU (very slow).
-      # The buildx GHA cache makes repeat builds reuse the heavy UCX/libnixl layers; the
-      # cache scope is per-line so lines don't clobber each other's protocol-crate layers.
-      #
-      # The tap's protocol rev is already pinned in the context (Cargo.toml rewritten by
-      # the pin step above). VLLM_TARGET_VERSION stamps build.rs so it emits the right
-      # capability cfgs + advertised version for this line (without it, build.rs falls
-      # back to the compat.toml default for every leg). VLLM_REPO/VLLM_REF point the
-      # vllm-rs frontend build at the same source as the tap.
-      - name: Build and push (vLLM ${{ matrix.line }} @ ${{ matrix.tag }})
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          build-args: |
-            VLLM_TARGET_VERSION=${{ matrix.tag }}
-            VLLM_REPO=${{ env.FRONTEND_REPO }}
-            VLLM_REF=${{ env.FRONTEND_REF }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=vllm${{ matrix.line }}
-          cache-to: type=gha,mode=max,scope=vllm${{ matrix.line }}
+      - name: Create multi-arch manifest (vLLM ${{ matrix.line }})
+        working-directory: /tmp/digests
+        run: |
+          tags=()
+          while read -r tag; do tags+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          refs=()
+          for digest in *; do refs+=("ghcr.io/${{ github.repository }}@sha256:${digest}"); done
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${SIMVER}-vllm${{ matrix.line }}"
