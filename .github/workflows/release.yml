@@ -138,7 +138,7 @@ jobs:
       # graph transitively covers the sim-* members. The default-line inspect tarball
       # is the same binary as that line's main tarball, so it shares this SBOM.
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
           tool: cargo-cyclonedx@0.5.9
 
