@@ -1904,7 +1904,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2468,7 +2468,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3610,7 +3610,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.43",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -3648,9 +3648,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3967,7 +3967,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5252,7 +5252,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6e448d0ea9bf3d88d898b65449ca6dc2aec170ac#6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
+source = "git+https://github.com/vllm-project/vllm.git?rev=2cf0a6915ce544dc493a0990f2ea38d81601128a#2cf0a6915ce544dc493a0990f2ea38d81601128a"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -5286,7 +5286,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6e448d0ea9bf3d88d898b65449ca6dc2aec170ac#6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
+source = "git+https://github.com/vllm-project/vllm.git?rev=2cf0a6915ce544dc493a0990f2ea38d81601128a#2cf0a6915ce544dc493a0990f2ea38d81601128a"
 dependencies = [
  "itertools 0.14.0",
  "prometheus-client",
