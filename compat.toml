@@ -55,6 +55,16 @@ tag = "v0.28.0rc2"
 protocol_rev = "74a6576b9b5832494c314405c3cae94db55801e1"
 fidelity_validated = false
 
+# Auto-rolled in by vllm-release-watch as the new default. Review the
+# protocol_rev (pinned to the release tag's commit, not a post-release main
+# sha) and whether this line needs a [patch] fork before promoting fidelity.
+[[vllm]]
+line = "0.28"
+tag = "v0.28.0"
+protocol_rev = "2cf0a6915ce544dc493a0990f2ea38d81601128a"
+fidelity_validated = false
+default = true
+
 [[vllm]]
 # N (head). 0.27 grew the handshake: `EngineCoreReadyResponse` added the
 # parallel-config sizes, the scheduler caps, `instance_id`, and an optional
@@ -65,7 +75,6 @@ line = "0.27"
 tag = "v0.27.1"
 protocol_rev = "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
 fidelity_validated = true
-default = true
 
 [[vllm]]
 # N-1. Same protocol layout as 0.27, minus the 0.27 handshake fields (which the
@@ -73,16 +82,4 @@ default = true
 line = "0.26"
 tag = "v0.26.0"
 protocol_rev = "568afb3a13806beb53bb2e6bd518269357b237c0"
-fidelity_validated = true
-
-[[vllm]]
-# N-2. The 0.25 protocol restructure landed here: types moved into
-# `protocol::{request, output, sampling}` and `EngineCoreOutputs` became the
-# classified enum. Every line in the window shares that layout now, so the
-# outputs shim in `sim_protocol::vllm` is unconditional. This line lacks
-# `EngineCoreOutput.ec_transfer_params` and `PrefillStats.num_cache_creation_tokens`
-# (the `vllm_cache_creation_tokens` cfg, off here).
-line = "0.25"
-tag = "v0.25.1"
-protocol_rev = "752a3a504485790a2e8491cacbb35c137339ad34"
 fidelity_validated = true
