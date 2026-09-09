@@ -148,11 +148,11 @@ upstream, so the repo has no external-fork dependency.
   the only one without `vllm_engine_id_u16`, so it is what keeps that branch
   honest.
 
-0.27 is `fidelity_validated = true` with three goldens (two prefix-cached
-multiturn seeds plus one nocache multiturn, Qwen3-8B on H200), captured against
-that line's released engine image and replaying byte-identically. 0.28 and 0.29
-entered the window without goldens and stay `false` until captures for those
-lines land. See `conformance.md` for the capture runbook.
+0.27 hard-gates CI: it has its three goldens (two prefix-cached multiturn seeds
+plus one nocache multiturn, Qwen3-8B on H200), captured against that line's
+released engine image and replaying byte-identically. 0.28 and 0.29 entered the
+window without goldens and run non-gating until the Golden Capture workflow
+registers theirs. See `conformance.md`.
 
 ### Fork patches
 

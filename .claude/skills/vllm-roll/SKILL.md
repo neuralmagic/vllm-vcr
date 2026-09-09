@@ -137,20 +137,21 @@ Also update, or the roll is half done:
 still *reproduces* the engine. That is conformance: golden captures replayed
 GPU-free (`docs/conformance.md`).
 
-A line enters the window as `fidelity_validated = false` and only flips to `true`
-after a golden for **that line** is captured on the GPU rig, uploaded, registered
-in `conformance/manifest.toml`, and passing the replay gate. Captures do not
-transfer across lines — a new `protocol_rev` invalidates the old ones.
+Whether a line hard-gates CI is derived from `conformance/manifest.toml`: a stable
+line with `MIN_FIDELITY_GOLDENS` fidelity goldens registered gates, anything less
+runs non-blocking. Captures do not transfer across lines — a new `protocol_rev`
+needs its own.
 
-Capturing needs the cluster, not a dev box:
+Normally the automation does this: the watcher's roll PR triggers `docker.yml`,
+which triggers `golden-capture.yml`, which pushes the new line's goldens onto the
+roll branch. When rolling by hand, run the same thing once the line's `:vllm<line>`
+image is published (needs the cluster, not a dev box):
 
 ```bash
-just capture-up && just capture-status    # wait for "forwarding frames"
-just capture-run                          # drive load, fetch trace + reports
-just capture-down                         # release the GPU
-cargo xtask nightly-golden-entry --line <line> --trace <trace.jsonl> --archive <trace.jsonl.gz> \
-  --bucket-path conformance/<tag>/<gpu>/<model>/<workload>.jsonl.gz --workload <workload>
+just conformance-goldens <line>           # capture, upload, register the golden set
 ```
+
+Or dispatch the Golden Capture workflow with `line=<line>`.
 
 ## 6. Cut the release
 

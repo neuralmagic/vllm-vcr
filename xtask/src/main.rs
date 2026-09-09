@@ -4,7 +4,6 @@
 
 mod version;
 
-use std::collections::BTreeSet;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -110,12 +109,12 @@ enum Command {
         latest_stable: String,
     },
     /// Roll the stable window to a newly released vLLM line: add it as the new
-    /// `default`, demote the old default, and drop the oldest stable line once
-    /// the window exceeds `--max-stable`. A release on a line already in the
-    /// window is a patch bump instead: that line's tag/protocol_rev move in
-    /// place and its `fidelity_validated` resets to false. No-op (prints
-    /// `changed=false`) when the release is already tracked or isn't newer.
-    /// The `nightly`/`rc` trackers are never touched. Prints the same
+    /// `default`, demote the old default, drop the oldest stable line once the
+    /// window exceeds `--max-stable`, and drop the dropped line's goldens from
+    /// conformance/manifest.toml. A release on a line already in the window is
+    /// a patch bump instead: that line's tag/protocol_rev move in place. No-op
+    /// (prints `changed=false`) when the release is already tracked or isn't
+    /// newer. The `nightly`/`rc` trackers are never touched. Prints the same
     /// `key=value` summary as `watch-rc`.
     WatchStable {
         /// File holding `git ls-remote --tags https://github.com/vllm-project/vllm.git`.
@@ -130,7 +129,7 @@ enum Command {
         max_stable: usize,
     },
     /// Emit one `[[golden]]` TOML entry for a captured trace.
-    NightlyGoldenEntry {
+    GoldenEntry {
         /// Uncompressed trace JSONL path.
         #[arg(long)]
         trace: PathBuf,
@@ -144,11 +143,11 @@ enum Command {
         #[arg(long)]
         workload: String,
         /// compat.toml line the golden validates.
-        #[arg(long, default_value = "nightly")]
+        #[arg(long)]
         line: String,
     },
     /// Replace a line's generated goldens block in conformance/manifest.toml.
-    SetNightlyGoldens {
+    SetGoldens {
         /// TOML file containing generated `[[golden]]` entries.
         #[arg(long)]
         entries_file: PathBuf,
@@ -156,7 +155,7 @@ enum Command {
         #[arg(long, default_value = MANIFEST_TOML)]
         manifest: PathBuf,
         /// compat.toml line whose generated block is replaced.
-        #[arg(long, default_value = "nightly")]
+        #[arg(long)]
         line: String,
     },
     /// Write a kubeconfig that authenticates through GitHub Actions OIDC.
@@ -187,6 +186,8 @@ struct CiRow {
     line: String,
     tag: String,
     protocol_rev: String,
+    /// Derived from conformance/manifest.toml: the line has enough fidelity
+    /// goldens to hard-gate (`GoldenManifest::validates`).
     fidelity_validated: bool,
     default: bool,
     has_goldens: bool,
@@ -199,7 +200,6 @@ struct DockerRow {
     protocol_rev: String,
     patch_repo: String,
     patch_rev: String,
-    fidelity_validated: bool,
     default: bool,
 }
 
@@ -250,18 +250,18 @@ fn main() -> Result<()> {
             latest_stable,
             max_stable,
         } => watch_stable(&tags_file, &latest_stable, max_stable),
-        Command::NightlyGoldenEntry {
+        Command::GoldenEntry {
             trace,
             archive,
             bucket_path,
             workload,
             line,
-        } => nightly_golden_entry(&trace, &archive, &bucket_path, &workload, &line),
-        Command::SetNightlyGoldens {
+        } => golden_entry(&trace, &archive, &bucket_path, &workload, &line),
+        Command::SetGoldens {
             entries_file,
             manifest,
             line,
-        } => set_nightly_goldens(&entries_file, &manifest, &line),
+        } => set_goldens(&entries_file, &manifest, &line),
         Command::GithubOidcKubeconfig {
             cluster_url,
             plugin_path,
@@ -273,7 +273,7 @@ fn main() -> Result<()> {
 
 fn ci_matrix() -> Result<()> {
     let compat = CompatManifest::load(COMPAT_TOML)?;
-    let golden_lines = golden_lines()?;
+    let goldens = load_goldens()?;
     let rows: Vec<CiRow> = compat
         .lines
         .iter()
@@ -281,9 +281,9 @@ fn ci_matrix() -> Result<()> {
             line: v.line.clone(),
             tag: v.tag.clone(),
             protocol_rev: v.protocol_rev.clone(),
-            fidelity_validated: v.fidelity_validated,
+            fidelity_validated: goldens.validates(v),
             default: v.default,
-            has_goldens: golden_lines.contains(v.line.as_str()),
+            has_goldens: goldens.for_line(&v.line).next().is_some(),
         })
         .collect();
     print_json(&rows)
@@ -300,7 +300,6 @@ fn docker_matrix() -> Result<()> {
             protocol_rev: v.protocol_rev.clone(),
             patch_repo: v.patch_repo.clone().unwrap_or_default(),
             patch_rev: v.patch_rev.clone().unwrap_or_default(),
-            fidelity_validated: v.fidelity_validated,
             default: v.default,
         })
         .collect();
@@ -487,9 +486,9 @@ fn watch_stable(tags_file: &Path, latest_stable: &str, max_stable: usize) -> Res
     let manifest = CompatManifest::load(COMPAT_TOML)?;
     let minor = new.minor_line();
     // A release on a line already in the window is a patch bump (v0.23.0 ->
-    // v0.23.1): move that line's tag/rev in place. The new rev invalidates any
-    // fidelity captures taken against the old one, so the line is demoted back
-    // to fidelity_validated = false until conformance re-passes.
+    // v0.23.1): move that line's tag/rev in place. Its goldens stay registered
+    // and keep gating; the golden-capture workflow recaptures them for the new
+    // rev on the roll PR, and a replay failure in between is the drift signal.
     if let Some(existing) = manifest.line(&minor) {
         let current = VllmVersion::parse(&existing.tag)
             .with_context(|| format!("line {minor} tag {} is unparseable", existing.tag))?;
@@ -503,7 +502,6 @@ fn watch_stable(tags_file: &Path, latest_stable: &str, max_stable: usize) -> Res
         }
         let mut doc = read_compat_toml()?;
         apply_set_line(&mut doc, &minor, Some(latest_stable), Some(&rev))?;
-        apply_demote_fidelity(&mut doc, &minor)?;
         std::fs::write(COMPAT_TOML, doc.to_string()).context("writing compat.toml")?;
         eprintln!(
             "patch-bumped line {minor}: {} -> {latest_stable} ({rev})",
@@ -533,6 +531,22 @@ fn watch_stable(tags_file: &Path, latest_stable: &str, max_stable: usize) -> Res
     apply_roll_stable(&mut doc, &minor, latest_stable, &rev, max_stable)?;
     std::fs::write(COMPAT_TOML, doc.to_string()).context("writing compat.toml")?;
     eprintln!("rolled stable window: new default {latest_stable} (line {minor})");
+
+    let rolled = CompatManifest::parse(&doc.to_string())?;
+    let dropped: Vec<&str> = manifest
+        .lines
+        .iter()
+        .filter(|l| rolled.line(&l.line).is_none())
+        .map(|l| l.line.as_str())
+        .collect();
+    if !dropped.is_empty() && Path::new(MANIFEST_TOML).exists() {
+        let mut text = std::fs::read_to_string(MANIFEST_TOML).context("reading manifest")?;
+        for line in &dropped {
+            text = remove_goldens_block(&text, line);
+            eprintln!("dropped line {line}'s goldens from {MANIFEST_TOML}");
+        }
+        std::fs::write(MANIFEST_TOML, text).context("writing manifest")?;
+    }
     print_watch_summary(WatchOutcome::ChangedDefault, latest_stable, &minor, &rev);
     Ok(())
 }
@@ -568,7 +582,7 @@ fn print_watch_summary(outcome: WatchOutcome, tag: &str, line: &str, rev: &str) 
     println!("is_default={is_default}");
 }
 
-fn nightly_golden_entry(
+fn golden_entry(
     trace: &Path,
     archive: &Path,
     bucket_path: &str,
@@ -593,7 +607,7 @@ fn nightly_golden_entry(
     Ok(())
 }
 
-fn set_nightly_goldens(entries_file: &Path, manifest: &Path, line: &str) -> Result<()> {
+fn set_goldens(entries_file: &Path, manifest: &Path, line: &str) -> Result<()> {
     let entries = std::fs::read_to_string(entries_file)
         .with_context(|| format!("reading {}", entries_file.display()))?;
     let mut text = std::fs::read_to_string(manifest)
@@ -779,6 +793,28 @@ fn replace_goldens_block(manifest: &str, entries: &str, line: &str) -> String {
     format!("{}\n\n{block}\n", manifest.trim_end())
 }
 
+/// Drop one line's generated goldens block (markers included). A manifest
+/// without a block for the line is returned unchanged.
+fn remove_goldens_block(manifest: &str, line: &str) -> String {
+    let label = line.to_uppercase();
+    let start = format!("# BEGIN {label} GOLDENS");
+    let end = format!("# END {label} GOLDENS");
+    let Some(start_idx) = manifest.find(&start) else {
+        return manifest.to_string();
+    };
+    let Some(end_rel) = manifest[start_idx..].find(&end) else {
+        return manifest.to_string();
+    };
+    let end_idx = start_idx + end_rel + end.len();
+    let before = manifest[..start_idx].trim_end();
+    let after = manifest[end_idx..].trim_start_matches('\n');
+    if after.is_empty() {
+        format!("{before}\n")
+    } else {
+        format!("{before}\n\n{after}")
+    }
+}
+
 /// Set a `[[vllm]]` line's `tag` and/or `protocol_rev` in place, preserving the
 /// surrounding formatting and comments. `None` leaves that field alone. Returns
 /// `true` if anything changed, so the caller (and the watcher's `git diff` check)
@@ -805,21 +841,6 @@ fn apply_set_line(
         changed |= set_str_field(entry, "protocol_rev", rev)?;
     }
     Ok(changed)
-}
-
-/// Reset a `[[vllm]]` line's `fidelity_validated` to `false`. Used when the
-/// line's tag/rev moves: existing fidelity captures were taken against the old
-/// rev, so the promotion has to be re-earned through the conformance gates.
-fn apply_demote_fidelity(doc: &mut DocumentMut, line: &str) -> Result<()> {
-    let tables = doc["vllm"]
-        .as_array_of_tables_mut()
-        .context("compat.toml [[vllm]] is not an array of tables")?;
-    let entry = tables
-        .iter_mut()
-        .find(|t| t.get("line").and_then(Item::as_str) == Some(line))
-        .with_context(|| format!("no [[vllm]] entry with line = \"{line}\" in compat.toml"))?;
-    entry["fidelity_validated"] = value(false);
-    Ok(())
 }
 
 /// Set an existing string field on a `[[vllm]]` table, returning whether it moved.
@@ -862,14 +883,15 @@ fn apply_roll_stable(
     // (i.e. right after the nightly/rc trackers), so the file stays newest-first.
     let mut entry = Table::new();
     entry.decor_mut().set_prefix(
-        "\n# Auto-rolled in by vllm-release-watch as the new default. Review the\n\
-         # protocol_rev (pinned to the release tag's commit, not a post-release main\n\
-         # sha) and whether this line needs a [patch] fork before promoting fidelity.\n",
+        "\n# Auto-rolled in by vllm-release-watch as the new default. Its goldens are\n\
+         # captured onto the roll PR by the golden-capture workflow once docker.yml\n\
+         # has published the line's image; the line hard-gates CI as soon as they are\n\
+         # registered. Review the protocol_rev (pinned to the release tag's commit,\n\
+         # not a post-release main sha) and whether this line needs a [patch] fork.\n",
     );
     entry["line"] = value(minor);
     entry["tag"] = value(tag);
     entry["protocol_rev"] = value(rev);
-    entry["fidelity_validated"] = value(false);
     entry["default"] = value(true);
 
     let insert_at = first_stable_index(tables);
@@ -916,13 +938,12 @@ fn read_compat_toml() -> Result<DocumentMut> {
         .context("parsing compat.toml")
 }
 
-/// Lines with at least one golden registered (drives the conformance fetch leg).
-fn golden_lines() -> Result<BTreeSet<String>> {
+/// The golden manifest, empty when none has been committed yet.
+fn load_goldens() -> Result<GoldenManifest> {
     if !Path::new(MANIFEST_TOML).exists() {
-        return Ok(BTreeSet::new());
+        return Ok(GoldenManifest::default());
     }
-    let manifest = GoldenManifest::load(MANIFEST_TOML)?;
-    Ok(manifest.goldens.into_iter().map(|g| g.line).collect())
+    GoldenManifest::load(MANIFEST_TOML)
 }
 
 fn read_cargo_toml() -> Result<DocumentMut> {
@@ -1018,7 +1039,6 @@ anyhow = \"1\"
 line = \"nightly\"
 tag = \"nightly\"
 protocol_rev = \"oldsha\"
-fidelity_validated = false
 
 [[vllm]]
 line = \"0.23\"
@@ -1050,7 +1070,6 @@ default = true
         let (out, _) = set_nightly(COMPAT, "newsha");
         assert!(out.contains("# manifest header"));
         assert!(out.contains("# nightly tracks vLLM main"));
-        assert!(out.contains("fidelity_validated = false"));
         assert!(out.contains(r#"default = true"#));
     }
 
@@ -1079,13 +1098,11 @@ default = true
 line = \"nightly\"
 tag = \"nightly\"
 protocol_rev = \"mainsha\"
-fidelity_validated = false
 
 [[vllm]]
 line = \"rc\"
 tag = \"v0.24.0rc1\"
 protocol_rev = \"rcsha\"
-fidelity_validated = false
 
 [[vllm]]
 line = \"0.23\"
@@ -1117,7 +1134,6 @@ protocol_rev = \"sha21\"
         assert_eq!(default.line, "0.24");
         assert_eq!(default.tag, "v0.24.0");
         assert_eq!(default.protocol_rev, "sha24");
-        assert!(!default.fidelity_validated);
         assert_eq!(m.lines.iter().filter(|l| l.default).count(), 1);
     }
 
@@ -1151,38 +1167,20 @@ protocol_rev = \"sha21\"
     }
 
     #[test]
-    fn patch_bump_moves_the_line_in_place_and_demotes_fidelity() {
+    fn patch_bump_moves_the_line_in_place() {
         // A patch release on an existing line (v0.22.1 -> v0.22.2) edits that
-        // line only: same window shape, same default, fidelity reset to false.
+        // line only: same window shape, same default.
         let mut doc: DocumentMut = WINDOW.parse().unwrap();
         apply_set_line(&mut doc, "0.22", Some("v0.22.2"), Some("sha222")).unwrap();
-        apply_demote_fidelity(&mut doc, "0.22").unwrap();
         let m = CompatManifest::parse(&doc.to_string()).unwrap();
 
         let line = m.line("0.22").unwrap();
         assert_eq!(line.tag, "v0.22.2");
         assert_eq!(line.protocol_rev, "sha222");
-        assert!(!line.fidelity_validated);
         assert!(!line.default, "a patch bump never moves the default");
         assert_eq!(m.default_line().unwrap().line, "0.23");
         let order: Vec<&str> = m.lines.iter().map(|l| l.line.as_str()).collect();
         assert_eq!(order, ["nightly", "rc", "0.23", "0.22", "0.21"]);
-    }
-
-    #[test]
-    fn demote_fidelity_resets_a_promoted_line() {
-        let toml = "\
-[[vllm]]
-line = \"0.23\"
-tag = \"v0.23.0\"
-protocol_rev = \"sha23\"
-fidelity_validated = true
-default = true
-";
-        let mut doc: DocumentMut = toml.parse().unwrap();
-        apply_demote_fidelity(&mut doc, "0.23").unwrap();
-        let m = CompatManifest::parse(&doc.to_string()).unwrap();
-        assert!(!m.line("0.23").unwrap().fidelity_validated);
     }
 
     /// Re-serialize a parsed manifest back to TOML for a second roll. The field
@@ -1194,7 +1192,6 @@ default = true
             out.push_str(&format!("line = \"{}\"\n", l.line));
             out.push_str(&format!("tag = \"{}\"\n", l.tag));
             out.push_str(&format!("protocol_rev = \"{}\"\n", l.protocol_rev));
-            out.push_str(&format!("fidelity_validated = {}\n", l.fidelity_validated));
             if l.default {
                 out.push_str("default = true\n");
             }
@@ -1243,6 +1240,37 @@ nightly-entry
         assert!(out.contains("# BEGIN 0.27 GOLDENS"));
         assert!(out.contains("v027-entry"));
         assert!(out.contains("# END 0.27 GOLDENS"));
+    }
+
+    /// A roll drops the aged-out line's goldens with it, leaving every other
+    /// block (and the hand-written header) intact.
+    #[test]
+    fn remove_goldens_block_drops_only_that_line() {
+        let existing = "\
+header
+
+# BEGIN 0.25 GOLDENS
+v025-entry
+# END 0.25 GOLDENS
+
+# BEGIN 0.26 GOLDENS
+v026-entry
+# END 0.26 GOLDENS
+";
+        let out = remove_goldens_block(existing, "0.25");
+        assert_eq!(
+            out,
+            "header\n\n# BEGIN 0.26 GOLDENS\nv026-entry\n# END 0.26 GOLDENS\n"
+        );
+
+        let last = remove_goldens_block(&out, "0.26");
+        assert_eq!(last, "header\n");
+
+        assert_eq!(
+            remove_goldens_block(&last, "0.24"),
+            last,
+            "absent block is a no-op"
+        );
     }
 
     #[test]

@@ -1,10 +1,14 @@
 # Conformance capture runbook
 
-How to capture a golden trace for one vLLM line, upload it to the private golden
-bucket, register it in `conformance/manifest.toml`, and let CI flip that line to
-`fidelity_validated = true`. This is the "profile-once" half of the
-profile-once/replay-many model. The "replay-many" half is GPU-free and runs in CI
-and on the offline replay rig.
+How a golden trace for one vLLM line gets captured, uploaded to the private golden
+bucket, and registered in `conformance/manifest.toml`, which is what makes that
+line a hard CI gate. This is the "profile-once" half of the profile-once/replay-many
+model. The "replay-many" half is GPU-free and runs in CI and on the offline replay
+rig.
+
+The normal path is fully automated: a stable roll PR gets its goldens pushed onto
+it by the Golden Capture workflow (see [Automation](#automation)). The rest of this
+runbook is what that workflow does, for when you need to run a piece of it by hand.
 
 For the version-mapping strategy this runbook serves (the N-2 window, `compat.toml`,
 the build matrix, image tagging), see [versioning.md](versioning.md). For the trace
@@ -26,7 +30,8 @@ schema, see `crates/sim-trace/src/trace.rs`.
 - [Fetch the trace + step stats](#fetch-the-trace--step-stats)
 - [Compute the config hash](#compute-the-config-hash)
 - [Upload + register the golden](#upload--register-the-golden)
-- [Flip the line to validated](#flip-the-line-to-validated)
+- [Automation](#automation)
+- [When a line gates](#when-a-line-gates)
 - [The GPU-free replay half](#the-gpu-free-replay-half)
 - [Building the capture image on waldorf](#building-the-capture-image-on-waldorf)
 
@@ -81,23 +86,20 @@ real engine, because the point is to measure the engine vLLM actually ships for 
 
 ## What pins the vLLM version
 
-The vLLM version under capture is pinned by the engine container image digest, not by
-a tag. The per-line engine + tap/frontend images live in `models.toml` under
-`[lines.<vllm_tag>]`, e.g.:
+`compat.toml` does. A capture targets a compat line (`--line`, default: the
+`default = true` line) and `gen-capture-jobs.py` derives both images from it:
 
-```toml
-[lines."v0.23.0"]
-engine_image = "docker.io/vllm/vllm-openai:v0.23.0@sha256:6d8429e3..."  # release, by digest
-tap_image    = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"     # built for this line
-```
+- engine: `docker.io/vllm/vllm-openai:<tag>` for a stable line (the release tag is
+  immutable, so it is the ground truth for "which vLLM this golden measures"), or
+  the post-merge image at `protocol_rev` for `nightly`. The `rc` line never gets
+  goldens.
+- tap + frontend: `ghcr.io/neuralmagic/vllm-vcr:vllm<line>`, the per-line capture
+  image (`vllm-vcr record` + `vllm-rs`) built against that line's `protocol_rev` so
+  the wire parses, which is exactly what CI's `docker.yml` publishes.
 
-For a conformance capture, pin the engine to the **release tag's** published image for
-the line you are validating (the `tag` field in `compat.toml`, e.g. `v0.23.0`), by its
-digest, that digest is the ground truth for "which vLLM this golden measures" (record it
-in the manifest entry's provenance). The `nightly` line instead points at the post-merge
-image at its `protocol_rev`. The tap and frontend stay on the per-line capture image
-(`vllm-vcr record` + `vllm-rs`), built against that line's `protocol_rev` so the wire
-parses, which is exactly what CI's `docker.yml` publishes as `:vllm<line>`.
+The resolved images are stamped on the Job as annotations, and the engine's reported
+version lands in the trace meta (`vllm_version`), so a golden carries its own
+provenance. There is no second table of images to keep in sync.
 
 ## Capture hygiene
 
@@ -122,13 +124,14 @@ golden you can gate on and noise:
 Each capture is a Kueue-admitted Job on the GPU cluster (waldorf), so Kueue holds the Job
 until GPU quota admits it and releases the GPU the moment the capture completes. The
 capture matrix lives in `deploy/trace-capture/models.toml`: one `[[capture]]` per
-model × scenario (`baseline` / `nocache` / `specdecode` / `multimodal`), each pinned to a
-line's engine + tap/frontend images. `gen-capture-jobs.py` turns a target into a Job; the
-scenario drives the engine *and* tap flags so the `config_hash` matches the engine config
+model × scenario (`baseline` / `nocache` / `specdecode` / `multimodal`), line-agnostic.
+`gen-capture-jobs.py --line <line> <target>` turns a target into a Job for that line
+(named `trace-<line>-<target>`, e.g. `trace-029-qwen3-8b-mt-s7`); the scenario drives
+the engine *and* tap flags so the `config_hash` matches the engine config
 (prefix-cache, spec-decode). Generated conformance Jobs enable `--record-tokens` and
 `--step-stats-out`, so the trace is usable as a fidelity golden and the sidecar stats are
-available for timing inspection. To add a model or scenario, edit `models.toml`, no YAML by
-hand.
+available for timing inspection. `[goldens].targets` names the per-line golden set (what
+the automation captures). To add a model or scenario, edit `models.toml`, no YAML by hand.
 
 All capture Jobs target `conformance-queue` (`base/conformance-queue.yaml`), a dedicated Kueue
 queue with a one-GPU quota, so they run **one at a time**: submit as many as you like and
@@ -144,25 +147,23 @@ The flow (wrapped by the justfile):
 > justfile recipes below, or filter by `llm-d.ai/rig` before apply.
 
 ```bash
-just conformance-queue                  # apply the one-GPU queue (once)
-just conformance-list                   # see the targets in models.toml
-just conformance-capture qwen3-8b       # ship loadgen scripts + submit the Job
-just conformance-capture \
-  nightly-qwen3-8b-mt-s7 \
-  nightly-qwen3-8b-mt-s13 \
-  nightly-qwen3-8b-nocache-s7           # rolling vLLM main goldens
+just conformance-queue                       # apply the one-GPU queue (once)
+just conformance-list                        # targets in models.toml + the golden set
+just conformance-capture 0.29 qwen3-8b       # ship loadgen scripts + submit the Job
+just conformance-goldens 0.29                # the whole golden set: capture, upload, register
+just conformance-goldens nightly             # same against vLLM main
 
 # raw equivalent:
-python3 deploy/trace-capture/gen-capture-jobs.py qwen3-8b | kubectl apply -f -
+python3 deploy/trace-capture/gen-capture-jobs.py --line 0.29 qwen3-8b | kubectl apply -f -
 
 # wait for the loadgen to finish (it logs "waiting for fetch"):
-kubectl logs -f job/trace-qwen3-8b -c loadgen
+kubectl logs -f job/trace-029-qwen3-8b -c loadgen
 ```
 
-To capture a new line (e.g. a new release or `nightly`), add a `[lines.<vllm_tag>]` entry
-(engine image digest + the tap/frontend image built for that line) and point captures at it.
-The built-in nightly set is deliberately small: two multiturn seeds with prefix caching
-enabled plus one nocache multiturn capture, all against Qwen3-8B.
+A new line needs nothing here: as soon as it is in `compat.toml` and its `:vllm<line>`
+image is published, `--line` resolves it. The golden set is deliberately small: two
+multiturn seeds with prefix caching enabled plus one nocache multiturn capture, all
+against Qwen3-8B.
 
 ## Fetch the trace + step stats
 
@@ -171,7 +172,7 @@ fetch":
 
 ```bash
 NAMESPACE=${NAMESPACE:-inference-sim}
-JOB=trace-nightly-qwen3-8b-mt-s7
+JOB=trace-029-qwen3-8b-mt-s7
 
 # The trace, and the per-step SchedulerStats sidecar if captured.
 kubectl exec -n "$NAMESPACE" "job/$JOB" -c loadgen -- cat /trace/trace.jsonl > "$JOB.jsonl"
@@ -256,42 +257,55 @@ workload    = "multiturn"                              # human-readable workload
 role        = "fidelity"                              # "schema" or "fidelity"
 ```
 
-Nightly entries use `line = "nightly"` and live under the `conformance/nightly/...`
-prefix, for example
-`conformance/nightly/H200/Qwen/Qwen3-8B/multiturn-seed7.jsonl.gz`. Once any nightly
-entry lands, the nightly canary detects it and fetches/replays it before refreshing the
-rolling prerelease.
-
-The `Nightly Golden Capture` workflow automates this operator loop. It runs on a
-nightly schedule and can also be manually dispatched with an alternate target list.
-It authenticates to the conformance cluster with GitHub OIDC, submits the configured
-Kueue capture targets, uploads the token-recording traces, and opens or updates a PR
-with the generated nightly manifest block. It expects these repository variables:
-
-- `CONFORMANCE_CLUSTER_URL` — Kubernetes API server URL for the capture cluster.
-- `CONFORMANCE_CAPTURE_ROLE_ARN` — AWS role allowed to write `conformance/*` objects.
+Generated entries live in a per-line block bounded by `# BEGIN <LINE> GOLDENS` /
+`# END <LINE> GOLDENS`; `cargo xtask set-goldens --line <line>` replaces the block
+wholesale, and the stable roll (`cargo xtask watch-stable`) deletes the block of a
+line that ages out of the window. Nightly entries use `line = "nightly"` and live
+under the `conformance/nightly/...` prefix; once any nightly entry lands, the nightly
+canary fetches and replays it before refreshing the rolling prerelease.
 
 A line gains `has_goldens = true` in the CI matrix automatically once it has a
 `[[golden]]` entry; that is what turns on the AWS fetch leg for it (lines without
 goldens skip credentials entirely).
+
+## Automation
+
+`.github/workflows/golden-capture.yml` runs `ci/capture-goldens.sh`, which is the
+whole loop above for one line: submit the `[goldens].targets` Jobs, wait, fetch,
+upload, and replace the line's manifest block. Three triggers:
+
+- **A stable roll.** The release watcher pushes `auto/vllm-stable-roll`; `docker.yml`
+  builds that branch's images; when it succeeds, Golden Capture runs for the branch's
+  new default line and pushes the manifest commit onto the same branch. The roll PR
+  then carries the line and its goldens, and the line's conformance leg hard-gates
+  from its first CI run. It skips when the manifest already has goldens at that tag,
+  and the watcher leaves an open roll PR alone, so the goldens commit survives the
+  watcher's daily re-run.
+- **Nightly.** The schedule refreshes the `nightly` line's goldens and opens a PR
+  from `auto/goldens-nightly`.
+- **Manual.** `workflow_dispatch` takes a line (empty: the default line) and an
+  optional target list, and opens a PR from `auto/goldens-<line>`.
+
+It authenticates to the capture cluster with GitHub OIDC and expects these repository
+variables:
+
+- `CONFORMANCE_CLUSTER_URL` — Kubernetes API server URL for the capture cluster.
+- `CONFORMANCE_CAPTURE_ROLE_ARN` — AWS role allowed to write `conformance/*` objects.
 
 `role = "schema"` captures gate the wire protocol parsing (cheap, never a fidelity
 gate); `role = "fidelity"` captures gate replay accuracy. Per the hygiene rules,
 fitting captures and fidelity-gate captures must be different traces, and a fidelity
 gate should reference multiple seeds.
 
-## Flip the line to validated
+## When a line gates
 
-A new line lands in `compat.toml` with `fidelity_validated = false`. The matrix builds
-it and runs conformance, but a fidelity failure does not block promotion
-(continue-on-error in the non-gating conformance step, see `.github/workflows/ci.yml`).
-
-Once the golden(s) are uploaded, registered, and the replay gates green for that line:
-
-1. Flip `fidelity_validated = true` for the line in `compat.toml`.
-2. On the next run the conformance leg for that line becomes a hard gate.
-3. When the line becomes the head, move `default = true` to it (`:latest` follows the
-   default line) and drop the now-N-4 line per `versioning.md`.
+Nothing is flipped by hand. `cargo xtask ci-matrix` marks a line `fidelity_validated`
+when it is a stable line with at least `MIN_FIDELITY_GOLDENS` (three) `role = "fidelity"`
+entries in the manifest (`sim_compat::GoldenManifest::validates`). Until then its
+conformance leg runs but does not block (continue-on-error in `.github/workflows/ci.yml`);
+from then on a replay failure is red. A patch bump on a line keeps its goldens (and
+gate) in place until the roll PR's capture replaces them; a line that leaves the window
+takes its block with it. The `nightly`/`rc` trackers never gate.
 
 ## The conformance runner
 
@@ -324,12 +338,12 @@ which is the normal state until captures exist. Set `$CONFORMANCE_MANIFEST` to p
 an alternate manifest. The pure assertions live in `src/conformance.rs` and are
 unit-tested independently of any real capture.
 
-The nightly canary is therefore a protocol-drift smoke until nightly captures exist,
-not a true fidelity gate: after pinning to live vLLM `main`, it runs the manifest
-runner for schema/provenance plumbing and also runs the HEAD-client protocol e2e
-tests (`engine_core_e2e` and `tap_e2e`) so a client-wire break still turns the run red.
-When a `line = "nightly"` golden is added, the canary detects it, assumes the same
-golden-fetch role as CI, and replays it before publishing the rolling prerelease.
+The nightly canary is a protocol-drift smoke until nightly captures exist, not a
+fidelity gate: after pinning to live vLLM `main`, it runs the manifest runner for
+schema/provenance plumbing and also runs the HEAD-client protocol e2e tests
+(`engine_core_e2e` and `tap_e2e`) so a client-wire break still turns the run red.
+Once `line = "nightly"` goldens are registered, the canary assumes the same
+golden-fetch role as CI and replays them before publishing the rolling prerelease.
 
 ## The GPU-free replay half
 

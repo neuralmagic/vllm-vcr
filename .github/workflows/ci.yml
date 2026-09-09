@@ -130,9 +130,10 @@ jobs:
   # parse in its own tiny job means the heavy per-line build job can `needs:` a
   # ready-made list instead of re-parsing the manifest per matrix leg.
   #
-  # compat.toml is the source of truth (see docs/versioning.md). Each [[vllm]] entry
-  # carries: line, tag, protocol_rev, fidelity_validated, default. We surface every
-  # entry; the build job decides per-leg whether conformance gates (fidelity_validated).
+  # compat.toml is the source of truth (see docs/versioning.md). Each row carries
+  # line, tag, protocol_rev, default, plus two fields derived from
+  # conformance/manifest.toml: has_goldens and fidelity_validated (enough fidelity
+  # goldens registered for the line). The build job gates per leg on the latter.
   compat-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -160,12 +161,12 @@ jobs:
   # side. fail-fast off so one drifting line doesn't cancel the others' signal.
   #
   # Gating: the whole leg is a hard gate ONLY for fidelity_validated lines
-  # (continue-on-error below). A line enters the window as fidelity_validated = false,
-  # so a newly added or older line that doesn't yet build against its protocol_rev
-  # surfaces the failure as a non-blocking annotation instead of blocking the merge.
-  # The default line's build safety does not depend on this: the build-and-test job
-  # above already hard-gates the default pin (fmt/clippy/build/test). A line becomes a
-  # hard per-line gate the moment it flips to fidelity_validated = true.
+  # (continue-on-error below), which is derived: a stable line with the full golden
+  # set registered in conformance/manifest.toml. A line without goldens surfaces its
+  # failures as non-blocking annotations instead of blocking the merge. The default
+  # line's build safety does not depend on this: the build-and-test job above already
+  # hard-gates the default pin (fmt/clippy/build/test). A line becomes a hard per-line
+  # gate the moment its goldens land (the roll PR carries them, see golden-capture.yml).
   conformance:
     needs: compat-matrix
     runs-on: ubuntu-latest

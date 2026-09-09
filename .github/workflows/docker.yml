@@ -4,7 +4,9 @@ name: Docker
 # push it to GHCR, one multi-arch (linux/amd64 + linux/arm64) image per supported vLLM
 # line, each arch built on a native runner. Kept off the fast CI lane: the
 # from-source libnixl/UCX build is slow, so this only runs on the main line, release tags,
-# and manual dispatch (all trusted refs).
+# the release watcher's stable-roll branch (so golden-capture.yml can capture the new
+# line before the roll merges), and manual dispatch (all trusted refs). A manifest-only
+# push (the goldens landing on the roll branch) changes no image, so it is ignored.
 #
 # Per-line tagging (docs/versioning.md "Versioning"):
 #   vllm-vcr:<simver>-vllm<line>   immutable, the real artifact (sim ver x vLLM line)
@@ -14,8 +16,11 @@ name: Docker
 #   vllm-vcr:latest                sim-head x the default=true line only
 on:
   push:
-    branches: [main]
+    branches: [main, auto/vllm-stable-roll]
     tags: ['v*']
+    paths-ignore:
+      - 'conformance/**'
+      - 'docs/**'
   workflow_dispatch:
 
 concurrency:

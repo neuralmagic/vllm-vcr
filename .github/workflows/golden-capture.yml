@@ -1,0 +1,239 @@
+name: Golden Capture
+
+# Capture the per-line golden set (deploy/trace-capture/models.toml [goldens])
+# on the GPU cluster, upload the traces, and register them in
+# conformance/manifest.toml. Three ways in:
+#
+#   * workflow_run (Docker on auto/vllm-stable-roll): the stable roll's images
+#     just published, so capture the roll PR's new default line and push the
+#     manifest onto that branch. The PR then carries the line AND its goldens,
+#     and CI hard-gates the line from its first run. Skipped when the manifest
+#     already holds goldens at that tag (the manifest push itself re-triggers
+#     Docker only if images changed, see docker.yml paths-ignore).
+#   * schedule: refresh the nightly line's goldens and open a PR.
+#   * workflow_dispatch: any line (default: the compat.toml default) and any
+#     target list, opening a PR.
+#
+# Expects repository variables CONFORMANCE_CLUSTER_URL (capture cluster API) and
+# CONFORMANCE_CAPTURE_ROLE_ARN (AWS role that may write conformance/* objects).
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_run:
+    workflows: [Docker]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      line:
+        description: "compat.toml line to capture (empty: the default line)"
+        type: string
+        required: false
+        default: ""
+      targets:
+        description: "Space-separated models.toml capture targets (empty: the [goldens] set)"
+        type: string
+        required: false
+        default: ""
+      namespace:
+        description: "Kubernetes namespace for capture jobs"
+        type: string
+        required: false
+        default: "inference-sim"
+      cleanup:
+        description: "Delete capture Jobs at the end of the workflow"
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: golden-capture
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+  S3_BUCKET: llm-d-artifacts-783952637884
+  ROLL_BRANCH: auto/vllm-stable-roll
+  CANARY_APP_ID: ${{ secrets.CANARY_APP_ID }}
+
+jobs:
+  capture:
+    # A Docker run only matters when it published the roll branch's images.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'auto/vllm-stable-roll')
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      # The App token lets the manifest push re-trigger CI on the roll PR (the
+      # default GITHUB_TOKEN can't). Falls back to GITHUB_TOKEN until provisioned.
+      - name: Mint App token
+        id: app-token
+        if: ${{ env.CANARY_APP_ID != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CANARY_APP_ID }}
+          private-key: ${{ secrets.CANARY_APP_PRIVATE_KEY }}
+
+      - name: Resolve capture target
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_LINE: ${{ inputs.line }}
+          INPUT_TARGETS: ${{ inputs.targets }}
+          INPUT_NAMESPACE: ${{ inputs.namespace }}
+        run: |
+          set -euo pipefail
+          case "${EVENT}" in
+            workflow_run)
+              ref="${HEAD_BRANCH}"; line=""; mode="push" ;;
+            schedule)
+              ref="${GITHUB_REF_NAME}"; line="nightly"; mode="pr" ;;
+            *)
+              ref="${GITHUB_REF_NAME}"; line="${INPUT_LINE}"; mode="pr" ;;
+          esac
+          {
+            echo "ref=${ref}"
+            echo "line=${line}"
+            echo "mode=${mode}"
+            echo "targets=${INPUT_TARGETS}"
+            echo "namespace=${INPUT_NAMESPACE:-inference-sim}"
+          } >> "$GITHUB_OUTPUT"
+          echo "ref=${ref} line=${line:-<default>} mode=${mode}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          persist-credentials: ${{ steps.target.outputs.mode == 'push' }}
+
+      # The roll PR already has goldens at this tag: nothing to do. A patch bump
+      # moves the tag, so the bucket paths stop matching and capture runs again.
+      - name: Check whether the line already has goldens at its tag
+        id: have
+        env:
+          LINE: ${{ steps.target.outputs.line }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "${LINE}" ]]; then args=(--line "${LINE}"); fi
+          read -r line tag <<<"$(python3 deploy/trace-capture/gen-capture-jobs.py "${args[@]}" --show-line)"
+          have=false
+          if [[ "${{ steps.target.outputs.mode }}" == "push" ]] \
+            && grep -q "conformance/${tag}/" conformance/manifest.toml; then
+            have=true
+          fi
+          echo "resolved line=${line} tag=${tag} have_goldens=${have}"
+          {
+            echo "line=${line}"
+            echo "tag=${tag}"
+            echo "skip=${have}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        if: ${{ steps.have.outputs.skip != 'true' }}
+
+      - uses: ./.github/actions/setup-sccache
+        if: ${{ steps.have.outputs.skip != 'true' }}
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
+
+      - name: Validate capture configuration
+        if: ${{ steps.have.outputs.skip != 'true' }}
+        env:
+          CLUSTER_URL: ${{ vars.CONFORMANCE_CLUSTER_URL }}
+          CAPTURE_ROLE_ARN: ${{ vars.CONFORMANCE_CAPTURE_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          test -n "$CLUSTER_URL" || { echo "Set repository variable CONFORMANCE_CLUSTER_URL"; exit 1; }
+          test -n "$CAPTURE_ROLE_ARN" || { echo "Set repository variable CONFORMANCE_CAPTURE_ROLE_ARN"; exit 1; }
+
+      - name: Install kubectl and jq
+        if: ${{ steps.have.outputs.skip != 'true' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+          version="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
+          curl -sSLo kubectl "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+          kubectl version --client
+          jq --version
+
+      - name: Authenticate to conformance cluster
+        if: ${{ steps.have.outputs.skip != 'true' }}
+        uses: ./.github/actions/setup-cluster-auth
+        with:
+          cluster-url: ${{ vars.CONFORMANCE_CLUSTER_URL }}
+
+      - name: Configure AWS credentials for golden upload
+        if: ${{ steps.have.outputs.skip != 'true' }}
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.CONFORMANCE_CAPTURE_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Run capture jobs and update manifest
+        if: ${{ steps.have.outputs.skip != 'true' }}
+        env:
+          LINE: ${{ steps.have.outputs.line }}
+          TARGETS: ${{ steps.target.outputs.targets }}
+          NAMESPACE: ${{ steps.target.outputs.namespace }}
+          OUT_DIR: ${{ runner.temp }}/goldens
+        run: bash ci/capture-goldens.sh
+
+      - name: Show manifest diff
+        if: ${{ steps.have.outputs.skip != 'true' }}
+        run: git diff -- conformance/manifest.toml
+
+      # Roll PR: the goldens ride on the same branch as the line they validate.
+      - name: Push manifest onto the roll branch
+        if: ${{ steps.have.outputs.skip != 'true' && steps.target.outputs.mode == 'push' }}
+        env:
+          LINE: ${{ steps.have.outputs.line }}
+          TAG: ${{ steps.have.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add conformance/manifest.toml
+          git commit -m "conformance: register ${LINE} goldens (${TAG})"
+          git push origin "HEAD:${{ steps.target.outputs.ref }}"
+
+      - name: Open or update manifest PR
+        if: ${{ steps.have.outputs.skip != 'true' && steps.target.outputs.mode == 'pr' }}
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          sign-commits: ${{ env.CANARY_APP_ID != '' }}
+          add-paths: conformance/manifest.toml
+          base: ${{ steps.target.outputs.ref }}
+          branch: auto/goldens-${{ steps.have.outputs.line }}
+          delete-branch: true
+          commit-message: "conformance: register ${{ steps.have.outputs.line }} goldens (${{ steps.have.outputs.tag }})"
+          title: "conformance: refresh ${{ steps.have.outputs.line }} goldens"
+          body: |
+            Captured the `${{ steps.have.outputs.line }}` golden set against vLLM
+            `${{ steps.have.outputs.tag }}` and registered it in `conformance/manifest.toml`.
+
+      - name: Cleanup capture jobs
+        if: ${{ always() && steps.have.outputs.skip != 'true' && (github.event_name != 'workflow_dispatch' || inputs.cleanup) }}
+        env:
+          NAMESPACE: ${{ steps.target.outputs.namespace }}
+          LINE: ${{ steps.have.outputs.line }}
+        run: |
+          set -euo pipefail
+          kubectl delete job -n "$NAMESPACE" -l "llm-d.ai/guide=trace-capture,llm-d.ai/line=${LINE}" --ignore-not-found --wait=false || true

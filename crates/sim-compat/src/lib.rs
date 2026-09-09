@@ -11,8 +11,10 @@
 //!     build's supported line, and
 //!   - the conformance runner, which replays each line's goldens.
 //!
-//! The manifest diff *is* the release: adding/removing a `[[vllm]]` line or
-//! flipping `fidelity_validated` is what advances the N-2 window.
+//! The manifest diff *is* the release: adding/removing a `[[vllm]]` line is
+//! what advances the N-2 window, and a line becomes a hard conformance gate the
+//! moment the golden manifest carries enough fidelity captures for it
+//! ([`GoldenManifest::validates`]).
 
 pub mod capabilities;
 
@@ -46,10 +48,6 @@ pub struct VllmLine {
     pub patch_repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch_rev: Option<String>,
-    /// True once the replay gates pass against this line's captured goldens. A
-    /// line enters the window as `false` and is promoted once conformance is green.
-    #[serde(default)]
-    pub fidelity_validated: bool,
     /// Exactly one line carries `default = true`; it is `:latest` and the
     /// unsuffixed build.
     #[serde(default)]
@@ -189,6 +187,11 @@ pub struct GoldenManifest {
     pub goldens: Vec<GoldenEntry>,
 }
 
+/// Fidelity goldens a stable line needs before its conformance leg hard-gates
+/// CI. Three is the standard capture set (two prefix-cached multiturn seeds plus
+/// one nocache multiturn); a lone capture is an anomaly waiting to happen.
+pub const MIN_FIDELITY_GOLDENS: usize = 3;
+
 impl GoldenManifest {
     /// Parse manifest text.
     pub fn parse(text: &str) -> Result<Self> {
@@ -207,11 +210,23 @@ impl GoldenManifest {
     pub fn for_line<'a>(&'a self, line: &str) -> impl Iterator<Item = &'a GoldenEntry> {
         self.goldens.iter().filter(move |g| g.line == line)
     }
+
+    /// Whether a line carries enough fidelity goldens to be a hard conformance
+    /// gate. Trackers never qualify: their goldens are drift signal, not a
+    /// release promise, and a moving `protocol_rev` must not block every PR.
+    pub fn validates(&self, line: &VllmLine) -> bool {
+        !line.is_tracker()
+            && self
+                .for_line(&line.line)
+                .filter(|g| g.role == GoldenRole::Fidelity)
+                .count()
+                >= MIN_FIDELITY_GOLDENS
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{CompatManifest, GoldenManifest, GoldenRole, minor_line};
+    use crate::{CompatManifest, GoldenManifest, GoldenRole, VllmLine, minor_line};
 
     #[test]
     fn minor_line_strips_prefix_and_suffixes() {
@@ -228,14 +243,12 @@ mod tests {
 line = "0.10"
 tag = "v0.10.1"
 protocol_rev = "aaaa"
-fidelity_validated = true
 default = true
 
 [[vllm]]
 line = "0.9"
 tag = "v0.9.2"
 protocol_rev = "bbbb"
-fidelity_validated = false
 "#;
 
     #[test]
@@ -246,7 +259,6 @@ fidelity_validated = false
         assert_eq!(default.line, "0.10");
         assert_eq!(default.tag, "v0.10.1");
         assert!(manifest.line("0.9").is_some());
-        assert!(!manifest.line("0.9").expect("0.9 line").fidelity_validated);
     }
 
     #[test]
@@ -346,5 +358,47 @@ role = "fidelity"
         assert!(head.iter().any(|g| g.role == GoldenRole::Schema));
         assert!(head.iter().any(|g| g.role == GoldenRole::Fidelity));
         assert_eq!(manifest.for_line("0.9").count(), 1);
+    }
+
+    fn line(minor: &str) -> VllmLine {
+        VllmLine {
+            line: minor.to_string(),
+            tag: format!("v{minor}.0"),
+            protocol_rev: "sha".to_string(),
+            patch_repo: None,
+            patch_rev: None,
+            default: false,
+        }
+    }
+
+    fn goldens(line: &str, fidelity: usize, schema: usize) -> String {
+        let mut out = String::new();
+        for (role, n) in [("fidelity", fidelity), ("schema", schema)] {
+            for i in 0..n {
+                out.push_str(&format!(
+                    "[[golden]]\nline = \"{line}\"\nbucket_path = \"k{i}\"\nsha256 = \"s\"\n\
+                     config_hash = \"c\"\nworkload = \"w\"\nrole = \"{role}\"\n\n"
+                ));
+            }
+        }
+        out
+    }
+
+    /// The gate is derived from the manifest: enough fidelity goldens for the
+    /// line and nothing else. Schema goldens don't count, and a tracker never
+    /// qualifies no matter how many captures it has.
+    #[test]
+    fn validates_needs_min_fidelity_goldens_on_a_stable_line() {
+        let enough = GoldenManifest::parse(&goldens("0.10", 3, 0)).expect("parse");
+        assert!(enough.validates(&line("0.10")));
+        assert!(!enough.validates(&line("0.9")));
+
+        let short = GoldenManifest::parse(&goldens("0.10", 2, 5)).expect("parse");
+        assert!(!short.validates(&line("0.10")));
+
+        let tracker = GoldenManifest::parse(&goldens("nightly", 3, 0)).expect("parse");
+        assert!(!tracker.validates(&line("nightly")));
+
+        assert!(!GoldenManifest::default().validates(&line("0.10")));
     }
 }

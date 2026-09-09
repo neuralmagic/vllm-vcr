@@ -1,7 +1,9 @@
 # Conformance capture matrix for gen-capture-jobs.py (one Kueue Job per [[capture]]).
 # Targets run via conformance-queue (one GPU at a time). Upload + register: docs/conformance.md.
 #
-# Each [[capture]] inherits [defaults] and [lines.<vllm_tag>] for engine/tap images.
+# A target is a model x scenario; the vLLM line comes from `--line` (default: the
+# compat.toml default line) and the engine/tap images are derived from that line.
+# Each [[capture]] inherits [defaults].
 # scenario: baseline | nocache | specdecode | multimodal
 
 [defaults]
@@ -20,84 +22,54 @@ engine_memory_request = "64Gi"
 engine_memory_limit = "96Gi"
 model_cache_size = "100Gi"
 
-[lines."v0.23.0"]
-engine_image = "docker.io/vllm/vllm-openai:v0.23.0@sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f"
-tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
-
-[lines."nightly"]
-engine_image = "public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:8dd1b702f27edeed24a4336f531b01c346e04253"
-tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllmnightly"
-
-# The current support window (N, N-1, N-2). Engine images are the released
-# vllm-openai builds pinned by digest; that digest is the ground truth for which
-# vLLM a golden measures.
-
-[lines."v0.29.0"]
-engine_image = "docker.io/vllm/vllm-openai:v0.29.0@sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1"
-tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.29"
-
-[lines."v0.28.0"]
-engine_image = "docker.io/vllm/vllm-openai:v0.28.0@sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14"
-tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.28"
-
-[lines."v0.27.1"]
-engine_image = "docker.io/vllm/vllm-openai:v0.27.1@sha256:0a51ea5b4ae2dc5d81890e5173f54203d2a3ae0cfffe51b8fd2afd4391bfd967"
-tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.27"
-
-[lines."v0.26.0"]
-engine_image = "docker.io/vllm/vllm-openai:v0.26.0@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52"
-tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.26"
-
-[lines."v0.25.1"]
-engine_image = "docker.io/vllm/vllm-openai:v0.25.1@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089"
-tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.25"
-
-[lines."v0.24.0"]
-engine_image = "docker.io/vllm/vllm-openai:v0.24.0@sha256:251eba5cc7c12fed0b75da22a9240e582b1c9e39f6fbc064f86781b963bd814f"
-tap_image = "ghcr.io/neuralmagic/vllm-vcr:vllm0.24"
+# The per-line golden set: what the golden-capture workflow captures for a line.
+# Three multiturn captures because a lone capture is an anomaly waiting to happen
+# (3 of ~10 multiturn captures were anomalous when this was last measured), and
+# MIN_FIDELITY_GOLDENS in sim-compat is what makes the line a hard gate.
+[goldens]
+targets = ["qwen3-8b-mt-s7", "qwen3-8b-mt-s13", "qwen3-8b-nocache-s7"]
 
 [[capture]]
-name = "nightly-qwen3-8b-mt-s7"
+name = "qwen3-8b-mt-s7"
 model = "Qwen/Qwen3-8B"
-vllm_tag = "nightly"
 scenario = "baseline"
 phases = "multiturn"
 mt_seed = "7"
+workload = "multiturn-s7"
 
 [[capture]]
-name = "nightly-qwen3-8b-mt-s13"
+name = "qwen3-8b-mt-s13"
 model = "Qwen/Qwen3-8B"
-vllm_tag = "nightly"
 scenario = "baseline"
 phases = "multiturn"
 mt_seed = "13"
+workload = "multiturn-s13"
 
 [[capture]]
-name = "nightly-qwen3-8b-nocache-s7"
+name = "qwen3-8b-nocache-s7"
 model = "Qwen/Qwen3-8B"
-vllm_tag = "nightly"
 scenario = "nocache"
 phases = "multiturn"
 mt_seed = "7"
+workload = "multiturn-nocache-s7"
+
+# --- Calibration / exploration targets (not goldens) ---------------------------
 
 [[capture]]
 name = "qwen3-8b"
 model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.23.0"
 scenario = "baseline"
 phases = "sweep multiturn"
 
 [[capture]]
 name = "qwen3-8b-nocache"
 model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.23.0"
 scenario = "nocache"
 phases = "multiturn"
 
 [[capture]]
 name = "qwen3-8b-specdecode"
 model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.23.0"
 scenario = "specdecode"
 speculative = "ngram-k3"
 phases = "multiturn"
@@ -105,7 +77,6 @@ phases = "multiturn"
 [[capture]]
 name = "qwen3-0-6b"
 model = "Qwen/Qwen3-0.6B"
-vllm_tag = "v0.23.0"
 scenario = "baseline"
 phases = "sweep multiturn"
 engine_memory_request = "32Gi"
@@ -113,7 +84,6 @@ engine_memory_request = "32Gi"
 [[capture]]
 name = "qwen3-30b-a3b"
 model = "Qwen/Qwen3-30B-A3B"
-vllm_tag = "v0.23.0"
 scenario = "baseline"
 phases = "sweep multiturn"
 engine_memory_request = "96Gi"
@@ -122,7 +92,6 @@ engine_memory_limit = "160Gi"
 [[capture]]
 name = "gpt-oss-20b"
 model = "openai/gpt-oss-20b"
-vllm_tag = "v0.23.0"
 scenario = "baseline"
 phases = "sweep multiturn"
 engine_memory_request = "64Gi"
@@ -131,165 +100,6 @@ engine_memory_limit = "128Gi"
 [[capture]]
 name = "qwen2-5-vl-7b"
 model = "Qwen/Qwen2.5-VL-7B-Instruct"
-vllm_tag = "v0.23.0"
 scenario = "multimodal"
 phases = "multimodal"
 max_model_len = 32768
-
-# --- Support-window conformance goldens ---------------------------------------
-# Three per line: two prefix-cached multiturn seeds plus one nocache multiturn.
-# Multi-seed because a lone capture is an anomaly waiting to happen (3 of ~10
-# multiturn captures were anomalous when this was last measured).
-
-[[capture]]
-name = "v029-qwen3-8b-mt-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.29.0"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "7"
-workload = "multiturn-s7"
-
-[[capture]]
-name = "v029-qwen3-8b-mt-s13"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.29.0"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "13"
-workload = "multiturn-s13"
-
-[[capture]]
-name = "v029-qwen3-8b-nocache-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.29.0"
-scenario = "nocache"
-phases = "multiturn"
-mt_seed = "7"
-workload = "multiturn-nocache-s7"
-
-[[capture]]
-name = "v028-qwen3-8b-mt-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.28.0"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "7"
-workload = "multiturn-s7"
-
-[[capture]]
-name = "v028-qwen3-8b-mt-s13"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.28.0"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "13"
-workload = "multiturn-s13"
-
-[[capture]]
-name = "v028-qwen3-8b-nocache-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.28.0"
-scenario = "nocache"
-phases = "multiturn"
-mt_seed = "7"
-workload = "multiturn-nocache-s7"
-
-[[capture]]
-name = "v027-qwen3-8b-mt-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.27.1"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "7"
-workload = "multiturn-s7"
-
-[[capture]]
-name = "v027-qwen3-8b-mt-s13"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.27.1"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "13"
-workload = "multiturn-s13"
-
-[[capture]]
-name = "v027-qwen3-8b-nocache-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.27.1"
-scenario = "nocache"
-phases = "multiturn"
-mt_seed = "7"
-workload = "multiturn-nocache-s7"
-
-[[capture]]
-name = "v026-qwen3-8b-mt-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.26.0"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "7"
-
-[[capture]]
-name = "v026-qwen3-8b-mt-s13"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.26.0"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "13"
-
-[[capture]]
-name = "v026-qwen3-8b-nocache-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.26.0"
-scenario = "nocache"
-phases = "multiturn"
-mt_seed = "7"
-
-[[capture]]
-name = "v025-qwen3-8b-mt-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.25.1"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "7"
-
-[[capture]]
-name = "v025-qwen3-8b-mt-s13"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.25.1"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "13"
-
-[[capture]]
-name = "v025-qwen3-8b-nocache-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.25.1"
-scenario = "nocache"
-phases = "multiturn"
-mt_seed = "7"
-
-[[capture]]
-name = "v024-qwen3-8b-mt-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.24.0"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "7"
-
-[[capture]]
-name = "v024-qwen3-8b-mt-s13"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.24.0"
-scenario = "baseline"
-phases = "multiturn"
-mt_seed = "13"
-
-[[capture]]
-name = "v024-qwen3-8b-nocache-s7"
-model = "Qwen/Qwen3-8B"
-vllm_tag = "v0.24.0"
-scenario = "nocache"
-phases = "multiturn"
-mt_seed = "7"

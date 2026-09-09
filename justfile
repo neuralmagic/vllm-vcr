@@ -91,19 +91,26 @@ capture-fetch out="/tmp/tap-trace.jsonl":
 conformance-queue:
     just _apply-rig conformance-queue
 
-# List the capture targets defined in models.toml.
+# List the capture targets defined in models.toml, and the per-line golden set.
 conformance-list:
     python3 deploy/trace-capture/gen-capture-jobs.py --list
+    @echo "golden set: $(python3 deploy/trace-capture/gen-capture-jobs.py --list-goldens | tr '\n' ' ')"
 
-# Submit conformance capture Job(s), e.g. `just conformance-capture qwen3-8b`. Ships the
-# loadgen scripts as a configmap, then applies the generated Job (Kueue holds it until a
-# GPU is free, so it's safe to submit several; they run one at a time).
-conformance-capture +names:
+# Submit conformance capture Job(s) against a compat.toml line, e.g.
+# `just conformance-capture 0.27 qwen3-8b`. Ships the loadgen scripts as a configmap,
+# then applies the generated Job (Kueue holds it until a GPU is free, so it's safe to
+# submit several; they run one at a time).
+conformance-capture line +names:
     kubectl create configmap validation-scripts -n {{namespace}} \
         --from-file=loadgen.py=deploy/trace-capture/loadgen.py \
         --from-file=runner.sh=deploy/trace-capture/validation-runner.sh \
         --dry-run=client -o yaml | kubectl apply -f -
-    python3 deploy/trace-capture/gen-capture-jobs.py {{names}} | kubectl apply -f -
+    python3 deploy/trace-capture/gen-capture-jobs.py --line {{line}} {{names}} | kubectl apply -f -
+
+# Capture the full golden set for a line, upload, and register it in the manifest
+# (what golden-capture.yml runs). Needs cluster + S3 write access.
+conformance-goldens line:
+    LINE={{line}} S3_BUCKET=llm-d-artifacts-783952637884 bash ci/capture-goldens.sh
 
 # --- agentic capture + offline replay (docs/agentic-offline-replay.md) -------------
 
@@ -191,7 +198,7 @@ conformance-status:
     -kubectl -n {{namespace}} logs -l llm-d.ai/guide=trace-capture -c loadgen --tail=2 --prefix
 
 # Fetch a job's tap trace, optional step stats, and release it (job completes, GPU freed).
-# e.g. `just conformance-fetch trace-qwen3-8b /tmp/qwen3-8b.jsonl`.
+# e.g. `just conformance-fetch trace-029-qwen3-8b-mt-s7 /tmp/qwen3-8b.jsonl`.
 conformance-fetch job out:
     kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- cat /trace/trace.jsonl > {{out}}
     -kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- cat /trace/step-stats.jsonl > {{out}}.step-stats.jsonl

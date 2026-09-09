@@ -1,8 +1,8 @@
 # compat.toml -- the rolling vLLM support window.
 #
 # Source of truth for which vLLM lines this repo builds and conforms against.
-# The manifest diff *is* the release: adding/removing a [[vllm]] entry or
-# flipping `fidelity_validated` advances the window. Parsed by `sim-compat`
+# The manifest diff *is* the release: adding/removing a [[vllm]] entry
+# advances the window. Parsed by `sim-compat`
 # (build.rs stamps the default line's tag as VLLM_TARGET_VERSION + emits the
 # per-line capability cfgs; the handshake guard and conformance runner read it).
 #
@@ -17,8 +17,10 @@
 #     upstream, so the repo has no external-fork dependency.
 #   - Exactly one line has `default = true`. That line is `:latest` / unsuffixed.
 #     It is always the newest stable release.
-#   - A line enters with `fidelity_validated = false` and is promoted to `true`
-#     only once the conformance replay gates pass against its captures.
+#   - Whether a line hard-gates CI is not stored here: it is derived from
+#     conformance/manifest.toml (enough fidelity goldens registered for the line,
+#     see `GoldenManifest::validates`). The golden-capture workflow captures them
+#     onto the roll PR, so a new line arrives gated.
 #   - Two non-stable "tracker" lines ride ahead of the stable window so wire drift
 #     shows up before a release pins us to it. Neither is ever `default`:
 #       * `nightly` tracks vLLM main (post-merge commits); its `tag` is the literal
@@ -43,17 +45,15 @@
 line = "nightly"
 tag = "nightly"
 protocol_rev = "53e211d2923192ea1f7442de93d59cfbb150e089"
-fidelity_validated = false
 
 [[vllm]]
 # Latest upstream release candidate, ahead of the newest stable. Tracked by the
 # release watcher (`cargo xtask watch-rc`), which bumps BOTH tag and protocol_rev
-# to the highest `vX.Y.ZrcN` tag newer than the default line. fidelity_validated
-# stays false (RCs never get goldens).
+# to the highest `vX.Y.ZrcN` tag newer than the default line. RCs never get
+# goldens.
 line = "rc"
 tag = "v0.28.0rc2"
 protocol_rev = "74a6576b9b5832494c314405c3cae94db55801e1"
-fidelity_validated = false
 
 [[vllm]]
 # N (head). 0.29 grew the handshake again: `EngineCoreReadyResponse` requires
@@ -65,7 +65,6 @@ fidelity_validated = false
 line = "0.29"
 tag = "v0.29.0"
 protocol_rev = "98dff2a81d747d1dba01a47f939f48c3526d4206"
-fidelity_validated = false
 default = true
 
 [[vllm]]
@@ -77,7 +76,6 @@ default = true
 line = "0.28"
 tag = "v0.28.0"
 protocol_rev = "2cf0a6915ce544dc493a0990f2ea38d81601128a"
-fidelity_validated = false
 
 [[vllm]]
 # N-2. The oldest line: `EngineId::from_engine_index` still takes u32, so this
@@ -88,4 +86,3 @@ fidelity_validated = false
 line = "0.27"
 tag = "v0.27.1"
 protocol_rev = "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
-fidelity_validated = true

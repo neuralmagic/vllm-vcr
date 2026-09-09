@@ -8,9 +8,16 @@ spec-decode. Replaces the hand-maintained validation-jobs.yaml.
 
 Usage:
   gen-capture-jobs.py --list                       # names + scenarios
-  gen-capture-jobs.py <name> [<name> ...]          # selected targets
+  gen-capture-jobs.py --list-goldens               # the per-line golden set
+  gen-capture-jobs.py [--line 0.27] --show-line    # resolved `<line> <tag>`
+  gen-capture-jobs.py [--line 0.27] <name> ...     # selected targets
   gen-capture-jobs.py --all                        # every target
   gen-capture-jobs.py qwen3-8b | kubectl apply -f -
+
+A target is a model x scenario. The vLLM line is `--line` (default: the compat.toml
+default line); the engine image is the line's released vllm-openai image at its tag
+(the post-merge image at protocol_rev for nightly) and the tap/frontend image is the
+per-line vllm-vcr build, so compat.toml is the only place a line is defined.
 
 The pod is the same sidecar stack as before (engine + tap + frontend, loadgen as the
 main container); only the per-target knobs change.
@@ -24,6 +31,11 @@ import tomllib
 from pathlib import Path
 
 MANIFEST = Path(__file__).with_name("models.toml")
+COMPAT = Path(__file__).resolve().parents[2] / "compat.toml"
+
+RELEASE_ENGINE_REPO = "docker.io/vllm/vllm-openai"
+NIGHTLY_ENGINE_REPO = "public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo"
+TAP_REPO = "ghcr.io/neuralmagic/vllm-vcr"
 
 # Scalar keys a [[capture]] may inherit from [defaults] (or override).
 INHERITED = (
@@ -31,6 +43,36 @@ INHERITED = (
     "max_num_seqs max_model_len enforce_eager engine_cpu_request engine_cpu_limit "
     "engine_memory_request engine_memory_limit model_cache_size"
 ).split()
+
+
+def resolve_line(name: str | None) -> dict:
+    """The compat.toml line to capture against: `name`, or the default line."""
+    with open(COMPAT, "rb") as f:
+        lines = tomllib.load(f)["vllm"]
+    if name is None:
+        return next(v for v in lines if v.get("default"))
+    for v in lines:
+        if v["line"] == name:
+            return v
+    known = ", ".join(v["line"] for v in lines)
+    sys.exit(f"unknown compat.toml line {name!r} (known: {known})")
+
+
+def engine_image(line: dict) -> str:
+    """The engine image a golden for this line measures."""
+    if line["line"] == "nightly":
+        return f"{NIGHTLY_ENGINE_REPO}:{line['protocol_rev']}"
+    if line["line"] == "rc":
+        sys.exit("the rc line never gets goldens; capture against a stable line or nightly")
+    return f"{RELEASE_ENGINE_REPO}:{line['tag']}"
+
+
+def tap_image(line: dict) -> str:
+    return f"{TAP_REPO}:vllm{line['line']}"
+
+
+def job_name(line: dict, target: str) -> str:
+    return f"trace-{line['line'].replace('.', '')}-{target}"
 
 
 def spec_config_json(descriptor: str) -> str:
@@ -94,7 +136,7 @@ def canonical_engine_config(c: dict) -> str:
     return ";".join(f"{k}={fmt(fields[k])}" for k in sorted(fields))
 
 
-def tap_args(c: dict) -> list[str]:
+def tap_args(c: dict, line: dict) -> list[str]:
     # --model/--gpu/--tp/--block-size/--max-num-seqs are recorded in the trace meta for
     # readability; the config_hash itself is gpu + vllm_tag + the engine_config digest.
     return [
@@ -107,7 +149,7 @@ def tap_args(c: dict) -> list[str]:
         f"--gpu={c['gpu']}",
         f"--tp={c['tp']}",
         f"--block-size={c['block_size']}",
-        f"--vllm-version={c['vllm_tag']}",
+        f"--vllm-version={line['tag']}",
         f"--max-num-seqs={c['max_num_seqs']}",
         f"--engine-config={canonical_engine_config(c)}",
         "--record-tokens",
@@ -133,26 +175,28 @@ def loadgen_env(c: dict) -> list[dict]:
     return env(pairs)
 
 
-def build_job(c: dict, lines: dict) -> dict:
-    tag = c["vllm_tag"]
-    if tag not in lines:
-        sys.exit(f"capture {c['name']!r} targets unknown line {tag!r} (add [lines.{tag!r}])")
-    line = lines[tag]
+def build_job(c: dict, line: dict) -> dict:
     label_model = c["model"].split("/")[-1]  # k8s label can't hold the '/'
     sidecar = {"restartPolicy": "Always"}
     # The tap/frontend image is a floating per-line tag (:vllm<line>); a node may
-    # cache a stale build under it, so force a re-pull. The engine is digest-pinned
-    # (immutable), so it keeps the default IfNotPresent.
+    # cache a stale build under it, so force a re-pull. The engine tag is a release
+    # version or a commit sha (immutable), so it keeps the default IfNotPresent.
     floating = {**sidecar, "imagePullPolicy": "Always"}
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
-            "name": f"trace-{c['name']}",
+            "name": job_name(line, c["name"]),
             "namespace": c["namespace"],
             "labels": {
                 "kueue.x-k8s.io/queue-name": c["queue"],
                 "llm-d.ai/guide": "trace-capture",
+                "llm-d.ai/line": line["line"],
+            },
+            "annotations": {
+                "llm-d.ai/vllm-tag": line["tag"],
+                "llm-d.ai/engine-image": engine_image(line),
+                "llm-d.ai/workload": c.get("workload", c["name"]),
             },
         },
         "spec": {
@@ -172,7 +216,7 @@ def build_job(c: dict, lines: dict) -> dict:
                         {
                             "name": "engine",
                             **sidecar,
-                            "image": line["engine_image"],
+                            "image": engine_image(line),
                             "command": ["vllm", "serve"],
                             "args": engine_args(c),
                             "env": env(
@@ -205,9 +249,9 @@ def build_job(c: dict, lines: dict) -> dict:
                         {
                             "name": "tap",
                             **floating,
-                            "image": line["tap_image"],
+                            "image": tap_image(line),
                             "command": ["/usr/local/bin/vllm-vcr", "record"],
-                            "args": tap_args(c),
+                            "args": tap_args(c, line),
                             "env": env({"RUST_LOG": "info"}),
                             "resources": {
                                 "requests": {"cpu": "2", "memory": "1Gi"},
@@ -218,7 +262,7 @@ def build_job(c: dict, lines: dict) -> dict:
                         {
                             "name": "frontend",
                             **floating,
-                            "image": line["tap_image"],
+                            "image": tap_image(line),
                             "command": ["/usr/local/bin/vllm-rs", "serve"],
                             "args": [
                                 c["model"],
@@ -271,18 +315,38 @@ def main() -> None:
     ap.add_argument("names", nargs="*", help="capture target names to emit")
     ap.add_argument("--all", action="store_true", help="emit every capture target")
     ap.add_argument("--list", action="store_true", help="list target names + scenarios")
+    ap.add_argument(
+        "--list-goldens", action="store_true", help="list the per-line golden set targets"
+    )
+    ap.add_argument(
+        "--line", help="compat.toml line to capture against (default: the default line)"
+    )
+    ap.add_argument(
+        "--show-line", action="store_true", help="print the resolved `<line> <tag>` and exit"
+    )
     args = ap.parse_args()
 
     with open(MANIFEST, "rb") as f:
         m = tomllib.load(f)
     defaults = m.get("defaults", {})
-    lines = m.get("lines", {})
     captures = m.get("capture", [])
     by_name = {c["name"]: c for c in captures}
+    goldens = m.get("goldens", {}).get("targets", [])
+    missing_goldens = [n for n in goldens if n not in by_name]
+    if missing_goldens:
+        sys.exit(f"[goldens].targets names unknown capture(s): {', '.join(missing_goldens)}")
 
     if args.list:
         for c in captures:
-            print(f"{c['name']:24} {c['scenario']:11} {c['vllm_tag']:9} {c['model']}")
+            print(f"{c['name']:24} {c['scenario']:11} {c['model']}")
+        return
+    if args.list_goldens:
+        print("\n".join(goldens))
+        return
+
+    line = resolve_line(args.line)
+    if args.show_line:
+        print(f"{line['line']} {line['tag']}")
         return
 
     if args.all:
@@ -295,7 +359,7 @@ def main() -> None:
     else:
         ap.error("give capture name(s), --all, or --list")
 
-    jobs = [build_job({**defaults, **c}, lines) for c in selected]
+    jobs = [build_job({**defaults, **c}, line) for c in selected]
     out = jobs[0] if len(jobs) == 1 else {"apiVersion": "v1", "kind": "List", "items": jobs}
     print(json.dumps(out, indent=2))
 
