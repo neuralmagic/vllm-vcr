@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use bytes::Bytes;
 use sim_protocol::mock_engine::MockEngineSockets;
 use sim_protocol::vllm::engine_id_from_index;
 use sim_protocol::vllm::{
@@ -730,8 +731,8 @@ fn observe_request<F: AsRef<[u8]>>(
 /// records are written to the trace writer. `arrival` is the instant the
 /// frames came off the wire, stamped before forwarding; `capture_start` is the
 /// zero point for the trace's arrival_ms column.
-fn observe_output<W: Write, S: Write, F: AsRef<[u8]>>(
-    frames: &[F],
+fn observe_output<W: Write, S: Write>(
+    frames: &[Bytes],
     requests: &mut HashMap<String, RequestState>,
     writer: &mut W,
     step_writer: Option<&mut S>,

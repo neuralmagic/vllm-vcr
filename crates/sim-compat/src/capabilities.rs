@@ -17,7 +17,7 @@ use crate::{CompatManifest, minor_line};
 
 /// Every capability cfg this workspace can emit, declared to Rust's check-cfg so
 /// a typo in a `#[cfg(...)]` warns instead of silently compiling the other arm.
-const ALL: &[&str] = &["vllm_cache_creation_tokens", "vllm_engine_id_u16"];
+const ALL: &[&str] = &["vllm_engine_id_u16"];
 
 /// Resolve the vLLM tag this build targets.
 ///
@@ -47,13 +47,6 @@ pub fn target_tag(compat_path: &Path) -> Result<String> {
 pub fn emit(tag: &str) {
     for name in ALL {
         println!("cargo::rustc-check-cfg=cfg({name})");
-    }
-
-    // `vllm_cache_creation_tokens`: `PrefillStats` gained
-    // `num_cache_creation_tokens` (prompt tokens this prefill newly admits into
-    // the local prefix cache) in 0.26.
-    if line_at_least(tag, 0, 26) {
-        println!("cargo::rustc-cfg=vllm_cache_creation_tokens");
     }
 
     // `vllm_engine_id_u16`: `EngineId::from_engine_index` narrowed its parameter

@@ -63,9 +63,22 @@ pub struct SimReadyResponse {
     pub max_num_batched_tokens: u64,
     /// Unique identifier for this server instance. Required since 0.27.
     pub instance_id: String,
+    /// Whether the engine accepts LoRA adapters. Required since 0.29, and the
+    /// 0.29 frontend rejects an engine where this disagrees with
+    /// `max_loras > 0`.
+    pub supports_lora: bool,
+    /// Maximum number of LoRA adapters the engine keeps active. Required since
+    /// 0.29.
+    pub max_loras: u32,
     /// KV-event publisher configuration (0.27+). Optional on every line's
     /// decoder; None when the sim isn't publishing KV events.
     pub kv_events_config: Option<SimKvEventsConfig>,
+    /// RL weight-transfer backend (0.28+, optional). The sim has none.
+    pub weight_transfer_backend: Option<String>,
+    /// Whether the engine started with sleep mode (0.28+, optional).
+    pub enable_sleep_mode: bool,
+    /// Whether a speculative draft model can be updated (0.28+, optional).
+    pub supports_draft_weight_updates: bool,
 }
 
 /// KV-event publisher configuration in the ready response, matching python
@@ -278,7 +291,9 @@ mod tests {
     /// key any supported line requires must be present in the msgpack map.
     /// 0.23 requires the first six; 0.24 added world_size/data_parallel_size
     /// (required) and the two kv_cache_* fields; 0.27 added the parallel-config
-    /// sizes, the scheduler caps, instance_id, and kv_events_config.
+    /// sizes, the scheduler caps, instance_id, and kv_events_config; 0.28 added
+    /// three optional weight-transfer/sleep-mode keys; 0.29 added supports_lora
+    /// and max_loras (required).
     #[test]
     fn sim_ready_response_carries_all_required_fields() {
         let payload = SimReadyResponse {
@@ -299,7 +314,12 @@ mod tests {
             max_num_seqs: 256,
             max_num_batched_tokens: 8192,
             instance_id: "sim-test".to_string(),
+            supports_lora: true,
+            max_loras: 4,
             kv_events_config: None,
+            weight_transfer_backend: None,
+            enable_sleep_mode: false,
+            supports_draft_weight_updates: false,
         }
         .encode()
         .expect("encode");
@@ -324,7 +344,12 @@ mod tests {
             "max_num_seqs",
             "max_num_batched_tokens",
             "instance_id",
+            "supports_lora",
+            "max_loras",
             "kv_events_config",
+            "weight_transfer_backend",
+            "enable_sleep_mode",
+            "supports_draft_weight_updates",
         ] {
             assert!(keys.contains(&required), "missing field {required}");
         }

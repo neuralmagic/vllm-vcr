@@ -262,8 +262,9 @@ This three-container approach is for **capture** only (requires GPU, real vLLM e
 
 ### Image tags
 
-- `ghcr.io/neuralmagic/vllm-vcr:latest` — the `default = true` line from `compat.toml` (currently `v0.23.0`).
-- `ghcr.io/neuralmagic/vllm-vcr:vllm0.23` — floating, latest sim for the 0.23 line.
-- `ghcr.io/neuralmagic/vllm-vcr:0.1.3-vllm0.23` — immutable, sim version × vLLM line.
+- `ghcr.io/neuralmagic/vllm-vcr:latest` — the `default = true` line from `compat.toml` (currently `v0.29.0`).
+- `ghcr.io/neuralmagic/vllm-vcr:0.2.3` — immutable, sim version on the `default = true` line at release time.
+- `ghcr.io/neuralmagic/vllm-vcr:vllm0.29` — floating, latest sim for the 0.29 line.
+- `ghcr.io/neuralmagic/vllm-vcr:0.2.3-vllm0.29` — immutable, sim version × vLLM line.
 
 For multi-version support, see [Versioning](./versioning.md) and [Conformance](./conformance.md).

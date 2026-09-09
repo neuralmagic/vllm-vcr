@@ -312,9 +312,11 @@ pub struct Opt {
     /// `--max-loras`). A request needing an adapter not already resident waits once the batch
     /// holds this many distinct adapters. `0` (default) disables the cap; adapter accounting
     /// (the `running_lora_adapters`/`waiting_lora_adapters` stats behind
-    /// `vllm:lora_requests_info`) is always on regardless.
+    /// `vllm:lora_requests_info`) is always on regardless. Advertised in the ready response
+    /// as `max_loras` with `supports_lora = max_loras > 0`, so a 0.29+ frontend only routes
+    /// LoRA requests to the sim when this is set.
     #[arg(long, default_value_t = 0)]
-    pub max_loras: u64,
+    pub max_loras: u32,
 
     // === KV-cache events (vLLM `--kv-events-config`) ===
     /// Publish KV-cache events (BlockStored/BlockRemoved/AllBlocksCleared) over ZMQ so the
@@ -716,9 +718,14 @@ async fn run_engine(
         max_num_seqs: opt.max_num_seqs,
         max_num_batched_tokens: opt.max_num_batched_tokens,
         instance_id: opt.pod_id(engine_index),
+        supports_lora: opt.max_loras > 0,
+        max_loras: opt.max_loras,
         kv_events_config: kv_events
             .enabled
             .then(|| frontend_connect::SimKvEventsConfig::zmq(kv_events.endpoint, kv_events.topic)),
+        weight_transfer_backend: None,
+        enable_sleep_mode: false,
+        supports_draft_weight_updates: false,
     }
     .encode()?;
 
