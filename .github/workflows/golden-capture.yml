@@ -140,7 +140,7 @@ jobs:
             echo "skip=${have}"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         if: ${{ steps.have.outputs.skip != 'true' }}
 
       - uses: ./.github/actions/setup-sccache
@@ -181,7 +181,7 @@ jobs:
 
       - name: Configure AWS credentials for golden upload
         if: ${{ steps.have.outputs.skip != 'true' }}
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
           role-to-assume: ${{ vars.CONFORMANCE_CAPTURE_ROLE_ARN }}
           aws-region: us-east-1
