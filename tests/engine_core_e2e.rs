@@ -18,9 +18,10 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::json;
-use sim_protocol::vllm::{EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams};
+use sim_protocol::vllm::{
+    EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams, LoraRequest,
+};
 use tokio_util::sync::CancellationToken;
-use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 use vllm_vcr::{Opt, run};
 
@@ -396,13 +397,15 @@ async fn reset_prefix_cache_busy_vs_idle() {
 async fn lora_load_unload_lifecycle() {
     let (client, _guard) = harness("lora_load_unload_lifecycle", &[]).await;
 
-    let lora = LoraRequest::new(
-        "test-adapter".to_string(),
-        42,
-        "/fake/path".to_string(),
-        false,
-        false,
-    );
+    let lora = LoraRequest {
+        lora_name: "test-adapter".to_string(),
+        lora_int_id: 42,
+        lora_path: "/fake/path".to_string(),
+        base_model_name: None,
+        tensorizer_config_dict: None,
+        load_inplace: false,
+        is_3d_lora_weight: false,
+    };
 
     // add_lora -> true
     let added = tokio::time::timeout(TIMEOUT, client.add_lora(&lora))

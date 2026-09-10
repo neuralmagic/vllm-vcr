@@ -480,24 +480,17 @@ impl ActiveRequest {
             0
         };
         let cached = local + external;
-        #[cfg_attr(not(vllm_cache_creation_tokens), allow(unused_mut))]
-        let mut stats = PrefillStats {
+        PrefillStats {
             num_prompt_tokens: prompt,
             num_computed_tokens: prompt.saturating_sub(cached),
             num_cached_tokens: cached,
             num_local_cached_tokens: local,
             num_external_cached_tokens: external,
-            ..Default::default()
-        };
-        // 0.26+ splits out what this prefill *adds* to the local prefix cache:
-        // everything the local cache didn't already hold, whether it was computed
-        // here or pulled from the prefill peer (a remote pull lands in local KV
-        // too). Absent before 0.26, hence the cfg rather than a plain field.
-        #[cfg(vllm_cache_creation_tokens)]
-        {
-            stats.num_cache_creation_tokens = prompt.saturating_sub(local);
+            // What this prefill *adds* to the local prefix cache: everything the
+            // local cache didn't already hold, whether it was computed here or
+            // pulled from the prefill peer (a remote pull lands in local KV too).
+            num_cache_creation_tokens: prompt.saturating_sub(local),
         }
-        stats
     }
 }
 
@@ -1903,21 +1896,23 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use sim_protocol::vllm::{EngineCoreRequest, EngineCoreSamplingParams};
+    use sim_protocol::vllm::{EngineCoreRequest, EngineCoreSamplingParams, LoraRequest};
 
     use super::*;
     use crate::dataplane::{NixlConfig, PdRole, make_data_plane};
     use crate::engine_core::{EngineInput, EngineOutput};
 
     /// Build a value for `EngineCoreRequest.lora_request`.
-    fn lora_field(name: &str, id: u64) -> vllm_engine_core_client::protocol::lora::LoraRequest {
-        vllm_engine_core_client::protocol::lora::LoraRequest::new(
-            name.to_string(),
-            id,
-            format!("/loras/{name}"),
-            false,
-            false,
-        )
+    fn lora_field(name: &str, id: u64) -> LoraRequest {
+        LoraRequest {
+            lora_name: name.to_string(),
+            lora_int_id: id,
+            lora_path: format!("/loras/{name}"),
+            base_model_name: None,
+            tensorizer_config_dict: None,
+            load_inplace: false,
+            is_3d_lora_weight: false,
+        }
     }
 
     fn test_opt() -> Opt {

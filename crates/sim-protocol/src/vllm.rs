@@ -22,6 +22,7 @@ use anyhow::{Result, anyhow};
 
 pub use vllm_engine_core_client::EngineId;
 pub use vllm_engine_core_client::protocol::dtype::ModelDtype;
+pub use vllm_engine_core_client::protocol::lora::LoraRequest;
 pub use vllm_engine_core_client::protocol::output::{
     EngineCoreFinishReason, EngineCoreOutput, decode_engine_core_outputs,
 };

@@ -56,33 +56,36 @@ protocol_rev = "74a6576b9b5832494c314405c3cae94db55801e1"
 fidelity_validated = false
 
 [[vllm]]
-# N (head). 0.27 grew the handshake: `EngineCoreReadyResponse` added the
-# parallel-config sizes, the scheduler caps, `instance_id`, and an optional
-# `kv_events_config` (all required by 0.27 frontends). The sim's map-encoded
-# `SimReadyResponse` superset always emits them; older frontends skip the keys
-# they don't know, so no capability cfg was needed.
-line = "0.27"
-tag = "v0.27.1"
-protocol_rev = "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
-fidelity_validated = true
+# N (head). 0.29 grew the handshake again: `EngineCoreReadyResponse` requires
+# `supports_lora` and `max_loras` (the frontend rejects an engine where
+# `supports_lora != (max_loras > 0)`), and the client-side
+# `decode_engine_core_outputs` now takes `&[Bytes]` instead of any `AsRef<[u8]>`.
+# The sim's map-encoded `SimReadyResponse` superset emits the new keys on every
+# line, and the tap already holds `Bytes` frames, so neither needed a cfg.
+line = "0.29"
+tag = "v0.29.0"
+protocol_rev = "98dff2a81d747d1dba01a47f939f48c3526d4206"
+fidelity_validated = false
 default = true
 
 [[vllm]]
-# N-1. Same protocol layout as 0.27, minus the 0.27 handshake fields (which the
-# sim emits anyway, see above).
-line = "0.26"
-tag = "v0.26.0"
-protocol_rev = "568afb3a13806beb53bb2e6bd518269357b237c0"
-fidelity_validated = true
+# N-1. `EngineId::from_engine_index` narrowed to u16 here (the
+# `vllm_engine_id_u16` cfg, on from this line up). Everything else 0.28 added
+# is a trailing `#[serde(default)]` field (`EngineCoreRequest.session_id`, the
+# `mm_cache_miss_hashes`/`new_sampling_mask` output slots, three optional ready
+# response keys), which the tuple decoders tolerate in both directions.
+line = "0.28"
+tag = "v0.28.0"
+protocol_rev = "2cf0a6915ce544dc493a0990f2ea38d81601128a"
+fidelity_validated = false
 
 [[vllm]]
-# N-2. The 0.25 protocol restructure landed here: types moved into
-# `protocol::{request, output, sampling}` and `EngineCoreOutputs` became the
-# classified enum. Every line in the window shares that layout now, so the
-# outputs shim in `sim_protocol::vllm` is unconditional. This line lacks
-# `EngineCoreOutput.ec_transfer_params` and `PrefillStats.num_cache_creation_tokens`
-# (the `vllm_cache_creation_tokens` cfg, off here).
-line = "0.25"
-tag = "v0.25.1"
-protocol_rev = "752a3a504485790a2e8491cacbb35c137339ad34"
+# N-2. The oldest line: `EngineId::from_engine_index` still takes u32, so this
+# is what keeps the `not(vllm_engine_id_u16)` branch honest. 0.27 frontends
+# require the parallel-config sizes, the scheduler caps, `instance_id`, and an
+# optional `kv_events_config` in the ready response (all emitted by the
+# `SimReadyResponse` superset).
+line = "0.27"
+tag = "v0.27.1"
+protocol_rev = "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
 fidelity_validated = true

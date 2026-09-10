@@ -46,8 +46,8 @@ block first, so it's idempotent. After the rewrite the rev no longer matches
 older-line build must too:
 
 ```sh
-cargo xtask pin-vllm 0.25
-VLLM_TARGET_VERSION=v0.25.1 cargo build --workspace   # no --locked
+cargo xtask pin-vllm 0.27
+VLLM_TARGET_VERSION=v0.27.1 cargo build --workspace   # no --locked
 ```
 
 ## Capability cfgs
@@ -57,17 +57,16 @@ field whose *type* differs per line), the engine gates on a discrete capability,
 not a version number. `build.rs` maps the target line to cfgs and declares them
 with `cargo::rustc-check-cfg`:
 
-- `vllm_cache_creation_tokens` — `PrefillStats` gained
-  `num_cache_creation_tokens`. On 0.26+.
 - `vllm_engine_id_u16` — `EngineId::from_engine_index` narrowed its parameter
-  from u32 to u16 on vLLM main (the wire encoding was always two-byte
+  from u32 to u16 in 0.28 (the wire encoding was always two-byte
   little-endian). Gates `sim_protocol::vllm::engine_id_from_index`. On 0.28+.
 
-`vllm_outputs_enum` (the 0.25 protocol restructure: types moved into
-`protocol::{request, output, sampling}` and `EngineCoreOutputs` became the
-classified enum over a private flat struct) was retired when 0.24 left the
-window; every supported line now shares that layout and the outputs shim is
-unconditional.
+Retired cfgs: `vllm_outputs_enum` (the 0.25 protocol restructure: types moved
+into `protocol::{request, output, sampling}` and `EngineCoreOutputs` became the
+classified enum over a private flat struct) went when 0.24 left the window, and
+`vllm_cache_creation_tokens` (`PrefillStats.num_cache_creation_tokens`, added
+in 0.26) went when 0.25 did. Every supported line shares both, so the outputs
+shim is unconditional and the field is assigned directly.
 
 The capability list itself lives in `sim_compat::capabilities`, not in a build
 script: cfgs from `build.rs` only reach the crate that owns it, so both the root
@@ -91,10 +90,11 @@ deserialize the same wire on every line (serde ignores unknown fields).
 | Lora request | wire form is a positional array whose trailing fields differ per line | `LoraSpec{lora_int_id,lora_name}` (own, reads positions 0/1) for the add_lora call + registry |
 | Protocol type paths | none since 0.24 rolled off; every line uses `protocol::{request,output,sampling}` | `sim-protocol::vllm` re-exports the whole surface; every crate imports from there, never from `vllm_engine_core_client::protocol` directly, so the next path move lands in one file |
 | Output envelope | the classified enum serializes through a private flat struct, so it cannot be built inline | `sim-protocol::vllm::Envelope` alias + `request_batch()`/`utility()` constructors and `request_outputs()`/`scheduler_stats()`/`utility_output()` accessors |
-| Engine identity | `EngineId::from_engine_index` takes u32 (<=0.27) vs u16 (main) | `sim-protocol::vllm::engine_id_from_index(u32)`, `vllm_engine_id_u16`-gated; validates the two-byte wire range on every line |
-| Prefill stats | `num_cache_creation_tokens` added in 0.26 | `..Default::default()` plus a `vllm_cache_creation_tokens`-gated assignment in `engine::prefill_stats` |
+| Engine identity | `EngineId::from_engine_index` takes u32 (0.27) vs u16 (0.28+) | `sim-protocol::vllm::engine_id_from_index(u32)`, `vllm_engine_id_u16`-gated; validates the two-byte wire range on every line |
 | Ready response (decode) | `EngineCoreReadyResponse.vllm_version` absent before 0.23 | tap decodes its own tolerant `CapturedReadyInfo{vllm_version:Option<String>}` |
-| Ready response (emit) | 0.27 frontends require the parallel-config sizes, scheduler caps, `instance_id`, and `kv_events_config` | sim-owned map-encoded `SimReadyResponse` superset: every field any line requires is always emitted, older frontends skip unknown keys, no cfg |
+| Ready response (emit) | 0.27 frontends require the parallel-config sizes, scheduler caps, `instance_id`, and `kv_events_config`; 0.29 frontends require `supports_lora` and `max_loras` (and reject `supports_lora != (max_loras > 0)`) | sim-owned map-encoded `SimReadyResponse` superset: every field any line requires is always emitted, older frontends skip unknown keys, no cfg |
+| Output decode | `decode_engine_core_outputs` takes any `AsRef<[u8]>` (<=0.28) vs `&[Bytes]` (0.29+) | the tap passes the `Bytes` frames zeromq already hands it, which satisfy both signatures, no cfg |
+| Lora request | `LoraRequest::new` returned `Self` (<=0.28), `Result` (0.29), and is gone on main | tests build the struct literal; the fields are stable across the window |
 | Utility request | `EngineCoreUtilityRequest` derives `Deserialize` only on 0.23+ (crate was client-only) | `engine_core::UtilityRequestSpec` (`Deserialize_tuple`, matches the wire tuple) |
 
 The wire types still come from the crate (the matrix's whole point: catch drift at
@@ -135,22 +135,24 @@ upstream, so the repo has no external-fork dependency.
   all capability cfgs are on. It exists to catch wire drift before a release lands: the
   live-HEAD nightly canary pins to upstream `main`, builds, runs unit tests, runs the
   HEAD-client protocol e2e suite, and runs the conformance runner.
-- **rc** (`v0.26.1rc0`): the newest release candidate ahead of the stable window,
+- **rc** (`v0.28.0rc2`): the newest release candidate ahead of the stable window,
   bumped (tag + rev) by the release watcher. Never `default`, never fidelity-validated.
-- **0.27** (`v0.27.1`, default): builds against upstream `6e448d0e`. Grew the
-  handshake: 0.27 frontends require the parallel-config sizes, the scheduler
-  caps, `instance_id`, and `kv_events_config` in the ready response (absorbed by
-  the `SimReadyResponse` superset, no cfg).
-- **0.26** (`v0.26.0`): builds against upstream `568afb3a`. Carries
-  `PrefillStats.num_cache_creation_tokens`.
-- **0.25** (`v0.25.1`): builds against upstream `752a3a50`. The oldest line and
-  the only one without `vllm_cache_creation_tokens`, so it is what keeps that
-  branch honest.
+- **0.29** (`v0.29.0`, default): builds against upstream `98dff2a8`. Grew the
+  handshake again: `supports_lora` and `max_loras` are required (absorbed by the
+  `SimReadyResponse` superset), `decode_engine_core_outputs` takes `&[Bytes]`,
+  and `LoraRequest::new` became fallible.
+- **0.28** (`v0.28.0`): builds against upstream `2cf0a691`. Narrowed
+  `EngineId::from_engine_index` to u16 (`vllm_engine_id_u16`); everything else
+  it added is a trailing `#[serde(default)]` field.
+- **0.27** (`v0.27.1`): builds against upstream `6e448d0e`. The oldest line and
+  the only one without `vllm_engine_id_u16`, so it is what keeps that branch
+  honest.
 
-Every stable line is `fidelity_validated = true`: each carries three goldens (two
-prefix-cached multiturn seeds plus one nocache multiturn, Qwen3-8B on H200),
-captured against that line's released engine image and replaying byte-identically.
-See `conformance.md` for the capture runbook.
+0.27 is `fidelity_validated = true` with three goldens (two prefix-cached
+multiturn seeds plus one nocache multiturn, Qwen3-8B on H200), captured against
+that line's released engine image and replaying byte-identically. 0.28 and 0.29
+entered the window without goldens and stay `false` until captures for those
+lines land. See `conformance.md` for the capture runbook.
 
 ### Fork patches
 

@@ -6,7 +6,7 @@ members = [".", "crates/sim-trace", "crates/sim-protocol", "crates/sim-tap", "cr
 resolver = "3"
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -22,11 +22,12 @@ sim-s3 = { path = "crates/sim-s3" }
 
 # The real vLLM engine-core protocol + reusable mock-engine handshake harness,
 # pulled straight from the in-tree Rust frontend so the wire format never drifts.
-# Tracks the compat.toml `default = true` line (v0.27.1); `cargo xtask pin-vllm`
+# Tracks the compat.toml `default = true` line (v0.29.0); `cargo xtask pin-vllm`
 # rewrites this rev for a per-line build.
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "98dff2a81d747d1dba01a47f939f48c3526d4206" }
 
 anyhow = "1.0.100"
+bytes = "1.12.1"
 base64 = "0.23.1"
 clap = { version = "4.5.38", features = ["derive", "env"] }
 clap_complete = "4.5.58"
