@@ -172,6 +172,7 @@ jobs:
           if [ -n "$n" ]; then echo "PR #$n already tracks ${TAG}; leaving it alone"; fi
 
       - name: Open/update the auto-bump PR
+        id: pr
         if: ${{ steps.watch.outputs.changed == 'true' && env.CANARY_APP_ID != '' && steps.open-pr.outputs.number == '' }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
@@ -206,7 +207,17 @@ jobs:
 
             For a stable roll, docker.yml builds this branch's images and the
             Golden Capture workflow then pushes the new default line's goldens
-            onto this branch, so the line hard-gates CI before merge.
+            onto this branch, so the line hard-gates CI before merge, and turns
+            auto-merge on once they are in. Merging bumps the sim patch version
+            and cuts a release (auto-release.yml).
+
+      # An rc bump is build-gated and touches only the tracker; let CI merge it.
+      # The stable roll waits for its goldens (golden-capture.yml enables it).
+      - name: Enable auto-merge (rc bump)
+        if: ${{ matrix.axis == 'rc' && steps.pr.outputs.pull-request-number != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh pr merge --auto --squash "${{ steps.pr.outputs.pull-request-number }}"
 
       # Scheduled watchers fail silently unless someone stares at the Actions tab;
       # file (or refresh) an issue so a red run actually reaches a human. Manual

@@ -107,6 +107,10 @@ conformance-capture line +names:
         --dry-run=client -o yaml | kubectl apply -f -
     python3 deploy/trace-capture/gen-capture-jobs.py --line {{line}} {{names}} | kubectl apply -f -
 
+# Apply ci/branch-rules.json (required checks, signatures, PR-only) to the main ruleset.
+branch-rules:
+    bash ci/apply-branch-rules.sh
+
 # Capture the full golden set for a line, upload, and register it in the manifest
 # (what golden-capture.yml runs). Needs cluster + S3 write access.
 conformance-goldens line:

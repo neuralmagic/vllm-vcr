@@ -213,7 +213,19 @@ jobs:
           git commit -m "conformance: register ${LINE} goldens (${TAG})"
           git push origin "HEAD:${{ steps.target.outputs.ref }}"
 
+      # The roll PR now carries its goldens; CI (conformance-gate) decides the rest.
+      - name: Enable auto-merge on the roll PR
+        if: ${{ steps.have.outputs.skip != 'true' && steps.target.outputs.mode == 'push' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+        run: |
+          set -euo pipefail
+          n=$(gh pr list --head "${{ steps.target.outputs.ref }}" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$n" ]; then echo "no open PR from ${{ steps.target.outputs.ref }}"; exit 0; fi
+          gh pr merge --auto --squash "$n"
+
       - name: Open or update manifest PR
+        id: pr
         if: ${{ steps.have.outputs.skip != 'true' && steps.target.outputs.mode == 'pr' }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
@@ -228,6 +240,12 @@ jobs:
           body: |
             Captured the `${{ steps.have.outputs.line }}` golden set against vLLM
             `${{ steps.have.outputs.tag }}` and registered it in `conformance/manifest.toml`.
+
+      - name: Enable auto-merge on the manifest PR
+        if: ${{ steps.pr.outputs.pull-request-number != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+        run: gh pr merge --auto --squash "${{ steps.pr.outputs.pull-request-number }}"
 
       - name: Cleanup capture jobs
         if: ${{ always() && steps.have.outputs.skip != 'true' && (github.event_name != 'workflow_dispatch' || inputs.cleanup) }}

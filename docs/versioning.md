@@ -144,8 +144,9 @@ When vLLM cuts N+1, the release watcher does all of it (`cargo xtask watch-stabl
    goldens, and opens the roll PR.
 2. `docker.yml` builds the roll branch's images; the Golden Capture workflow then
    captures the new line's golden set and pushes it onto the roll PR.
-3. CI replays the goldens; the new line hard-gates from that run on. Merge, then
-   cut a sim patch release so the unsuffixed image tag advances.
+3. CI replays the goldens; the new line hard-gates from that run on, auto-merge
+   is enabled, and the merge opens (and auto-merges) a sim patch release PR,
+   whose merge is tagged and published. No hands.
 
 ## Build order
 
@@ -177,6 +178,14 @@ When vLLM cuts N+1, the release watcher does all of it (`cargo xtask watch-stabl
 6. Golden capture on roll (`.github/workflows/golden-capture.yml`). The roll PR's
    image build triggers a capture of the new default line's golden set, pushed onto
    the same branch, so the line gates before it merges. **Done.**
+7. Auto-merge + auto-release. Every automation PR (roll once its goldens are in,
+   rc bump, nightly bump, goldens, release) enables GitHub auto-merge, which waits
+   on the `main` ruleset's required checks (`ci/branch-rules.json`, applied with
+   `just branch-rules`; `conformance-gate` is the one context over the per-line
+   matrix). When a merge moves the default line, `auto-release.yml` bumps the sim
+   patch version in a release PR; when a version bump lands on main, it tags
+   `v<simver>` and release.yml + docker.yml publish. Set the repository variable
+   `AUTO_RELEASE=off` to pause it. **Done.**
 
 ## Open coupling note: the `block_size` / registration drift
 

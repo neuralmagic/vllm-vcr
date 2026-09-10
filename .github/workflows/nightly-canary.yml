@@ -169,6 +169,7 @@ jobs:
       # compat.toml on merge), not part of the source-of-truth bump. No diff -> the
       # action opens no PR, so a HEAD that already matches is a clean no-op.
       - name: Open/update the auto-bump PR
+        id: pr
         if: ${{ env.CANARY_APP_ID != '' && (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * 1') }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
@@ -193,8 +194,13 @@ jobs:
 
             The committed `Cargo.toml` pin tracks the default stable line and is
             untouched; CI pins the nightly line transiently at build time
-            (`cargo xtask pin-vllm nightly`). Review the build + conformance
-            results before merging.
+            (`cargo xtask pin-vllm nightly`). Merges on green CI.
+
+      - name: Enable auto-merge on the bump PR
+        if: ${{ steps.pr.outputs.pull-request-number != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh pr merge --auto --squash "${{ steps.pr.outputs.pull-request-number }}"
 
       # Scheduled canaries fail silently unless someone stares at the Actions tab;
       # file (or refresh) an issue so a red run actually reaches a human. Manual

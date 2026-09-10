@@ -68,6 +68,11 @@ enum Command {
     ReleaseMatrix,
     /// Print the sim semver from `[workspace.package].version`.
     Simver,
+    /// Print the `default = true` line's vLLM tag from compat.toml.
+    DefaultTag,
+    /// Bump `[workspace.package].version`'s patch component in Cargo.toml and
+    /// print the new version.
+    BumpPatch,
     /// Print `TAG=…; FREPO=…; FREF=…` shell assignments for a line's vllm-rs
     /// frontend build args (`eval` it). FREPO/FREF point at the fork when the
     /// line has one, else upstream at protocol_rev.
@@ -238,6 +243,8 @@ fn main() -> Result<()> {
         Command::DockerMatrix => docker_matrix(),
         Command::ReleaseMatrix => release_matrix(),
         Command::Simver => simver(),
+        Command::DefaultTag => default_tag(),
+        Command::BumpPatch => bump_patch(),
         Command::FrontendArgs { line } => frontend_args(&line),
         Command::PinVllm { line, rev } => pin_vllm(&line, rev.as_deref()),
         Command::SetNightlyRev { sha } => set_nightly_rev(&sha),
@@ -335,6 +342,49 @@ fn simver() -> Result<()> {
         .context("[workspace.package].version is not a string")?;
     println!("{version}");
     Ok(())
+}
+
+fn default_tag() -> Result<()> {
+    let compat = CompatManifest::load(COMPAT_TOML)?;
+    println!("{}", compat.default_line()?.tag);
+    Ok(())
+}
+
+fn bump_patch() -> Result<()> {
+    let mut doc = read_cargo_toml()?;
+    let next = apply_bump_patch(&mut doc)?;
+    std::fs::write(CARGO_TOML, doc.to_string()).context("writing Cargo.toml")?;
+    println!("{next}");
+    Ok(())
+}
+
+/// Increment the patch component of `[workspace.package].version`, returning the
+/// new version. Pre-release or build suffixes are rejected: a release is always
+/// cut from a plain `X.Y.Z`.
+fn apply_bump_patch(doc: &mut DocumentMut) -> Result<String> {
+    let item = doc["workspace"]["package"]["version"]
+        .as_value_mut()
+        .context("[workspace.package].version is not a value")?;
+    let current = item
+        .as_str()
+        .context("[workspace.package].version is not a string")?;
+    let mut parts = current.split('.');
+    let parsed: Option<(u64, u64, u64)> = (|| {
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some((major, minor, patch))
+    })();
+    let (major, minor, patch) =
+        parsed.with_context(|| format!("version {current:?} is not a plain X.Y.Z"))?;
+    let next = format!("{major}.{minor}.{}", patch + 1);
+    let decor = item.decor().clone();
+    *item = next.as_str().into();
+    *item.decor_mut() = decor;
+    Ok(next)
 }
 
 fn frontend_args(line: &str) -> Result<()> {
@@ -1271,6 +1321,23 @@ v026-entry
             last,
             "absent block is a no-op"
         );
+    }
+
+    #[test]
+    fn bump_patch_increments_only_the_patch_component() {
+        let mut doc: DocumentMut = "[workspace.package]\nversion = \"0.2.3\"  # keep\n"
+            .parse()
+            .unwrap();
+        assert_eq!(apply_bump_patch(&mut doc).unwrap(), "0.2.4");
+        assert_eq!(
+            doc.to_string(),
+            "[workspace.package]\nversion = \"0.2.4\"  # keep\n"
+        );
+
+        let mut pre: DocumentMut = "[workspace.package]\nversion = \"0.3.0-rc1\"\n"
+            .parse()
+            .unwrap();
+        assert!(apply_bump_patch(&mut pre).is_err());
     }
 
     #[test]
