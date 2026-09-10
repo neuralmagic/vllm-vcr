@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# Submit conformance capture jobs, upload their traces, and refresh the
-# captured lines' generated blocks in conformance/manifest.toml. Targets may
-# span lines (nightly and release); each target's line, tag, and workload come
-# from models.toml + compat.toml.
+# Submit conformance capture jobs for one compat.toml line, upload their traces,
+# and replace that line's generated block in conformance/manifest.toml.
+#
+#   LINE     compat.toml line to capture (default: the default = true line)
+#   TARGETS  models.toml capture targets (default: the [goldens].targets set)
 set -Eeuo pipefail
 
 : "${S3_BUCKET:?S3_BUCKET is required, e.g. llm-d-artifacts-783952637884}"
 
 NAMESPACE="${NAMESPACE:-inference-sim}"
-TARGETS="${TARGETS:-nightly-qwen3-8b-mt-s7 nightly-qwen3-8b-mt-s13 nightly-qwen3-8b-nocache-s7}"
+LINE="${LINE:-}"
 MANIFEST="${MANIFEST:-conformance/manifest.toml}"
-OUT_DIR="${OUT_DIR:-nightly-goldens}"
+OUT_DIR="${OUT_DIR:-goldens}"
 POLL_SECONDS="${POLL_SECONDS:-20}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-10800}"
 QUEUE_NAME="conformance-queue"
+GEN=(python3 deploy/trace-capture/gen-capture-jobs.py)
+if [[ -n "${LINE}" ]]; then
+    GEN+=(--line "${LINE}")
+fi
+TARGETS="${TARGETS:-$("${GEN[@]}" --list-goldens | tr '\n' ' ')}"
 
 timestamp() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -41,58 +47,10 @@ file_bytes() {
     wc -c < "$1" | tr -d '[:space:]'
 }
 
-validate_capture_matrix() {
-    python3 - "${TARGETS}" <<'PY'
-import sys
-import tomllib
-
-targets = sys.argv[1].split()
-with open("deploy/trace-capture/models.toml", "rb") as f:
-    models = tomllib.load(f)
-with open("compat.toml", "rb") as f:
-    compat = tomllib.load(f)
-
-captures = {c["name"]: c for c in models.get("capture", [])}
-defaults = models.get("defaults", {})
-selected = []
-missing = []
-for target in targets:
-    capture = captures.get(target)
-    if capture:
-        selected.append({**defaults, **capture})
-    else:
-        missing.append(target)
-
-if missing:
-    raise SystemExit(f"unknown capture target(s): {' '.join(missing)}")
-
-lines_by_tag = {v["tag"]: v["line"] for v in compat["vllm"]}
-for c in selected:
-    tag = c["vllm_tag"]
-    if tag not in lines_by_tag:
-        raise SystemExit(
-            f"capture {c['name']} pins vllm_tag {tag}, which matches no compat.toml "
-            f"line; goldens for an out-of-window line cannot gate anything"
-        )
-
-if any(c.get("vllm_tag") == "nightly" for c in selected):
-    nightly = next(v for v in compat["vllm"] if v["line"] == "nightly")
-    engine_image = models["lines"]["nightly"]["engine_image"]
-    # engine_image tag format: <registry>/<repo>:<protocol_rev>[@digest]
-    # Extract the tag (after last colon, before any @) and verify it matches protocol_rev.
-    tag = engine_image.split(":")[-1].split("@")[0]
-    if tag != nightly["protocol_rev"]:
-        raise SystemExit(
-            f"nightly engine_image tag must match compat.toml nightly protocol_rev "
-            f"{nightly['protocol_rev']}, got: {tag} (full image: {engine_image})"
-        )
-PY
-}
-
 on_error() {
     local status=$?
     local line="${1:-unknown}"
-    log "ERROR: nightly golden capture failed at line ${line} with exit code ${status}"
+    log "ERROR: golden capture failed at line ${line} with exit code ${status}"
     [[ "${GITHUB_ACTIONS:-}" == "true" ]] && printf '::endgroup::\n' >&2
     exit "${status}"
 }
@@ -106,9 +64,9 @@ if [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
     exit 1
 fi
 
-validate_capture_matrix
+read -r line_id vllm_tag <<<"$("${GEN[@]}" --show-line)"
 
-log "Starting nightly golden capture"
+log "Starting golden capture for line ${line_id} (${vllm_tag})"
 log "Configuration: namespace=${NAMESPACE} targets=${TARGETS} manifest=${MANIFEST} out_dir=${OUT_DIR} poll=${POLL_SECONDS}s timeout=${TIMEOUT_SECONDS}s"
 
 group_start "Prepare namespace and queue"
@@ -140,11 +98,15 @@ kubectl create configmap validation-scripts -n "${NAMESPACE}" \
     --dry-run=client -o yaml | kubectl apply -f -
 group_end
 
+# One generated Job per target: the Job's name and workload annotation are the
+# only naming rule, and the generator owns it.
 group_start "Submit Kueue capture jobs"
-log "Submitting nightly capture target(s): ${TARGETS}"
-# shellcheck disable=SC2086 # TARGETS intentionally word-split into selected names.
-python3 deploy/trace-capture/gen-capture-jobs.py ${TARGETS} | kubectl apply -f -
-log "Submitted capture target(s)"
+for target in ${TARGETS}; do
+    job_file="${OUT_DIR}/${target}.job.json"
+    "${GEN[@]}" "${target}" > "${job_file}"
+    log "${target}: submitting $(jq -r .metadata.name "${job_file}") (engine $(jq -r '.metadata.annotations["llm-d.ai/engine-image"]' "${job_file}"))"
+    kubectl apply -f "${job_file}"
+done
 group_end
 
 wait_for_loadgen_done() {
@@ -184,32 +146,16 @@ wait_for_loadgen_done() {
     return 1
 }
 
-# Resolve a target's compat line, vllm_tag, and workload label from
-# models.toml + compat.toml. Workload defaults to the target name.
-target_metadata() {
-    python3 - "$1" <<'PY'
-import sys
-import tomllib
-
-target = sys.argv[1]
-with open("deploy/trace-capture/models.toml", "rb") as f:
-    models = tomllib.load(f)
-with open("compat.toml", "rb") as f:
-    compat = tomllib.load(f)
-
-capture = next(c for c in models["capture"] if c["name"] == target)
-tag = capture["vllm_tag"]
-line = next(v["line"] for v in compat["vllm"] if v["tag"] == tag)
-print(line, tag, capture.get("workload", target))
-PY
-}
+entries="${OUT_DIR}/goldens-${line_id}.toml"
+: > "${entries}"
 
 for target in ${TARGETS}; do
-    job="trace-${target}"
+    job_file="${OUT_DIR}/${target}.job.json"
+    job="$(jq -r .metadata.name "${job_file}")"
+    workload="$(jq -r '.metadata.annotations["llm-d.ai/workload"]' "${job_file}")"
     trace="${OUT_DIR}/${target}.jsonl"
     stats="${OUT_DIR}/${target}.step-stats.jsonl"
     gz="${trace}.gz"
-    read -r line_id vllm_tag workload <<<"$(target_metadata "${target}")"
 
     group_start "Capture ${target}"
     log "${target}: using Kubernetes Job ${job}"
@@ -250,12 +196,12 @@ for target in ${TARGETS}; do
     log "${target}: upload complete"
 
     log "${target}: appending generated manifest entry (line ${line_id})"
-    cargo xtask nightly-golden-entry \
+    cargo xtask golden-entry \
         --trace "${trace}" \
         --archive "${gz}" \
         --bucket-path "${key}" \
         --workload "${workload}" \
-        --line "${line_id}" >> "${OUT_DIR}/goldens-${line_id}.toml"
+        --line "${line_id}" >> "${entries}"
 
     kubectl exec -n "${NAMESPACE}" "job/${job}" -c loadgen -- touch /trace/fetched
     if kubectl wait -n "${NAMESPACE}" --for=condition=complete "job/${job}" --timeout=10m; then
@@ -267,14 +213,10 @@ for target in ${TARGETS}; do
 done
 
 group_start "Update conformance manifest"
-for entry_file in "${OUT_DIR}"/goldens-*.toml; do
-    line_id="$(basename "${entry_file}" .toml)"
-    line_id="${line_id#goldens-}"
-    log "Updating ${MANIFEST} line ${line_id} from ${entry_file}"
-    cargo xtask set-nightly-goldens \
-        --entries-file "${entry_file}" \
-        --manifest "${MANIFEST}" \
-        --line "${line_id}"
-    cat "${entry_file}"
-done
+log "Replacing ${MANIFEST} line ${line_id} block from ${entries}"
+cargo xtask set-goldens \
+    --entries-file "${entries}" \
+    --manifest "${MANIFEST}" \
+    --line "${line_id}"
+cat "${entries}"
 group_end

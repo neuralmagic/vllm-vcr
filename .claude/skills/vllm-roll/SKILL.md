@@ -137,31 +137,38 @@ Also update, or the roll is half done:
 still *reproduces* the engine. That is conformance: golden captures replayed
 GPU-free (`docs/conformance.md`).
 
-A line enters the window as `fidelity_validated = false` and only flips to `true`
-after a golden for **that line** is captured on the GPU rig, uploaded, registered
-in `conformance/manifest.toml`, and passing the replay gate. Captures do not
-transfer across lines — a new `protocol_rev` invalidates the old ones.
+Whether a line hard-gates CI is derived from `conformance/manifest.toml`: a stable
+line with `MIN_FIDELITY_GOLDENS` fidelity goldens registered gates, anything less
+runs non-blocking. Captures do not transfer across lines — a new `protocol_rev`
+needs its own.
 
-Capturing needs the cluster, not a dev box:
+Normally the automation does this: the watcher's roll PR triggers `docker.yml`,
+which triggers `golden-capture.yml`, which pushes the new line's goldens onto the
+roll branch. When rolling by hand, run the same thing once the line's `:vllm<line>`
+image is published (needs the cluster, not a dev box):
 
 ```bash
-just capture-up && just capture-status    # wait for "forwarding frames"
-just capture-run                          # drive load, fetch trace + reports
-just capture-down                         # release the GPU
-cargo xtask nightly-golden-entry --line <line> --trace <trace.jsonl> --archive <trace.jsonl.gz> \
-  --bucket-path conformance/<tag>/<gpu>/<model>/<workload>.jsonl.gz --workload <workload>
+just conformance-goldens <line>           # capture, upload, register the golden set
 ```
+
+Or dispatch the Golden Capture workflow with `line=<line>`.
 
 ## 6. Cut the release
 
-Only after every line in the window is green **and** the fidelity story is
-whatever the release calls for. The sim's semver tracks *its* features; the vLLM
-line is build metadata that lives in the image tag, never in the sim version
-(`vllm-vcr:0.2.0-vllm0.26`). Do not conflate them.
+Normally automatic: a merge that moves the default line makes `auto-release.yml`
+open a patch-bump release PR with auto-merge on, and the merged version bump gets
+tagged, which is what release.yml and docker.yml build from. Only two things are
+ever manual: a *minor* bump (sim features, not a vLLM roll) is a hand-written
+`release: vX.Y.0` PR, which the tag job still picks up on merge; and pausing the
+whole thing is the repository variable `AUTO_RELEASE=off`.
+
+The sim's semver tracks *its* features; the vLLM line is build metadata that
+lives in the image tag, never in the sim version (`vllm-vcr:0.2.0-vllm0.26`).
+Do not conflate them.
 
 ```bash
-# bump [workspace.package] version in Cargo.toml, then:
+cargo xtask bump-patch     # or edit [workspace.package].version by hand for a minor
 cargo update --workspace   # refresh the lock's own version entries
 cargo test --workspace
-git tag v<version> && git push origin v<version>   # release.yml builds the matrix
+# open the release PR; the merge is tagged by auto-release.yml
 ```

@@ -50,32 +50,27 @@ release.
 line = "nightly"              # tracks vLLM main for drift detection
 tag  = "nightly"
 protocol_rev = "62a86318..."
-fidelity_validated = false
 
 [[vllm]]
 line = "rc"                   # tracks the newest release candidate
 tag  = "v0.28.0rc2"           # bumped (tag + rev) by the release watcher
 protocol_rev = "74a6576b..."
-fidelity_validated = false
 
 [[vllm]]
 line = "0.29"                 # current default line
 tag  = "v0.29.0"              # vLLM release tag; also the e2e frontend version
 protocol_rev = "98dff2a8..."  # rev for vllm-engine-core-client at this line
-fidelity_validated = false    # flips true once replay gates validate goldens
 default = true                # what :latest / unsuffixed builds point at
 
 [[vllm]]
 line = "0.28"                 # N-1 supported release line
 tag  = "v0.28.0"
 protocol_rev = "2cf0a691..."
-fidelity_validated = false
 
 [[vllm]]
 line = "0.27"                 # N-2 supported release line
 tag  = "v0.27.1"
 protocol_rev = "6e448d0e..."
-fidelity_validated = true
 ```
 
 Rules:
@@ -85,8 +80,10 @@ Rules:
   `vllm-engine-core-client` crate the simulator builds against for that line.
 - **Exactly one `default = true`.** That line is `:latest` and the unsuffixed
   build.
-- **A line enters the window only when `fidelity_validated = true`.** New lines
-  land as `false`, get capture+replay validation, then flip.
+- **Whether a line hard-gates CI is derived, not stored.** A stable line gates once
+  `conformance/manifest.toml` carries its full golden set (`MIN_FIDELITY_GOLDENS`
+  fidelity entries, see `conformance.md`). The roll PR arrives with those goldens,
+  so a new line is gated before it merges.
 
 ## Versioning: keep the two axes orthogonal
 
@@ -126,10 +123,10 @@ upstream). `compat.toml` stays the single source of truth.
 
 On `main` and tags the matrix builds + runs the replay gates against every line.
 That is the payoff: the day vLLM N+1 lands, the matrix tells us whether the wire
-still parses before we promote anything. Lines that are not yet
-`fidelity_validated` run non-gating (job-level `continue-on-error`), so a line
-with real API drift (e.g. a removed `mock_engine` module) surfaces as a
-non-blocking annotation rather than blocking the merge.
+still parses before we promote anything. Lines without their golden set run
+non-gating (job-level `continue-on-error`), so a line with real API drift (e.g. a
+removed `mock_engine` module) surfaces as a non-blocking annotation rather than
+blocking the merge.
 
 ## Handshake version guard (do regardless of path)
 
@@ -141,12 +138,15 @@ abort." Cheap, high value, independent of the matrix.
 
 ## Rotation when N advances
 
-When vLLM cuts N+1:
+When vLLM cuts N+1, the release watcher does all of it (`cargo xtask watch-stable`):
 
-1. Add it to `compat.toml` with `fidelity_validated = false`.
-2. Matrix builds it; run capture + replay to validate fidelity.
-3. Flip `fidelity_validated = true`, move `default` to the new line.
-4. Drop the now-N-3 line from the manifest.
+1. Adds it to `compat.toml` as the new `default`, drops the now-N-3 line and its
+   goldens, and opens the roll PR.
+2. `docker.yml` builds the roll branch's images; the Golden Capture workflow then
+   captures the new line's golden set and pushes it onto the roll PR.
+3. CI replays the goldens; the new line hard-gates from that run on, auto-merge
+   is enabled, and the merge opens (and auto-merges) a sim patch release PR,
+   whose merge is tagged and published. No hands.
 
 ## Build order
 
@@ -169,13 +169,23 @@ When vLLM cuts N+1:
    counterpart to the canary, run daily. It keeps the `rc` line on the newest
    release candidate (`cargo xtask watch-rc`) and rolls the stable window when a
    new final release lands (`cargo xtask watch-stable --max-stable 3`: new default,
-   oldest stable dropped past three). A patch release on a line already in the
-   window (v0.23.0 -> v0.23.1) bumps that line's tag/rev in place and resets its
-   `fidelity_validated` (old captures were taken against the old rev). Both pin +
-   build + run the protocol e2e against the new tag and only open a build-gated
-   PR if green; when the change moves the default line, the PR also carries the
-   re-pinned `Cargo.toml`/`Cargo.lock` so the committed pin keeps tracking the
-   default. **Done.**
+   oldest stable dropped past three, its goldens with it). A patch release on a
+   line already in the window (v0.23.0 -> v0.23.1) bumps that line's tag/rev in
+   place. Both pin + build + run the protocol e2e against the new tag and only
+   open a build-gated PR if green; when the change moves the default line, the PR
+   also carries the re-pinned `Cargo.toml`/`Cargo.lock` so the committed pin keeps
+   tracking the default. **Done.**
+6. Golden capture on roll (`.github/workflows/golden-capture.yml`). The roll PR's
+   image build triggers a capture of the new default line's golden set, pushed onto
+   the same branch, so the line gates before it merges. **Done.**
+7. Auto-merge + auto-release. Every automation PR (roll once its goldens are in,
+   rc bump, nightly bump, goldens, release) enables GitHub auto-merge, which waits
+   on the `main` ruleset's required checks (`ci/branch-rules.json`, applied with
+   `just branch-rules`; `conformance-gate` is the one context over the per-line
+   matrix). When a merge moves the default line, `auto-release.yml` bumps the sim
+   patch version in a release PR; when a version bump lands on main, it tags
+   `v<simver>` and release.yml + docker.yml publish. Set the repository variable
+   `AUTO_RELEASE=off` to pause it. **Done.**
 
 ## Open coupling note: the `block_size` / registration drift
 
@@ -205,8 +215,7 @@ captures with a GPU-free replay in CI. The capture runbook is
 Three artifacts cooperate:
 
 - **`compat.toml`** — the three-line stable window plus the `nightly`/`rc` trackers
-  (above). Each line carries `fidelity_validated`,
-  which gates whether its conformance failures block promotion.
+  (above).
 - **`conformance/manifest.toml`** — one `[[golden]]` entry per captured trace, with
   `line`, `bucket_path`, `sha256`, `config_hash`, `workload`, and `role` (`schema` or
   `fidelity`). The captures themselves are NOT in the repo; they live in a private
@@ -221,10 +230,10 @@ The CI flow (`.github/workflows/ci.yml`):
    `protocol_rev` (the `--config` patch from "CI matrix mechanics"), then fetches that
    line's goldens by sha, verifies the sha256, and replays them GPU-free, asserting the
    trace's `config_hash` (the profile-once/replay-many cache key, `--expect-config-hash`).
-3. Lines with `fidelity_validated = false` build and run conformance, but their
-   fidelity failures are continue-on-error (see "Rotation when N advances"): a freshly
-   added line gets signal without blocking the merge. Flip `fidelity_validated = true`
-   once the golden validates, and the leg becomes a hard gate.
+3. Lines without their full golden set build and run conformance, but their
+   fidelity failures are continue-on-error: a line gets signal without blocking the
+   merge until its goldens are registered, and the leg is a hard gate from then on
+   (`fidelity_validated` in the matrix is derived from the manifest).
 
 The replay-many half needs no GPU and is the same mechanism as the offline replay rig
 (`deploy/trace-capture/base/offline-replay.yaml`): the python frontend talks to

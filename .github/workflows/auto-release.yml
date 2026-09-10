@@ -1,0 +1,167 @@
+name: Auto Release
+
+# Closes the loop after a stable roll merges. Two jobs, each keyed on what the
+# push to main changed:
+#
+#   release-pr: the compat.toml default line's tag moved (a roll or a patch bump
+#     of the default line), so bump the sim patch version and open a release PR
+#     with auto-merge on. A vLLM line without a sim release would produce no new
+#     unsuffixed `vllm-vcr:<simver>` image tag (docker.yml), so a roll is always
+#     followed by a patch release.
+#   tag: the workspace version changed on main and carries no tag yet, so create
+#     `v<simver>`. That tag is what release.yml and docker.yml build from. This
+#     also covers a hand-written release PR: a version bump on main is a release.
+#
+# Both need the GitHub App (CANARY_APP_ID): commits and tags made with the default
+# GITHUB_TOKEN don't trigger workflows, and main requires signed commits.
+on:
+  push:
+    branches: [main]
+    paths:
+      - compat.toml
+      - Cargo.toml
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+  CANARY_APP_ID: ${{ secrets.CANARY_APP_ID }}
+
+jobs:
+  release-pr:
+    if: ${{ vars.AUTO_RELEASE != 'off' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - uses: ./.github/actions/setup-sccache
+        if: ${{ vars.SCCACHE_ROLE_ARN != '' }}
+        with:
+          role-arn: ${{ vars.SCCACHE_ROLE_ARN }}
+          bucket: ${{ vars.SCCACHE_BUCKET }}
+          region: ${{ vars.SCCACHE_REGION }}
+          key-prefix: ${{ vars.SCCACHE_S3_KEY_PREFIX }}
+
+      # xtask reads compat.toml from the working directory, so the parent's copy
+      # is read from a scratch dir rather than through an extra flag.
+      - name: Did the default line move?
+        id: moved
+        run: |
+          set -euo pipefail
+          cargo build -q -p xtask
+          xtask="$PWD/target/debug/xtask"
+          mkdir -p "${RUNNER_TEMP}/parent"
+          git show HEAD^:compat.toml > "${RUNNER_TEMP}/parent/compat.toml"
+          before=$(cd "${RUNNER_TEMP}/parent" && "$xtask" default-tag)
+          after=$("$xtask" default-tag)
+          echo "default line: ${before} -> ${after}"
+          echo "moved=$([[ "$before" != "$after" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "tag=${after}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump the patch version
+        id: bump
+        if: ${{ steps.moved.outputs.moved == 'true' }}
+        run: |
+          set -euo pipefail
+          version=$(cargo xtask bump-patch)
+          cargo update --workspace
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release: v${version}"
+
+      - name: Mint App token
+        id: app-token
+        if: ${{ steps.moved.outputs.moved == 'true' && env.CANARY_APP_ID != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CANARY_APP_ID }}
+          private-key: ${{ secrets.CANARY_APP_PRIVATE_KEY }}
+
+      - name: Open the release PR
+        id: pr
+        if: ${{ steps.moved.outputs.moved == 'true' && env.CANARY_APP_ID != '' }}
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          sign-commits: true
+          add-paths: |
+            Cargo.toml
+            Cargo.lock
+          base: main
+          branch: auto/release
+          delete-branch: true
+          commit-message: "release: v${{ steps.bump.outputs.version }}"
+          title: "release: v${{ steps.bump.outputs.version }}"
+          body: |
+            The default vLLM line moved to `${{ steps.moved.outputs.tag }}`, so this
+            cuts sim `v${{ steps.bump.outputs.version }}` on it. On merge the version
+            is tagged automatically and release.yml + docker.yml publish the
+            binaries and images, including the unsuffixed `vllm-vcr:${{ steps.bump.outputs.version }}`.
+
+      - name: Enable auto-merge on the release PR
+        if: ${{ steps.pr.outputs.pull-request-number != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh pr merge --auto --squash "${{ steps.pr.outputs.pull-request-number }}"
+
+  tag:
+    if: ${{ vars.AUTO_RELEASE != 'off' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Did the version change?
+        id: version
+        run: |
+          set -euo pipefail
+          cargo build -q -p xtask
+          xtask="$PWD/target/debug/xtask"
+          mkdir -p "${RUNNER_TEMP}/parent"
+          git show HEAD^:Cargo.toml > "${RUNNER_TEMP}/parent/Cargo.toml"
+          before=$(cd "${RUNNER_TEMP}/parent" && "$xtask" simver)
+          after=$("$xtask" simver)
+          echo "version: ${before} -> ${after}"
+          changed=false
+          if [[ "$before" != "$after" ]] && [[ -z "$(git ls-remote --tags origin "refs/tags/v${after}")" ]]; then
+            changed=true
+          fi
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          echo "version=${after}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint App token
+        id: app-token
+        if: ${{ steps.version.outputs.changed == 'true' && env.CANARY_APP_ID != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CANARY_APP_ID }}
+          private-key: ${{ secrets.CANARY_APP_PRIVATE_KEY }}
+
+      - name: Tag v${{ steps.version.outputs.version }}
+        if: ${{ steps.version.outputs.changed == 'true' && env.CANARY_APP_ID != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/v${{ steps.version.outputs.version }}" \
+            -f sha="${GITHUB_SHA}"
+          echo "tagged v${{ steps.version.outputs.version }} at ${GITHUB_SHA}"

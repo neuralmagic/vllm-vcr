@@ -15,6 +15,12 @@ name: vLLM Release Watch
 # a moving main HEAD, weekly bump), release/rc tags are low-noise events, so the
 # PR opens as soon as a new tag is detected.
 #
+# The stable roll PR is the start of a chain: its push builds the line's images
+# (docker.yml on the roll branch), which triggers golden-capture.yml to capture
+# the new default line's goldens and push them onto the same branch. Once a roll
+# PR for a tag is open the watcher leaves it alone, so that goldens commit
+# survives the daily re-run.
+#
 # The auto-bump PR steps are gated on the same GitHub App secret as the canary
 # (CANARY_APP_ID); until it's provisioned the watcher still runs its detect +
 # build check, it just doesn't open the PR.
@@ -149,8 +155,25 @@ jobs:
         if: ${{ steps.watch.outputs.changed == 'true' && steps.watch.outputs.is_default != 'true' }}
         run: git checkout -- Cargo.toml Cargo.lock
 
+      # An open PR from this branch that already names the tag is this same bump,
+      # possibly carrying commits pushed after it (the goldens). Re-creating it
+      # would force-push those away.
+      - name: Check for an open PR at this tag
+        id: open-pr
+        if: ${{ steps.watch.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.watch.outputs.tag }}
+        run: |
+          set -euo pipefail
+          n=$(gh pr list --head "${{ matrix.branch }}" --state open --json number,body \
+            | jq -r --arg tag "$TAG" '.[] | select(.body | contains($tag)) | .number' | head -n1)
+          echo "number=${n}" >> "$GITHUB_OUTPUT"
+          if [ -n "$n" ]; then echo "PR #$n already tracks ${TAG}; leaving it alone"; fi
+
       - name: Open/update the auto-bump PR
-        if: ${{ steps.watch.outputs.changed == 'true' && env.CANARY_APP_ID != '' }}
+        id: pr
+        if: ${{ steps.watch.outputs.changed == 'true' && env.CANARY_APP_ID != '' && steps.open-pr.outputs.number == '' }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -181,6 +204,20 @@ jobs:
             re-pinned `Cargo.toml`/`Cargo.lock` (the committed pin tracks the
             default line); otherwise the pin used to prove the build was transient
             and only `compat.toml` changes.
+
+            For a stable roll, docker.yml builds this branch's images and the
+            Golden Capture workflow then pushes the new default line's goldens
+            onto this branch, so the line hard-gates CI before merge, and turns
+            auto-merge on once they are in. Merging bumps the sim patch version
+            and cuts a release (auto-release.yml).
+
+      # An rc bump is build-gated and touches only the tracker; let CI merge it.
+      # The stable roll waits for its goldens (golden-capture.yml enables it).
+      - name: Enable auto-merge (rc bump)
+        if: ${{ matrix.axis == 'rc' && steps.pr.outputs.pull-request-number != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh pr merge --auto --squash "${{ steps.pr.outputs.pull-request-number }}"
 
       # Scheduled watchers fail silently unless someone stares at the Actions tab;
       # file (or refresh) an issue so a red run actually reaches a human. Manual
