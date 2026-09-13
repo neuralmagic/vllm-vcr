@@ -52,8 +52,8 @@ protocol_rev = "53e211d2923192ea1f7442de93d59cfbb150e089"
 # to the highest `vX.Y.ZrcN` tag newer than the default line. RCs never get
 # goldens.
 line = "rc"
-tag = "v0.28.0rc2"
-protocol_rev = "74a6576b9b5832494c314405c3cae94db55801e1"
+tag = "v0.29.1rc0"
+protocol_rev = "7ee8a6dd013819838da8012ca549d724bee7c6c6"
 
 [[vllm]]
 # N (head). 0.29 grew the handshake again: `EngineCoreReadyResponse` requires
