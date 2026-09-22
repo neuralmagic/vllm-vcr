@@ -24,7 +24,7 @@ sim-s3 = { path = "crates/sim-s3" }
 # pulled straight from the in-tree Rust frontend so the wire format never drifts.
 # Tracks the compat.toml `default = true` line (v0.29.0); `cargo xtask pin-vllm`
 # rewrites this rev for a per-line build.
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "98dff2a81d747d1dba01a47f939f48c3526d4206" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "ced6857afa0ea7b2e3f0846a62e1394e90f15607" }
 
 anyhow = "1.0.100"
 bytes = "1.12.1"

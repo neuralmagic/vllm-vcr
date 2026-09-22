@@ -55,6 +55,17 @@ line = "rc"
 tag = "v0.29.1rc0"
 protocol_rev = "7ee8a6dd013819838da8012ca549d724bee7c6c6"
 
+# Auto-rolled in by vllm-release-watch as the new default. Its goldens are
+# captured onto the roll PR by the golden-capture workflow once docker.yml
+# has published the line's image; the line hard-gates CI as soon as they are
+# registered. Review the protocol_rev (pinned to the release tag's commit,
+# not a post-release main sha) and whether this line needs a [patch] fork.
+[[vllm]]
+line = "0.30"
+tag = "v0.30.0"
+protocol_rev = "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+default = true
+
 [[vllm]]
 # N (head). 0.29 grew the handshake again: `EngineCoreReadyResponse` requires
 # `supports_lora` and `max_loras` (the frontend rejects an engine where
@@ -65,7 +76,6 @@ protocol_rev = "7ee8a6dd013819838da8012ca549d724bee7c6c6"
 line = "0.29"
 tag = "v0.29.0"
 protocol_rev = "98dff2a81d747d1dba01a47f939f48c3526d4206"
-default = true
 
 [[vllm]]
 # N-1. `EngineId::from_engine_index` narrowed to u16 here (the
@@ -76,13 +86,3 @@ default = true
 line = "0.28"
 tag = "v0.28.0"
 protocol_rev = "2cf0a6915ce544dc493a0990f2ea38d81601128a"
-
-[[vllm]]
-# N-2. The oldest line: `EngineId::from_engine_index` still takes u32, so this
-# is what keeps the `not(vllm_engine_id_u16)` branch honest. 0.27 frontends
-# require the parallel-config sizes, the scheduler caps, `instance_id`, and an
-# optional `kv_events_config` in the ready response (all emitted by the
-# `SimReadyResponse` superset).
-line = "0.27"
-tag = "v0.27.1"
-protocol_rev = "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
