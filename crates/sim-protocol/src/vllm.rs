@@ -24,7 +24,8 @@ pub use vllm_engine_core_client::EngineId;
 pub use vllm_engine_core_client::protocol::dtype::ModelDtype;
 pub use vllm_engine_core_client::protocol::lora::LoraRequest;
 pub use vllm_engine_core_client::protocol::output::{
-    EngineCoreFinishReason, EngineCoreOutput, decode_engine_core_outputs,
+    EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
+    decode_engine_core_outputs,
 };
 pub use vllm_engine_core_client::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
 pub use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
@@ -38,6 +39,21 @@ pub use vllm_engine_core_client::protocol::{decode_msgpack, encode_msgpack};
 /// The classified enum since 0.25. It serializes through a private flat struct,
 /// so it is not safe to construct inline; use the constructors below.
 pub type Envelope = vllm_engine_core_client::protocol::output::EngineCoreOutputs;
+
+/// The timestamp carried by a request-batch envelope, if it is one.
+///
+/// Exposed so a caller can check that a per-request `EngineCoreEvent.timestamp` is on the same
+/// clock as the envelope delivering it: a frontend subtracts one from the other
+/// (`prefill_time`, `inference_time` in vLLM's `stats.py`), so a mismatch is not detectable
+/// from either value alone.
+pub fn batch_timestamp(envelope: &Envelope) -> Option<f64> {
+    match envelope {
+        vllm_engine_core_client::protocol::output::EngineCoreOutputs::RequestBatch(batch) => {
+            Some(batch.timestamp)
+        }
+        _ => None,
+    }
+}
 
 /// Engine identity from the sim's engine index.
 ///

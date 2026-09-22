@@ -3,20 +3,34 @@
 # End-to-end LoRA metric check: real vLLM Rust frontend <--> our mock engine, exercising the
 # LoRA layer all the way to the vllm:lora_requests_info Prometheus gauge.
 #
-# This needs a vllm-rs built from the LoRA-gauge fork (the upstream Rust frontend at ba94a3b
-# does NOT emit vllm:lora_requests_info; see the divergence note). Build it and point
-# FRONTEND_BIN at it:
+# No fork is needed: a plain upstream vllm-rs emits the gauge as of vllm-project/vllm#45030
+# ("[Rust Frontend][Metrics] Export vllm:lora_requests_info from frontend", cc640ee8bc, merged
+# 2026-06-11). The ba94a3b this note used to pin predates it.
 #
-#   git clone https://github.com/wseaton/vllm && cd vllm && git checkout lora-info-gauge
-#   cd rust && cargo build --bin vllm-rs
-#   FRONTEND_BIN=$PWD/target/debug/vllm-rs ./scripts/e2e_lora.sh
+# Build the frontend once, anywhere on disk (the subshell leaves you where you started):
+#
+#   git clone https://github.com/vllm-project/vllm
+#   (cd vllm/rust && cargo build --bin vllm-rs)
+#   VLLM_RS="$PWD/vllm/rust/target/debug/vllm-rs"
+#
+# then run this script from the root of THIS repo:
+#
+#   FRONTEND_BIN="$VLLM_RS" ./scripts/e2e_lora.sh
 #
 # Flow:
 #   1. load a (fake) LoRA adapter via POST /v1/load_lora_adapter  -> engine add_lora
 #   2. send a request targeting that adapter; a slow inter-token latency keeps it decoding
-#      (the engine emits scheduler_stats on each decode step, so running_lora_adapters stays
-#      populated the whole time, unlike a prefill park which is silent until the first token)
-#   3. scrape /metrics mid-flight and assert running_lora_adapters names our adapter
+#      across the scrape window
+#   3. scrape /metrics mid-flight and assert the adapter is named inside running_lora_adapters
+#      specifically -- not merely somewhere on the gauge line, which the waiting label would
+#      also satisfy
+#
+# Where those two label sets come from, because it is not the scheduler stats: the frontend
+# derives them from per-request engine-core EVENTS. EngineCoreEventType::Scheduled promotes a
+# request to the running phase; Queued and Preempted return it to waiting
+# (RequestRegistry::apply_lora_events in the frontend). An engine that emits no events leaves
+# every request in the phase register() defaults to, which is Waiting -- so
+# running_lora_adapters stays empty however long the request decodes.
 set -euo pipefail
 
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
@@ -28,7 +42,7 @@ HTTP_PORT="${HTTP_PORT:-8000}"
 # DECODE_TOKENS tokens, so it runs ~ITL_MS*DECODE_TOKENS ms; keep that well over the scrape loop.
 ITL_MS="${ITL_MS:-2000}"
 DECODE_TOKENS="${DECODE_TOKENS:-12}"
-FRONTEND_BIN="${FRONTEND_BIN:-$HOME/git/vllm-fork/rust/target/debug/vllm-rs}"
+FRONTEND_BIN="${FRONTEND_BIN:-$HOME/git/vllm/rust/target/debug/vllm-rs}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE_BIN="$REPO_ROOT/target/debug/vllm-vcr"
@@ -57,8 +71,9 @@ fail() {
 }
 
 [[ -x "$FRONTEND_BIN" ]] || fail "frontend binary not found at $FRONTEND_BIN
-  build the LoRA-gauge fork: git checkout lora-info-gauge && (cd rust && cargo build --bin vllm-rs)
-  then re-run with FRONTEND_BIN=/path/to/rust/target/debug/vllm-rs"
+  build it from upstream vLLM -- no fork needed, see the note at the top of this script:
+    git clone https://github.com/vllm-project/vllm && (cd vllm/rust && cargo build --bin vllm-rs)
+  then re-run with FRONTEND_BIN=/absolute/path/to/vllm/rust/target/debug/vllm-rs"
 [[ -x "$ENGINE_BIN" ]] || { echo "building engine..."; (cd "$REPO_ROOT" && cargo build); }
 
 echo "logs: $LOG_DIR"
@@ -113,21 +128,50 @@ curl -fsS "$BASE_URL/v1/chat/completions" \
     >"$LOG_DIR/req.log" 2>&1 &
 req_pid=$!
 
-# 6. Scrape /metrics mid-flight and assert the gauge names our adapter.
+# 6. Scrape /metrics mid-flight and assert the gauge names our adapter as RUNNING.
+
+# Read one named label's value off the first vllm:lora_requests_info sample. Read by name
+# rather than by field position, because the two vLLM frontends do not agree on the label
+# set: the Python one carries max_lora and the Rust one does not.
+label_value() {
+    sed -n "s/^vllm:lora_requests_info{[^}]*$1=\"\([^\"]*\)\"[^}]*}.*/\1/p" | head -1
+}
+
+# Membership in a comma-separated adapter list, so "$ADAPTER" does not match a longer name
+# that merely has it as a prefix.
+list_contains() {
+    case ",$1," in
+        *",$2,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 echo "--- scraping /metrics for vllm:lora_requests_info ---"
 found=""
+saw_waiting=""
 for _ in $(seq 1 30); do
     sleep 1
     METRICS=$(curl -fsS "$BASE_URL/metrics" 2>/dev/null) || continue
-    LINE=$(echo "$METRICS" | grep 'vllm:lora_requests_info' | grep "$ADAPTER" || true)
-    if [[ -n "$LINE" ]]; then found="$LINE"; break; fi
+    GAUGE=$(echo "$METRICS" | grep '^vllm:lora_requests_info{' || true)
+    [[ -n "$GAUGE" ]] || continue
+    RUNNING=$(echo "$GAUGE" | label_value running_lora_adapters)
+    WAITING=$(echo "$GAUGE" | label_value waiting_lora_adapters)
+    if list_contains "$RUNNING" "$ADAPTER"; then found="$GAUGE"; break; fi
+    # Keep the last sample that had the adapter waiting-only: that is a distinct failure with
+    # a distinct cause, and reporting it as "adapter not found" would hide the cause.
+    if list_contains "$WAITING" "$ADAPTER"; then saw_waiting="$GAUGE"; fi
 done
 
-[[ -n "$found" ]] || {
+if [[ -z "$found" ]]; then
     echo "--- vllm:lora_requests_info lines seen ---" >&2
-    curl -fsS "$BASE_URL/metrics" 2>/dev/null | grep 'lora' >&2 || echo "(no lora metric lines; is FRONTEND_BIN the patched fork build?)" >&2
-    fail "vllm:lora_requests_info never named adapter '$ADAPTER' (gauge missing or engine not reporting it)"
-}
+    curl -fsS "$BASE_URL/metrics" 2>/dev/null | grep 'lora' >&2 || echo "(no lora metric lines at all)" >&2
+    if [[ -n "$saw_waiting" ]]; then
+        fail "adapter '$ADAPTER' appeared only in waiting_lora_adapters, never in running_lora_adapters.
+  The engine is emitting no EngineCoreEventType::Scheduled, so the frontend leaves every request
+  in the Waiting phase register() defaults to. See RequestRegistry::apply_lora_events."
+    fi
+    fail "vllm:lora_requests_info never named adapter '$ADAPTER' in running_lora_adapters (gauge absent, or the engine never reported the adapter at all)"
+fi
 
 echo ""
 echo "$found"

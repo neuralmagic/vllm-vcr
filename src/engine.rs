@@ -6,8 +6,8 @@
 //! stays correct as the protocol evolves upstream.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 
 use crate::lora::{LoraSpec, request_lora_name};
 use anyhow::{Result, anyhow};
@@ -29,7 +29,8 @@ use vllm_engine_core_client::protocol::utility::{
 use crate::control::{Config, ConfigPatch, ControlError, ControlReply, ControlRequest, Stats};
 use crate::engine_core::UtilityRequestSpec;
 use sim_protocol::vllm::{
-    self as vllm, EngineCoreFinishReason, EngineCoreOutput, EngineCoreRequest, Envelope,
+    self as vllm, EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
+    EngineCoreRequest, Envelope,
 };
 
 use crate::blockpool::BlockPool;
@@ -53,12 +54,62 @@ fn request_seed(base_seed: u64, engine_index: u32, request_id: &str) -> u64 {
     hasher.finish()
 }
 
-/// Current UNIX timestamp in seconds for engine-core output envelopes.
-fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or_default()
+/// Origin of the monotonic clock below, in seconds.
+///
+/// Any positive constant would do, because every consumer of these timestamps differences two of
+/// them and the origin cancels. It exists so a sample can never be `0.0`, which is not a free
+/// choice: vLLM's frontend uses `0.0` as "no timestamp yet" -- `if req_stats.scheduled_ts == 0.0:
+/// # ignore preemptions` in `vllm/v1/metrics/stats.py` -- so a real event stamped zero reads as an
+/// absent one. Elapsed time alone cannot supply that guarantee: the monotonic clock is quantised,
+/// and its tick can be coarser than the gap between two reads taken back to back -- which then
+/// differ by exactly zero. Observed in practice, not merely possible in principle.
+/// It also matches the shape of what vLLM reports, `time.monotonic()` being seconds since boot and
+/// never near zero.
+const CLOCK_ORIGIN_SECS: f64 = 1.0;
+
+/// Seconds from `base` on the monotonic clock, shifted by [`CLOCK_ORIGIN_SECS`] so the result is
+/// always strictly positive -- including when no measurable time has passed, and when `base` is
+/// somehow in the future, where the saturating subtraction floors the elapsed part at zero rather
+/// than wrapping.
+///
+/// Split out from [`now_monotonic`] so that guarantee is testable without depending on which
+/// caller in the process happens to sample the clock first.
+fn monotonic_secs_from(base: std::time::Instant) -> f64 {
+    CLOCK_ORIGIN_SECS
+        + std::time::Instant::now()
+            .saturating_duration_since(base)
+            .as_secs_f64()
+}
+
+/// Seconds on a process-local monotonic clock: the one time base for engine-core output
+/// envelopes and for the per-request lifecycle event timestamps a frontend subtracts from them.
+///
+/// **Why one clock.** A frontend mixes the two: `prefill_time = first_token_ts - scheduled_ts`
+/// and `inference_time = last_token_ts - scheduled_ts` (`vllm/v1/metrics/stats.py`, repeated in
+/// `output_processor.py`) each subtract an *event* timestamp from an *envelope* one. Two clocks
+/// make both intervals meaningless, and neither value looks wrong on its own.
+///
+/// **Why monotonic rather than the wall clock this used to read.** It is what vLLM does --
+/// `EngineCoreEvent` and `EngineCoreOutputs` are both stamped `time.monotonic()`, and the event
+/// struct documents itself as intervals-only, "should not be compared with timestamps from other
+/// processes". Agreeing clocks alone would have been enough to fix the arithmetic, but a wall
+/// clock can still step under NTP mid-request and corrupt a duration that spans the adjustment.
+/// The offset from any epoch is meaningless to every consumer of these fields, so there is
+/// nothing to lose by dropping it.
+///
+/// **Not every timestamp here is this clock**, and that is also vLLM's shape: KV-cache events
+/// carry wall time (`KVEventBatch(ts=time.time(), ...)` in vLLM's `scheduler.py`), which is why
+/// `kvevents.rs` keeps its own epoch helper. Do not unify them.
+fn now_monotonic() -> f64 {
+    // std's Instant, not tokio's: this is a timestamp reported to a frontend, so it should not
+    // follow a paused or auto-advanced runtime clock if one is ever enabled in tests.
+    static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+    // Resolve the base BEFORE sampling. Written as one expression -- `now().saturating_duration_
+    // since(*BASE.get_or_init(now))` -- the receiver is evaluated first, so on the very first call
+    // the base is the *later* of the two instants and every process's first timestamp saturates to
+    // exactly zero.
+    let base = *BASE.get_or_init(std::time::Instant::now);
+    monotonic_secs_from(base)
 }
 
 /// Build one request output with only token IDs and terminal status populated.
@@ -88,7 +139,7 @@ fn empty_finish_outputs(
         engine_index,
         vec![output],
         None,
-        now_secs(),
+        now_monotonic(),
         Some(finished_requests),
     )
 }
@@ -111,7 +162,7 @@ fn utility_result_outputs(
 ) -> Envelope {
     vllm::utility(
         engine_index,
-        now_secs(),
+        now_monotonic(),
         UtilityOutput {
             call_id,
             failure_message: None,
@@ -262,6 +313,11 @@ struct ActiveRequest {
     emit_offset: Duration,
     /// Generated output chunks awaiting their emission deadlines, in step order.
     pending_emits: VecDeque<PendingEmit>,
+    /// Lifecycle events accumulated for this request and not yet sent. vLLM attaches a
+    /// request's pending events to its next output, so these are drained onto the first
+    /// output this request produces; a frontend reads them to move the request between the
+    /// running and waiting LoRA adapter sets (`RequestRegistry::apply_lora_events`).
+    pending_events: Vec<EngineCoreEvent>,
     /// Verbatim decode schedule from `--replay-steps`: when present, each decode
     /// step pops its recorded `(gap, tokens)` instead of drawing from the
     /// latency model, so burst sizes (and gaps, at concurrency 1) replay
@@ -280,6 +336,11 @@ struct AdmissionCtx {
     block_ids: Vec<usize>,
     /// The batch's decode regime at admission (see `latency::Churn`).
     churn: Churn,
+    /// When this request entered the waiting queue, on `now_monotonic`'s clock. `None` when no
+    /// arrival was recorded for it, in which case the `Queued` event is omitted rather than
+    /// invented -- an absent event is honest, a fabricated timestamp would corrupt the
+    /// frontend's queue-duration interval.
+    queued_at: Option<f64>,
 }
 
 impl ActiveRequest {
@@ -296,7 +357,23 @@ impl ActiveRequest {
             num_local_cached_tokens,
             block_ids,
             churn,
+            queued_at,
         } = admission;
+        // vLLM records QUEUED when a request enters the waiting queue and SCHEDULED when the
+        // scheduler admits it, in that order; a frontend replays them in order, so the last one
+        // wins. Both are stamped here because admission is where both facts are known, and the
+        // pair is what yields a queue duration on the receiving side.
+        let mut pending_events = Vec::with_capacity(2);
+        if let Some(queued) = queued_at {
+            pending_events.push(EngineCoreEvent {
+                r#type: EngineCoreEventType::Queued,
+                timestamp: queued,
+            });
+        }
+        pending_events.push(EngineCoreEvent {
+            r#type: EngineCoreEventType::Scheduled,
+            timestamp: now_monotonic(),
+        });
         let incoming_kv = extract_kv_params(&request);
         let prefill_advertise = incoming_kv
             .as_ref()
@@ -422,6 +499,7 @@ impl ActiveRequest {
             emitted: 0,
             emit_offset,
             pending_emits: VecDeque::new(),
+            pending_events,
             scripted_decode: None,
         })
     }
@@ -557,6 +635,10 @@ pub(crate) struct SimEngine {
     /// Admitted-but-not-yet-running requests, in arrival order. Drained into `active_requests`
     /// as slots free up; its length is `vllm:num_requests_waiting`.
     waiting: VecDeque<Box<EngineCoreRequest>>,
+    /// Timestamp at which each request entered `waiting`, on `now_monotonic`'s clock, keyed by
+    /// request id. Consumed at admission to build that request's `Queued` lifecycle event, and
+    /// dropped if the request is aborted before it is ever admitted.
+    queued_at: BTreeMap<String, f64>,
     /// Requests whose blocks are pinned and batch slot reserved, but whose remote KV pull
     /// is still in flight. These count toward the seq cap and the step token
     /// backlog to prevent over-admission while pulls are outstanding.
@@ -848,6 +930,8 @@ impl SimEngine {
 
                 // vLLM never rejects on queue length, so the queue is unbounded. Enqueue, then
                 // admit into the batch if the seq cap and token budget allow; else it waits.
+                self.queued_at
+                    .insert(request.request_id.clone(), now_monotonic());
                 self.waiting.push_back(request);
                 outputs.extend(self.schedule());
                 self.ensure_step(Instant::now());
@@ -916,6 +1000,11 @@ impl SimEngine {
             if let Ok(mut plane) = self.data_plane.lock() {
                 plane.release(&request_id);
             }
+            // Drop any arrival stamp this request still holds. Only admission consumes one,
+            // and a request can be aborted from any of the three states below -- including
+            // pending-pull, where two-phase admission has not reached `admit_direct` yet. For an
+            // already-running request this is a no-op, its stamp having gone at admission.
+            self.queued_at.remove(&request_id);
             // A request is running, pending-pull, or waiting; abort whichever.
             let client_index = if let Some(request) = self.active_requests.remove(&request_id) {
                 self.pool.unpin(&request.block_ids);
@@ -963,7 +1052,7 @@ impl SimEngine {
                     self.engine_index,
                     client_outputs,
                     stats.take(),
-                    now_secs(),
+                    now_monotonic(),
                     Some(finished_requests),
                 ),
             });
@@ -1132,6 +1221,9 @@ impl SimEngine {
                 num_local_cached_tokens: num_local_cached,
                 block_ids: block_ids.clone(),
                 churn,
+                // Consume the arrival stamp: a request is admitted once, and leaving the entry
+                // behind would leak it for the engine's lifetime.
+                queued_at: self.queued_at.remove(&request_id),
             },
         ) {
             Ok(mut active) => {
@@ -1573,6 +1665,13 @@ impl SimEngine {
                 if is_first {
                     output.prefill_stats = Some(request.prefill_stats());
                 }
+                // Drain whatever lifecycle events have accumulated onto this output, as vLLM
+                // does. Only the first output normally carries any; the take() keeps that true
+                // without depending on `is_first`, so a later event (were one ever recorded
+                // mid-flight) still ships rather than being silently dropped.
+                if !request.pending_events.is_empty() {
+                    output.events = Some(std::mem::take(&mut request.pending_events));
+                }
                 if finished {
                     finished_ids.insert(request.request_id.clone());
                     self.stats.requests_completed += 1;
@@ -1666,7 +1765,7 @@ impl SimEngine {
                         self.engine_index,
                         outputs,
                         Some(Box::new(stats.clone())),
-                        now_secs(),
+                        now_monotonic(),
                         (!finished_requests.is_empty()).then_some(finished_requests),
                     ),
                 })
@@ -1812,6 +1911,7 @@ impl SimEngine {
             loras: LoraRegistry::new(max_loras),
             active_requests: BTreeMap::new(),
             waiting: VecDeque::new(),
+            queued_at: BTreeMap::new(),
             pending_pulls: BTreeMap::new(),
             current_step: None,
             prefill_order: VecDeque::new(),
@@ -1956,6 +2056,7 @@ mod tests {
             loras: LoraRegistry::new(opt.max_loras as usize),
             active_requests: BTreeMap::new(),
             waiting: VecDeque::new(),
+            queued_at: BTreeMap::new(),
             pending_pulls: BTreeMap::new(),
             current_step: None,
             prefill_order: VecDeque::new(),
@@ -2015,6 +2116,40 @@ mod tests {
 
     /// Drain steps until the engine is idle, returning the flat output list. Safe only when
     /// the latency model is instant (deadlines never in the future), as in these tests.
+    /// Like `drain`, but pairs each output with the timestamp of the envelope that delivered it,
+    /// so a test can check an event's clock against the envelope's own rather than against an
+    /// external stand-in for it.
+    fn drain_with_envelope_ts(
+        engine: &mut SimEngine,
+        rx: &mut mpsc::UnboundedReceiver<PullCompletion>,
+    ) -> Vec<(f64, EngineCoreOutput)> {
+        let mut all = Vec::new();
+        let collect = |batch: Vec<EngineOutput>, all: &mut Vec<(f64, EngineCoreOutput)>| {
+            for out in batch {
+                // Only request batches carry per-request outputs, so only they can carry events.
+                let Some(timestamp) = vllm::batch_timestamp(&out.outputs) else {
+                    continue;
+                };
+                all.extend(
+                    vllm::request_outputs(&out.outputs)
+                        .iter()
+                        .cloned()
+                        .map(|output| (timestamp, output)),
+                );
+            }
+        };
+        while !engine.active_requests.is_empty() || !engine.pending_pulls.is_empty() {
+            collect(settle_pulls(engine, rx), &mut all);
+            let batch = engine.step();
+            assert!(
+                !batch.is_empty(),
+                "instant model must make progress each step"
+            );
+            collect(batch, &mut all);
+        }
+        all
+    }
+
     fn drain(
         engine: &mut SimEngine,
         rx: &mut mpsc::UnboundedReceiver<PullCompletion>,
@@ -2175,6 +2310,256 @@ mod tests {
         assert_eq!(stats.num_prompt_tokens, 7);
         assert_eq!(stats.num_computed_tokens, 7);
         assert_eq!(stats.num_external_cached_tokens, 0);
+    }
+
+    /// Event types on every output that carries any, in order.
+    fn event_types(outputs: &[EngineCoreOutput]) -> Vec<Vec<EngineCoreEventType>> {
+        outputs
+            .iter()
+            .filter_map(|o| o.events.as_ref())
+            .map(|events| events.iter().map(|e| e.r#type).collect())
+            .collect()
+    }
+
+    #[test]
+    fn lifecycle_events_ride_the_first_output() {
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 7, 4));
+        let outputs = drain(&mut engine, &mut rx);
+
+        assert!(
+            outputs.len() > 1,
+            "fixture premise: more than one output, so \"only the first carries events\" is a real claim"
+        );
+        assert_eq!(
+            event_types(&outputs),
+            vec![vec![
+                EngineCoreEventType::Queued,
+                EngineCoreEventType::Scheduled
+            ]],
+            "exactly one output carries events, and it carries QUEUED then SCHEDULED"
+        );
+
+        let events = outputs
+            .iter()
+            .find_map(|o| o.events.as_ref())
+            .expect("an output with events");
+        assert!(
+            events[0].timestamp <= events[1].timestamp,
+            "queued {} must not follow scheduled {}",
+            events[0].timestamp,
+            events[1].timestamp
+        );
+    }
+
+    #[test]
+    fn event_timestamps_share_the_envelope_clock() {
+        // A frontend subtracts an event timestamp from an envelope timestamp:
+        // `prefill_time = first_token_ts - scheduled_ts` and
+        // `inference_time = last_token_ts - scheduled_ts` in vllm/v1/metrics/stats.py, where the
+        // left operand comes from `EngineCoreOutputs.timestamp` and the right from an event. So
+        // the two must be one clock, and neither value reveals a mismatch on its own.
+        //
+        // Checked against the envelope that actually carried the events, not against wall time: a
+        // wall-time check only stands in for this while the envelope happens to be epoch-based, so
+        // it would keep passing if the envelope clock moved underneath it.
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 7, 4));
+        let carried = drain_with_envelope_ts(&mut engine, &mut rx);
+
+        let (envelope_ts, output) = carried
+            .iter()
+            .find(|(_, output)| output.events.is_some())
+            .expect("an output carrying events, paired with its envelope timestamp");
+        for event in output.events.as_ref().expect("events") {
+            let skew = (envelope_ts - event.timestamp).abs();
+            assert!(
+                skew < 60.0,
+                "{:?} stamped {} is {skew}s from the envelope that carried it ({envelope_ts}); \
+                 two different clocks show up here as ~1.8e9",
+                event.r#type,
+                event.timestamp,
+            );
+        }
+    }
+
+    #[test]
+    fn the_clock_is_strictly_positive_even_at_zero_elapsed() {
+        // 0.0 is not a usable timestamp: vLLM's frontend reads it as "not set yet"
+        // (`if req_stats.scheduled_ts == 0.0` in stats.py), so a real event stamped zero reads as
+        // an absent one. Elapsed time alone cannot rule it out -- the monotonic clock is quantised
+        // and its tick can be coarser than the gap between two back-to-back reads, which then
+        // differ by exactly zero -- which is what CLOCK_ORIGIN_SECS is for. Tested through
+        // `monotonic_secs_from` rather than
+        // `now_monotonic` because the latter's first-sample behaviour depends on which caller in
+        // the process samples first, and every test here shares one process.
+        let zero_elapsed = monotonic_secs_from(std::time::Instant::now());
+        assert!(
+            zero_elapsed > 0.0,
+            "a sample taken with no measurable elapsed time must still be positive, got {zero_elapsed}"
+        );
+
+        // A base in the future must floor at the origin, not wrap negative.
+        let future_base = std::time::Instant::now() + Duration::from_secs(5);
+        let saturated = monotonic_secs_from(future_base);
+        assert!(
+            saturated > 0.0,
+            "a base in the future must saturate to a positive value, got {saturated}"
+        );
+
+        // And the origin must not swamp real elapsed time: differences still survive it.
+        let base = std::time::Instant::now();
+        let first = monotonic_secs_from(base);
+        std::thread::sleep(Duration::from_millis(5));
+        let second = monotonic_secs_from(base);
+        assert!(
+            second - first >= 0.004,
+            "the origin shift must cancel in a difference: {second} - {first}"
+        );
+    }
+
+    #[test]
+    fn no_emitted_timestamp_is_zero() {
+        // The downstream form of the invariant above, on real emissions rather than the helper:
+        // neither an event nor the envelope carrying it may be stamped zero.
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 7, 4));
+        let carried = drain_with_envelope_ts(&mut engine, &mut rx);
+        assert!(
+            !carried.is_empty(),
+            "fixture premise: something was emitted"
+        );
+
+        for (envelope_ts, output) in &carried {
+            assert!(
+                *envelope_ts > 0.0,
+                "envelope for {} stamped {envelope_ts}, which a frontend reads as absent",
+                output.request_id
+            );
+            for event in output.events.iter().flatten() {
+                assert!(
+                    event.timestamp > 0.0,
+                    "{:?} for {} stamped {}, which a frontend reads as absent",
+                    event.r#type,
+                    output.request_id,
+                    event.timestamp
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_shared_clock_is_monotonic_not_wall() {
+        // Agreement alone, above, would also be satisfied by putting both on the wall clock --
+        // which is what this engine used to do. vLLM stamps both with `time.monotonic()` and
+        // documents the event timestamps as intervals only, "should not be compared with
+        // timestamps from other processes"; a wall clock can also step under NTP mid-request and
+        // corrupt any duration spanning the adjustment. A process-local monotonic clock reads as
+        // seconds since this process started, so it sits far below any epoch timestamp.
+        const EPOCH_FLOOR: f64 = 1.0e9; // ~2001 as epoch seconds; process uptime never reaches it
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 7, 4));
+        let carried = drain_with_envelope_ts(&mut engine, &mut rx);
+
+        let (envelope_ts, output) = carried
+            .iter()
+            .find(|(_, output)| output.events.is_some())
+            .expect("an output carrying events, paired with its envelope timestamp");
+        assert!(
+            *envelope_ts < EPOCH_FLOOR,
+            "envelope timestamp {envelope_ts} looks like wall-clock epoch, not a monotonic base"
+        );
+        for event in output.events.as_ref().expect("events") {
+            assert!(
+                event.timestamp < EPOCH_FLOOR,
+                "{:?} timestamp {} looks like wall-clock epoch, not a monotonic base",
+                event.r#type,
+                event.timestamp,
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_is_the_last_event_so_a_frontend_reads_the_adapter_as_running() {
+        // The consumer contract: a frontend replays these in order and keeps the last
+        // (RequestRegistry::apply_lora_events), mapping SCHEDULED to the running adapter set and
+        // QUEUED/PREEMPTED to the waiting one. If SCHEDULED were not last, an actively decoding
+        // adapter would render in waiting_lora_adapters instead of running_lora_adapters.
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, lora_request("r1", "adapterA", 1));
+        let outputs = drain(&mut engine, &mut rx);
+
+        let events = outputs
+            .iter()
+            .find_map(|o| o.events.as_ref())
+            .expect("the LoRA request's output carries events");
+        assert_eq!(
+            events.last().map(|e| e.r#type),
+            Some(EngineCoreEventType::Scheduled),
+            "SCHEDULED must be the final event a frontend sees"
+        );
+    }
+
+    #[test]
+    fn a_request_that_waited_still_carries_both_events() {
+        let mut opt = test_opt();
+        opt.max_num_seqs = 1; // force the second request to queue
+        let (mut engine, mut rx) = test_engine(opt);
+
+        add(&mut engine, &mut rx, request("first", 7, 2));
+        add(&mut engine, &mut rx, request("second", 7, 2));
+        // Fixture premise: "second" really did wait, so this exercises the queued path rather
+        // than admitting both immediately and testing the same path as the test above.
+        assert_eq!(engine.active_requests.len(), 1);
+        assert!(
+            engine.waiting.iter().any(|r| r.request_id == "second"),
+            "fixture premise: the second request is queued, not admitted"
+        );
+
+        let outputs = drain(&mut engine, &mut rx);
+        let second = outputs
+            .iter()
+            .filter(|o| o.request_id == "second")
+            .find_map(|o| o.events.as_ref())
+            .expect("the queued request's output carries events");
+        assert_eq!(
+            second.iter().map(|e| e.r#type).collect::<Vec<_>>(),
+            vec![EngineCoreEventType::Queued, EngineCoreEventType::Scheduled],
+        );
+        assert!(
+            second[0].timestamp <= second[1].timestamp,
+            "queue entry precedes admission"
+        );
+    }
+
+    #[test]
+    fn aborting_a_waiting_request_drops_its_arrival_stamp() {
+        let mut opt = test_opt();
+        opt.max_num_seqs = 1;
+        let (mut engine, mut rx) = test_engine(opt);
+
+        add(&mut engine, &mut rx, request("first", 7, 4));
+        add(&mut engine, &mut rx, request("second", 7, 4));
+        assert!(
+            engine.queued_at.contains_key("second"),
+            "fixture premise: the waiting request holds an arrival stamp to leak"
+        );
+
+        engine
+            .handle_input(EngineInput::Abort(vec!["second".to_string()]))
+            .expect("abort");
+        assert!(
+            !engine.queued_at.contains_key("second"),
+            "an abort before admission must drop the stamp; nothing else ever will"
+        );
+
+        // And the admitted request's own stamp was consumed at admission, so nothing is left.
+        let _ = drain(&mut engine, &mut rx);
+        assert!(
+            engine.queued_at.is_empty(),
+            "no arrival stamps outlive their requests: {:?}",
+            engine.queued_at
+        );
     }
 
     #[test]
@@ -3014,6 +3399,40 @@ mod tests {
         );
         req.sampling_params.as_mut().unwrap().extra_args = Some(extra);
         req
+    }
+
+    #[test]
+    fn aborting_a_pending_pull_request_drops_its_arrival_stamp() {
+        // Two-phase admission consumes the arrival stamp late, in `admit_direct` via
+        // `finish_pull`. A request aborted while its pull is still in flight never reaches
+        // that call, so the abort path is the only thing that can drop its stamp.
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4;
+        let (mut engine, mut rx) = test_engine(opt);
+
+        let req = remote_prefill_request("rpull", 8, 5);
+        engine
+            .handle_input(EngineInput::Request(Box::new(req)))
+            .expect("handle_input");
+
+        assert!(
+            engine.pending_pulls.contains_key("rpull"),
+            "fixture premise: the request is in the two-phase path, not admitted"
+        );
+        assert!(
+            engine.queued_at.contains_key("rpull"),
+            "fixture premise: it still holds an arrival stamp to leak"
+        );
+
+        engine
+            .handle_input(EngineInput::Abort(vec!["rpull".to_string()]))
+            .expect("abort");
+
+        assert!(
+            !engine.queued_at.contains_key("rpull"),
+            "aborting a pending-pull request must drop its arrival stamp"
+        );
+        let _ = &mut rx;
     }
 
     #[test]
