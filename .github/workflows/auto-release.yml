@@ -47,7 +47,7 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
 
       - uses: ./.github/actions/setup-sccache
         if: ${{ vars.SCCACHE_ROLE_ARN != '' }}
@@ -127,7 +127,7 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
 
       - name: Did the version change?
         id: version
