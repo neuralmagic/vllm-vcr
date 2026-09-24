@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::lora::{LoraSpec, request_lora_name};
 use anyhow::{Result, anyhow};
@@ -29,7 +29,8 @@ use vllm_engine_core_client::protocol::utility::{
 use crate::control::{Config, ConfigPatch, ControlError, ControlReply, ControlRequest, Stats};
 use crate::engine_core::UtilityRequestSpec;
 use sim_protocol::vllm::{
-    self as vllm, EngineCoreFinishReason, EngineCoreOutput, EngineCoreRequest, Envelope,
+    self as vllm, EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
+    EngineCoreRequest, Envelope,
 };
 
 use crate::blockpool::BlockPool;
@@ -39,7 +40,7 @@ use crate::kvparams::{extract_kv_params, kv_flag};
 use crate::latency::{Churn, DecodePacing, FirstTokenCtx, LatencyModel};
 use crate::lora::LoraRegistry;
 use crate::replay_steps::{ScriptedDecode, StepSource};
-use crate::sched::{self, Scheduler};
+use crate::sched::{self, QueuedRequest, Scheduler};
 use crate::tokens::{RandomTokens, TokenCtx, TokenSource};
 use crate::{Opt, SchedulingPolicy};
 
@@ -53,12 +54,18 @@ fn request_seed(base_seed: u64, engine_index: u32, request_id: &str) -> u64 {
     hasher.finish()
 }
 
-/// Current UNIX timestamp in seconds for engine-core output envelopes.
-fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or_default()
+/// Seconds on the system monotonic clock, the same clock as Python's `time.monotonic()` on
+/// Linux. vLLM stamps both output envelopes and request lifecycle events with it.
+fn now_monotonic() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec for the duration of the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return 0.0;
+    }
+    ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
 }
 
 /// Build one request output with only token IDs and terminal status populated.
@@ -88,7 +95,7 @@ fn empty_finish_outputs(
         engine_index,
         vec![output],
         None,
-        now_secs(),
+        now_monotonic(),
         Some(finished_requests),
     )
 }
@@ -111,7 +118,7 @@ fn utility_result_outputs(
 ) -> Envelope {
     vllm::utility(
         engine_index,
-        now_secs(),
+        now_monotonic(),
         UtilityOutput {
             call_id,
             failure_message: None,
@@ -262,6 +269,8 @@ struct ActiveRequest {
     emit_offset: Duration,
     /// Generated output chunks awaiting their emission deadlines, in step order.
     pending_emits: VecDeque<PendingEmit>,
+    /// Lifecycle events not yet sent, drained onto the request's next output.
+    pending_events: Vec<EngineCoreEvent>,
     /// Verbatim decode schedule from `--replay-steps`: when present, each decode
     /// step pops its recorded `(gap, tokens)` instead of drawing from the
     /// latency model, so burst sizes (and gaps, at concurrency 1) replay
@@ -280,6 +289,8 @@ struct AdmissionCtx {
     block_ids: Vec<usize>,
     /// The batch's decode regime at admission (see `latency::Churn`).
     churn: Churn,
+    /// When the request entered the waiting queue, on `now_monotonic`'s clock.
+    queued_at: f64,
 }
 
 impl ActiveRequest {
@@ -296,7 +307,18 @@ impl ActiveRequest {
             num_local_cached_tokens,
             block_ids,
             churn,
+            queued_at,
         } = admission;
+        let pending_events = vec![
+            EngineCoreEvent {
+                r#type: EngineCoreEventType::Queued,
+                timestamp: queued_at,
+            },
+            EngineCoreEvent {
+                r#type: EngineCoreEventType::Scheduled,
+                timestamp: now_monotonic(),
+            },
+        ];
         let incoming_kv = extract_kv_params(&request);
         let prefill_advertise = incoming_kv
             .as_ref()
@@ -422,6 +444,7 @@ impl ActiveRequest {
             emitted: 0,
             emit_offset,
             pending_emits: VecDeque::new(),
+            pending_events,
             scripted_decode: None,
         })
     }
@@ -498,7 +521,7 @@ impl ActiveRequest {
 /// remote KV pull is still in flight on a background thread. The pull result arrives
 /// via `pull_completion_rx`; on completion `finish_pull` promotes it to an `ActiveRequest`.
 struct PendingPull {
-    request: Box<EngineCoreRequest>,
+    queued: QueuedRequest,
     block_ids: Vec<usize>,
     num_local_cached_tokens: usize,
     client_index: u32,
@@ -556,7 +579,7 @@ pub(crate) struct SimEngine {
     active_requests: BTreeMap<String, ActiveRequest>,
     /// Admitted-but-not-yet-running requests, in arrival order. Drained into `active_requests`
     /// as slots free up; its length is `vllm:num_requests_waiting`.
-    waiting: VecDeque<Box<EngineCoreRequest>>,
+    waiting: VecDeque<QueuedRequest>,
     /// Requests whose blocks are pinned and batch slot reserved, but whose remote KV pull
     /// is still in flight. These count toward the seq cap and the step token
     /// backlog to prevent over-admission while pulls are outstanding.
@@ -816,7 +839,10 @@ impl SimEngine {
                 // Dedup against the running batch, pending pulls, and the waiting queue.
                 if self.active_requests.contains_key(&request_id)
                     || self.pending_pulls.contains_key(&request_id)
-                    || self.waiting.iter().any(|r| r.request_id == request_id)
+                    || self
+                        .waiting
+                        .iter()
+                        .any(|q| q.request.request_id == request_id)
                 {
                     warn!(
                         engine_index = self.engine_index,
@@ -848,10 +874,17 @@ impl SimEngine {
 
                 // vLLM never rejects on queue length, so the queue is unbounded. Enqueue, then
                 // admit into the batch if the seq cap and token budget allow; else it waits.
-                self.waiting.push_back(request);
+                self.waiting.push_back(QueuedRequest {
+                    request,
+                    queued_at: now_monotonic(),
+                });
                 outputs.extend(self.schedule());
                 self.ensure_step(Instant::now());
-                if self.opt.log_requests && self.waiting.iter().any(|r| r.request_id == request_id)
+                if self.opt.log_requests
+                    && self
+                        .waiting
+                        .iter()
+                        .any(|q| q.request.request_id == request_id)
                 {
                     info!(
                         request_id,
@@ -926,8 +959,12 @@ impl SimEngine {
                 // the orphaned task's completion be dropped in finish_pull.
                 self.pool.unpin(&pending.block_ids);
                 Some(pending.client_index)
-            } else if let Some(pos) = self.waiting.iter().position(|r| r.request_id == request_id) {
-                self.waiting.remove(pos).map(|r| r.client_index)
+            } else if let Some(pos) = self
+                .waiting
+                .iter()
+                .position(|q| q.request.request_id == request_id)
+            {
+                self.waiting.remove(pos).map(|q| q.request.client_index)
             } else {
                 None
             };
@@ -963,7 +1000,7 @@ impl SimEngine {
                     self.engine_index,
                     client_outputs,
                     stats.take(),
-                    now_secs(),
+                    now_monotonic(),
                     Some(finished_requests),
                 ),
             });
@@ -989,10 +1026,11 @@ impl SimEngine {
     /// Requests without remote KV go through single-phase admission: `ActiveRequest::new`
     /// is called inline and the request enters `active_requests` immediately. Returns an
     /// immediate-finish output if the request is invalid (e.g. `max_tokens == 0`).
-    fn admit(&mut self, request: Box<EngineCoreRequest>) -> Option<EngineOutput> {
+    fn admit(&mut self, queued: QueuedRequest) -> Option<EngineOutput> {
+        let request = &queued.request;
         let request_id = request.request_id.clone();
         let client_index = request.client_index;
-        let remote = extract_kv_params(&request)
+        let remote = extract_kv_params(request)
             .as_ref()
             .and_then(parse_remote_kv);
         let prompt_len = request
@@ -1005,7 +1043,7 @@ impl SimEngine {
         // Measure the local prefix hit, allocate slots for the new blocks, pin them all, and
         // emit BlockStored/BlockRemoved for the router. The slot ids are what the data plane
         // pages over NIXL and what we advertise as remote_block_ids.
-        let lora_name = request_lora_name(&request);
+        let lora_name = request_lora_name(request);
         let prompt_slice = request.prompt_token_ids.as_deref().unwrap_or_default();
         let outcome =
             self.pool
@@ -1022,11 +1060,11 @@ impl SimEngine {
         // park the request and spawn the pull on a blocking thread. The completion arrives via
         // `pull_completion_rx` and `finish_pull` promotes it to an ActiveRequest.
         if let Some(remote) = remote {
-            let lora_name_owned = request_lora_name(&request).map(str::to_string);
+            let lora_name_owned = request_lora_name(request).map(str::to_string);
             self.pending_pulls.insert(
                 request_id.clone(),
                 PendingPull {
-                    request,
+                    queued,
                     block_ids: block_ids.clone(),
                     num_local_cached_tokens: num_local_cached,
                     client_index,
@@ -1080,7 +1118,7 @@ impl SimEngine {
         self.admit_direct(
             request_id,
             client_index,
-            request,
+            queued,
             block_ids,
             num_local_cached,
         )
@@ -1092,10 +1130,11 @@ impl SimEngine {
         &mut self,
         request_id: String,
         client_index: u32,
-        request: Box<EngineCoreRequest>,
+        queued: QueuedRequest,
         block_ids: Vec<usize>,
         num_local_cached: usize,
     ) -> Option<EngineOutput> {
+        let QueuedRequest { request, queued_at } = queued;
         // Count this request among the running set for its own load-factor scaling.
         // Include pending pulls in the count since they occupy batch slots.
         let num_running = (self.active_requests.len() + self.pending_pulls.len()) as u64 + 1;
@@ -1132,6 +1171,7 @@ impl SimEngine {
                 num_local_cached_tokens: num_local_cached,
                 block_ids: block_ids.clone(),
                 churn,
+                queued_at,
             },
         ) {
             Ok(mut active) => {
@@ -1201,7 +1241,7 @@ impl SimEngine {
         if let Some(out) = self.admit_direct(
             request_id,
             pending.client_index,
-            pending.request,
+            pending.queued,
             pending.block_ids,
             pending.num_local_cached_tokens,
         ) {
@@ -1250,7 +1290,10 @@ impl SimEngine {
     /// Number of waiting requests the LoRA slot cap is currently blocking (vLLM's skipped
     /// waiting queue). Computed against the running batch's resident adapters.
     fn num_lora_skipped(&self) -> u64 {
-        self.waiting.iter().filter(|r| !self.lora_admits(r)).count() as u64
+        self.waiting
+            .iter()
+            .filter(|q| !self.lora_admits(&q.request))
+            .count() as u64
     }
 
     /// Admit waiting requests into the running batch (in policy order) until the seq cap
@@ -1573,6 +1616,9 @@ impl SimEngine {
                 if is_first {
                     output.prefill_stats = Some(request.prefill_stats());
                 }
+                if !request.pending_events.is_empty() {
+                    output.events = Some(std::mem::take(&mut request.pending_events));
+                }
                 if finished {
                     finished_ids.insert(request.request_id.clone());
                     self.stats.requests_completed += 1;
@@ -1666,7 +1712,7 @@ impl SimEngine {
                         self.engine_index,
                         outputs,
                         Some(Box::new(stats.clone())),
-                        now_secs(),
+                        now_monotonic(),
                         (!finished_requests.is_empty()).then_some(finished_requests),
                     ),
                 })
@@ -1867,7 +1913,7 @@ impl EngineCore for SimEngine {
             .keys()
             .cloned()
             .chain(self.pending_pulls.keys().cloned())
-            .chain(self.waiting.iter().map(|r| r.request_id.clone()))
+            .chain(self.waiting.iter().map(|q| q.request.request_id.clone()))
             .collect();
         self.abort_requests(request_ids)
     }
@@ -1898,8 +1944,8 @@ mod tests {
 
     use sim_protocol::vllm::{EngineCoreRequest, EngineCoreSamplingParams, LoraRequest};
 
-    use super::*;
     use crate::dataplane::{NixlConfig, PdRole, make_data_plane};
+    use crate::engine::*;
     use crate::engine_core::{EngineInput, EngineOutput};
 
     /// Build a value for `EngineCoreRequest.lora_request`.
@@ -2013,17 +2059,24 @@ mod tests {
         settle_pulls(engine, rx);
     }
 
-    /// Drain steps until the engine is idle, returning the flat output list. Safe only when
-    /// the latency model is instant (deadlines never in the future), as in these tests.
-    fn drain(
+    /// Drain steps until the engine is idle, returning each output with the timestamp of the
+    /// envelope that carried it. Safe only when the latency model is instant (deadlines never
+    /// in the future), as in these tests.
+    fn drain_with_envelope_ts(
         engine: &mut SimEngine,
         rx: &mut mpsc::UnboundedReceiver<PullCompletion>,
-    ) -> Vec<EngineCoreOutput> {
+    ) -> Vec<(f64, EngineCoreOutput)> {
         let mut all = Vec::new();
-        while !engine.active_requests.is_empty() || !engine.pending_pulls.is_empty() {
-            for out in settle_pulls(engine, rx) {
-                all.extend(vllm::request_outputs(&out.outputs).to_vec());
+        let mut collect = |batch: Vec<EngineOutput>| {
+            for out in batch {
+                if let Envelope::RequestBatch(batch) = out.outputs {
+                    let timestamp = batch.timestamp;
+                    all.extend(batch.outputs.into_iter().map(|output| (timestamp, output)));
+                }
             }
+        };
+        while !engine.active_requests.is_empty() || !engine.pending_pulls.is_empty() {
+            collect(settle_pulls(engine, rx));
             // settle_pulls emptied pending_pulls, so the batch is non-empty whenever the
             // loop condition held: an empty batch here means a stall.
             let batch = engine.step();
@@ -2031,11 +2084,20 @@ mod tests {
                 !batch.is_empty(),
                 "instant model must make progress each step"
             );
-            for output in batch {
-                all.extend(vllm::request_outputs(&output.outputs).to_vec());
-            }
+            collect(batch);
         }
         all
+    }
+
+    /// Drain steps until the engine is idle, returning the flat output list.
+    fn drain(
+        engine: &mut SimEngine,
+        rx: &mut mpsc::UnboundedReceiver<PullCompletion>,
+    ) -> Vec<EngineCoreOutput> {
+        drain_with_envelope_ts(engine, rx)
+            .into_iter()
+            .map(|(_, output)| output)
+            .collect()
     }
 
     #[test]
@@ -2175,6 +2237,161 @@ mod tests {
         assert_eq!(stats.num_prompt_tokens, 7);
         assert_eq!(stats.num_computed_tokens, 7);
         assert_eq!(stats.num_external_cached_tokens, 0);
+    }
+
+    /// Event types on every output that carries any, in order.
+    fn event_types(outputs: &[EngineCoreOutput]) -> Vec<Vec<EngineCoreEventType>> {
+        outputs
+            .iter()
+            .filter_map(|o| o.events.as_ref())
+            .map(|events| events.iter().map(|e| e.r#type).collect())
+            .collect()
+    }
+
+    /// The first output carrying events, with its envelope's timestamp.
+    fn first_with_events(carried: &[(f64, EngineCoreOutput)]) -> (f64, &[EngineCoreEvent]) {
+        carried
+            .iter()
+            .find_map(|(ts, o)| o.events.as_deref().map(|events| (*ts, events)))
+            .expect("an output carrying events")
+    }
+
+    #[test]
+    fn now_monotonic_is_positive_and_non_decreasing() {
+        let first = now_monotonic();
+        let second = now_monotonic();
+        assert!(first > 0.0, "0.0 reads as an unset timestamp, got {first}");
+        assert!(second >= first, "{second} < {first}");
+    }
+
+    #[test]
+    fn lifecycle_events_ride_the_first_output() {
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 7, 4));
+        let outputs = drain(&mut engine, &mut rx);
+
+        assert!(outputs.len() > 1, "fixture premise: more than one output");
+        assert!(
+            outputs[0].events.is_some(),
+            "the first output carries the events"
+        );
+        assert_eq!(
+            event_types(&outputs),
+            vec![vec![
+                EngineCoreEventType::Queued,
+                EngineCoreEventType::Scheduled
+            ]],
+        );
+    }
+
+    #[test]
+    fn event_timestamps_share_the_envelope_clock() {
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 7, 4));
+        let carried = drain_with_envelope_ts(&mut engine, &mut rx);
+
+        let (envelope_ts, events) = first_with_events(&carried);
+        let (queued, scheduled) = (events[0].timestamp, events[1].timestamp);
+        assert!(
+            0.0 < queued && queued <= scheduled && scheduled <= envelope_ts,
+            "want 0 < queued {queued} <= scheduled {scheduled} <= envelope {envelope_ts}"
+        );
+        assert!(
+            envelope_ts - queued < 60.0,
+            "envelope {envelope_ts} and queued {queued} are on different clocks"
+        );
+    }
+
+    #[test]
+    fn no_emitted_timestamp_is_zero() {
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 7, 4));
+        let carried = drain_with_envelope_ts(&mut engine, &mut rx);
+        assert!(
+            !carried.is_empty(),
+            "fixture premise: something was emitted"
+        );
+
+        for (envelope_ts, output) in &carried {
+            assert!(*envelope_ts > 0.0, "envelope for {}", output.request_id);
+            for event in output.events.iter().flatten() {
+                assert!(event.timestamp > 0.0, "{:?} event", event.r#type);
+            }
+        }
+    }
+
+    #[test]
+    fn the_shared_clock_is_monotonic_not_wall() {
+        // ~2001 in epoch seconds; uptime never gets there.
+        const EPOCH_FLOOR: f64 = 1.0e9;
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 7, 4));
+        let carried = drain_with_envelope_ts(&mut engine, &mut rx);
+
+        let (envelope_ts, events) = first_with_events(&carried);
+        assert!(
+            envelope_ts < EPOCH_FLOOR,
+            "envelope {envelope_ts} is wall time"
+        );
+        for event in events {
+            assert!(
+                event.timestamp < EPOCH_FLOOR,
+                "{:?} {} is wall time",
+                event.r#type,
+                event.timestamp
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_is_the_last_event_so_a_frontend_reads_the_adapter_as_running() {
+        // Frontends replay events in order and keep the last phase: SCHEDULED means running.
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, lora_request("r1", "adapterA", 1));
+        let outputs = drain(&mut engine, &mut rx);
+
+        let events = outputs
+            .iter()
+            .find_map(|o| o.events.as_ref())
+            .expect("the LoRA request's output carries events");
+        assert_eq!(
+            events.last().map(|e| e.r#type),
+            Some(EngineCoreEventType::Scheduled)
+        );
+    }
+
+    #[test]
+    fn a_request_that_waited_is_queued_before_it_is_scheduled() {
+        let mut opt = test_opt();
+        opt.max_num_seqs = 1;
+        let (mut engine, mut rx) = test_engine(opt);
+
+        add(&mut engine, &mut rx, request("first", 7, 2));
+        add(&mut engine, &mut rx, request("second", 7, 2));
+        assert!(
+            engine
+                .waiting
+                .iter()
+                .any(|q| q.request.request_id == "second"),
+            "fixture premise: the second request is queued, not admitted"
+        );
+        let queued_at = engine.waiting[0].queued_at;
+
+        let outputs = drain(&mut engine, &mut rx);
+        let second = outputs
+            .iter()
+            .filter(|o| o.request_id == "second")
+            .find_map(|o| o.events.as_ref())
+            .expect("the queued request's output carries events");
+        assert_eq!(
+            second.iter().map(|e| e.r#type).collect::<Vec<_>>(),
+            vec![EngineCoreEventType::Queued, EngineCoreEventType::Scheduled],
+        );
+        assert_eq!(
+            second[0].timestamp, queued_at,
+            "QUEUED is stamped at arrival"
+        );
+        assert!(second[0].timestamp <= second[1].timestamp);
     }
 
     #[test]
@@ -2922,7 +3139,7 @@ mod tests {
             "same adapter needs no new slot, skips past the blocked one"
         );
         assert!(
-            engine.waiting.iter().any(|r| r.request_id == "b"),
+            engine.waiting.iter().any(|q| q.request.request_id == "b"),
             "adapterB still waits"
         );
     }
@@ -3014,6 +3231,37 @@ mod tests {
         );
         req.sampling_params.as_mut().unwrap().extra_args = Some(extra);
         req
+    }
+
+    #[test]
+    fn a_pending_pull_is_scheduled_once_its_pull_completes() {
+        let mut opt = test_opt();
+        opt.tokens_per_block = 4;
+        let (mut engine, mut rx) = test_engine(opt);
+
+        engine
+            .handle_input(EngineInput::Request(Box::new(remote_prefill_request(
+                "rpull", 8, 5,
+            ))))
+            .expect("handle_input");
+        assert!(
+            engine.pending_pulls.contains_key("rpull"),
+            "fixture premise: the request is waiting on its pull"
+        );
+        let before_pull = now_monotonic();
+
+        let carried = drain_with_envelope_ts(&mut engine, &mut rx);
+        let (_, events) = first_with_events(&carried);
+        assert_eq!(
+            events.iter().map(|e| e.r#type).collect::<Vec<_>>(),
+            vec![EngineCoreEventType::Queued, EngineCoreEventType::Scheduled],
+        );
+        assert!(
+            events[0].timestamp <= before_pull && before_pull <= events[1].timestamp,
+            "QUEUED {} at arrival, SCHEDULED {} after the pull ({before_pull})",
+            events[0].timestamp,
+            events[1].timestamp
+        );
     }
 
     #[test]

@@ -24,7 +24,8 @@ pub use vllm_engine_core_client::EngineId;
 pub use vllm_engine_core_client::protocol::dtype::ModelDtype;
 pub use vllm_engine_core_client::protocol::lora::LoraRequest;
 pub use vllm_engine_core_client::protocol::output::{
-    EngineCoreFinishReason, EngineCoreOutput, decode_engine_core_outputs,
+    EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
+    decode_engine_core_outputs,
 };
 pub use vllm_engine_core_client::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
 pub use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
