@@ -5305,6 +5305,7 @@ dependencies = [
  "flate2",
  "futures",
  "hf-hub",
+ "libc",
  "nixl-sys",
  "rand 0.9.5",
  "rmpv",

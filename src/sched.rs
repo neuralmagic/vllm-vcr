@@ -10,6 +10,12 @@ use std::collections::VecDeque;
 
 use sim_protocol::vllm::EngineCoreRequest;
 
+/// A request in the waiting queue, with the engine-clock time it arrived.
+pub(crate) struct QueuedRequest {
+    pub(crate) request: Box<EngineCoreRequest>,
+    pub(crate) queued_at: f64,
+}
+
 /// Strategy for picking the next waiting request to admit into the running batch.
 pub(crate) trait Scheduler: Send {
     /// Return the index of the next waiting request to admit. Only requests for which
@@ -17,7 +23,7 @@ pub(crate) trait Scheduler: Send {
     /// qualifies.
     fn next_admissible(
         &self,
-        waiting: &VecDeque<Box<EngineCoreRequest>>,
+        waiting: &VecDeque<QueuedRequest>,
         admissible: &dyn Fn(&EngineCoreRequest) -> bool,
     ) -> Option<usize>;
 }
@@ -28,10 +34,10 @@ pub(crate) struct Fcfs;
 impl Scheduler for Fcfs {
     fn next_admissible(
         &self,
-        waiting: &VecDeque<Box<EngineCoreRequest>>,
+        waiting: &VecDeque<QueuedRequest>,
         admissible: &dyn Fn(&EngineCoreRequest) -> bool,
     ) -> Option<usize> {
-        waiting.iter().position(|r| admissible(r))
+        waiting.iter().position(|q| admissible(&q.request))
     }
 }
 
@@ -41,12 +47,13 @@ pub(crate) struct Priority;
 impl Scheduler for Priority {
     fn next_admissible(
         &self,
-        waiting: &VecDeque<Box<EngineCoreRequest>>,
+        waiting: &VecDeque<QueuedRequest>,
         admissible: &dyn Fn(&EngineCoreRequest) -> bool,
     ) -> Option<usize> {
         waiting
             .iter()
             .enumerate()
+            .map(|(i, q)| (i, &q.request))
             .filter(|(_, r)| admissible(r))
             .min_by(|(_, a), (_, b)| {
                 a.priority.cmp(&b.priority).then_with(|| {
@@ -68,12 +75,13 @@ pub(crate) struct ShortestPromptFirst;
 impl Scheduler for ShortestPromptFirst {
     fn next_admissible(
         &self,
-        waiting: &VecDeque<Box<EngineCoreRequest>>,
+        waiting: &VecDeque<QueuedRequest>,
         admissible: &dyn Fn(&EngineCoreRequest) -> bool,
     ) -> Option<usize> {
         waiting
             .iter()
             .enumerate()
+            .map(|(i, q)| (i, &q.request))
             .filter(|(_, r)| admissible(r))
             .min_by(|(i_a, a), (i_b, b)| {
                 let len_a = a.prompt_token_ids.as_ref().map(Vec::len).unwrap_or(0);
@@ -90,9 +98,9 @@ mod tests {
 
     use sim_protocol::vllm::{EngineCoreRequest, EngineCoreSamplingParams};
 
-    use crate::sched::{Fcfs, Priority, Scheduler};
+    use crate::sched::{Fcfs, Priority, QueuedRequest, Scheduler};
 
-    fn req(id: &str, priority: i32) -> Box<EngineCoreRequest> {
+    fn req(id: &str, priority: i32) -> QueuedRequest {
         let mut r = EngineCoreRequest {
             request_id: id.to_string(),
             prompt_token_ids: Some(vec![0; 4]),
@@ -104,7 +112,10 @@ mod tests {
             ..Default::default()
         };
         r.arrival_time = priority as f64;
-        Box::new(r)
+        QueuedRequest {
+            request: Box::new(r),
+            queued_at: 1.0,
+        }
     }
 
     #[test]
@@ -158,8 +169,8 @@ mod tests {
         assert_eq!(Priority.next_admissible(&q, &|_| true), None);
     }
 
-    fn req_with_prompt(id: &str, prompt_len: usize) -> Box<EngineCoreRequest> {
-        Box::new(EngineCoreRequest {
+    fn req_with_prompt(id: &str, prompt_len: usize) -> QueuedRequest {
+        let request = Box::new(EngineCoreRequest {
             request_id: id.to_string(),
             prompt_token_ids: Some(vec![0; prompt_len]),
             sampling_params: Some(EngineCoreSamplingParams {
@@ -167,7 +178,11 @@ mod tests {
                 ..EngineCoreSamplingParams::for_test()
             }),
             ..Default::default()
-        })
+        });
+        QueuedRequest {
+            request,
+            queued_at: 1.0,
+        }
     }
 
     #[test]
