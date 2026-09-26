@@ -73,3 +73,29 @@ config_hash = "207648aeb128254e4e0c6d177c428abccd40a306478c04b0b8519a61b9c4ce8e"
 workload = "multiturn-nocache-s7"
 role = "fidelity"
 # END 0.27 GOLDENS
+
+# BEGIN NIGHTLY GOLDENS
+[[golden]]
+line = "nightly"
+bucket_path = "conformance/nightly/H200/Qwen/Qwen3-8B/multiturn-s7.jsonl.gz"
+sha256 = "a468a8cdb2ddfbccc2b362beccd7161b88c64af3d752a0ef7e9e25697f2f4f98"
+config_hash = "d962e0c06ca78d83f3376ac41601c2afcdf28a93683c6f7a08d2fdffeacea638"
+workload = "multiturn-s7"
+role = "fidelity"
+
+[[golden]]
+line = "nightly"
+bucket_path = "conformance/nightly/H200/Qwen/Qwen3-8B/multiturn-s13.jsonl.gz"
+sha256 = "eaa0ce041edd8943298a328d03d119a7e4724966c1618ae75f2d6833ae8fc1b1"
+config_hash = "d962e0c06ca78d83f3376ac41601c2afcdf28a93683c6f7a08d2fdffeacea638"
+workload = "multiturn-s13"
+role = "fidelity"
+
+[[golden]]
+line = "nightly"
+bucket_path = "conformance/nightly/H200/Qwen/Qwen3-8B/multiturn-nocache-s7.jsonl.gz"
+sha256 = "c34ab0b66493035aefcdbcdc688f3395b252bc1cbddb700195484494f956719c"
+config_hash = "7d62d01c586a495b0c4bcec851a6342d6c4be4098a14e33bb26bce29c5bbe1a1"
+workload = "multiturn-nocache-s7"
+role = "fidelity"
+# END NIGHTLY GOLDENS
