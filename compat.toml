@@ -44,7 +44,7 @@
 # See .github/workflows/nightly-canary.yml.
 line = "nightly"
 tag = "nightly"
-protocol_rev = "1668e5976db7457631b84a6a570c64319581b1e7"
+protocol_rev = "92044241a02f05de51420d654daf669de20b4691"
 
 [[vllm]]
 # Latest upstream release candidate, ahead of the newest stable. Tracked by the
