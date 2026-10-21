@@ -54,7 +54,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           target: x86_64-unknown-linux-musl
 
@@ -109,7 +109,7 @@ jobs:
 
       - name: Configure AWS credentials (nightly golden fetch)
         if: ${{ steps.nightly-goldens.outputs.has_goldens == 'true' }}
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::783952637884:role/llm-d-conformance-ci
           aws-region: us-east-1
@@ -155,7 +155,7 @@ jobs:
       - name: Mint App token for the bump PR
         id: app-token
         if: ${{ env.CANARY_APP_ID != '' && (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * 1') }}
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.CANARY_APP_ID }}
           private-key: ${{ secrets.CANARY_APP_PRIVATE_KEY }}
