@@ -80,7 +80,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
 
       - uses: ./.github/actions/setup-sccache
         with:
@@ -142,7 +142,7 @@ jobs:
       - name: Mint App token for the bump PR
         id: app-token
         if: ${{ steps.watch.outputs.changed == 'true' && env.CANARY_APP_ID != '' }}
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.CANARY_APP_ID }}
           private-key: ${{ secrets.CANARY_APP_PRIVATE_KEY }}
