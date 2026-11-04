@@ -146,7 +146,7 @@ async fn calibrate_e2e_smoke() {
             };
 
             let call_start = std::time::Instant::now();
-            let mut stream = client.call(request).await.expect("call failed");
+            let mut stream = sim_protocol::vllm::output_stream(client.call(request).await.expect("call failed"));
 
             let mut got_first = false;
             while let Some(item) = stream.next().await {

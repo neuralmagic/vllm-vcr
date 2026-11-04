@@ -44,7 +44,7 @@
 # See .github/workflows/nightly-canary.yml.
 line = "nightly"
 tag = "nightly"
-protocol_rev = "92044241a02f05de51420d654daf669de20b4691"
+protocol_rev = "ef9339e64d458b10ab49b2c9af35645eff6388fd"
 
 [[vllm]]
 # Latest upstream release candidate, ahead of the newest stable. Tracked by the
@@ -52,37 +52,34 @@ protocol_rev = "92044241a02f05de51420d654daf669de20b4691"
 # to the highest `vX.Y.ZrcN` tag newer than the default line. RCs never get
 # goldens.
 line = "rc"
-tag = "v0.31.1rc0"
-protocol_rev = "e37e51dd246cf421c554e7d6f53e178e3fd29085"
+tag = "v0.32.1rc0"
+protocol_rev = "2365177ddda7714502e4df7a1669cc79c0a4dfd0"
 
 [[vllm]]
-# N (head). 0.29 grew the handshake again: `EngineCoreReadyResponse` requires
-# `supports_lora` and `max_loras` (the frontend rejects an engine where
-# `supports_lora != (max_loras > 0)`), and the client-side
-# `decode_engine_core_outputs` now takes `&[Bytes]` instead of any `AsRef<[u8]>`.
-# The sim's map-encoded `SimReadyResponse` superset emits the new keys on every
-# line, and the tap already holds `Bytes` frames, so neither needed a cfg.
-line = "0.29"
-tag = "v0.29.0"
-protocol_rev = "98dff2a81d747d1dba01a47f939f48c3526d4206"
+# N (head). 0.33 dropped the positional `LoraRequest.tensorizer_config_dict`
+# slot (`vllm_lora_tensorizer` is on below 0.33), added `EngineCoreOutput.error`,
+# typed `routed_experts`, and renamed the structured-outputs params; the last
+# three are unused by the sim or covered by `..Default::default()`. The v0.33.0
+# tag peels to the rc3 commit.
+line = "0.33"
+tag = "v0.33.0"
+protocol_rev = "4ba787ec9959e566d3b587a796dff07673324da5"
 default = true
 
 [[vllm]]
-# N-1. `EngineId::from_engine_index` narrowed to u16 here (the
-# `vllm_engine_id_u16` cfg, on from this line up). Everything else 0.28 added
-# is a trailing `#[serde(default)]` field (`EngineCoreRequest.session_id`, the
-# `mm_cache_miss_hashes`/`new_sampling_mask` output slots, three optional ready
-# response keys), which the tuple decoders tolerate in both directions.
-line = "0.28"
-tag = "v0.28.0"
-protocol_rev = "2cf0a6915ce544dc493a0990f2ea38d81601128a"
+# N-1. 0.32 boxed the sparse `EngineCoreOutput` fields (`prefill_stats`,
+# `kv_transfer_params`, ...; the sim assigns through `.into()`, so no cfg),
+# added `RequestBatchOutputs.weight_version` (`vllm_weight_version`), made the
+# client stream yield `EngineCoreStreamDelivery` batches (`vllm_stream_delivery`),
+# and pinned zmq.rs by git rev (unified across lines by the root `[patch.crates-io]`).
+line = "0.32"
+tag = "v0.32.0"
+protocol_rev = "5df63a7203cdb9328d824a27b682e77c7b9928be"
 
 [[vllm]]
-# N-2. The oldest line: `EngineId::from_engine_index` still takes u32, so this
-# is what keeps the `not(vllm_engine_id_u16)` branch honest. 0.27 frontends
-# require the parallel-config sizes, the scheduler caps, `instance_id`, and an
-# optional `kv_events_config` in the ready response (all emitted by the
-# `SimReadyResponse` superset).
-line = "0.27"
-tag = "v0.27.1"
-protocol_rev = "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
+# N-2. The oldest line: keeps the `not(vllm_weight_version)` and
+# `not(vllm_stream_delivery)` branches honest. Added the `kv_hints` and
+# `sampling_mask` protocol modules, which the sim does not use.
+line = "0.31"
+tag = "v0.31.0"
+protocol_rev = "db9527a46873454610df6dbedf79a36d6bf1a7f6"

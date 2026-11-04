@@ -1614,7 +1614,7 @@ impl SimEngine {
                 let mut output =
                     request_output(request.request_id.clone(), emit.tokens, finish_reason);
                 if is_first {
-                    output.prefill_stats = Some(request.prefill_stats());
+                    output.prefill_stats = Some(request.prefill_stats().into());
                 }
                 if !request.pending_events.is_empty() {
                     output.events = Some(std::mem::take(&mut request.pending_events));
@@ -1687,7 +1687,7 @@ impl SimEngine {
                             .find(|o| o.request_id == request_id && o.finish_reason.is_some())
                     {
                         out.kv_transfer_params =
-                            Some(build_prefill_kv_params(&remote, &request_id, num_tokens));
+                            Some(build_prefill_kv_params(&remote, &request_id, num_tokens).into());
                     }
                 }
                 Err(error) => warn!(request_id, %error, "prefill KV advertise failed"),
@@ -1950,15 +1950,7 @@ mod tests {
 
     /// Build a value for `EngineCoreRequest.lora_request`.
     fn lora_field(name: &str, id: u64) -> LoraRequest {
-        LoraRequest {
-            lora_name: name.to_string(),
-            lora_int_id: id,
-            lora_path: format!("/loras/{name}"),
-            base_model_name: None,
-            tensorizer_config_dict: None,
-            load_inplace: false,
-            is_3d_lora_weight: false,
-        }
+        sim_protocol::vllm::lora_request(name, id, &format!("/loras/{name}"))
     }
 
     fn test_opt() -> Opt {

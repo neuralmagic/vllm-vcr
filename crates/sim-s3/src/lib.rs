@@ -208,10 +208,10 @@ fn parse_hf_uri(uri: &str) -> Result<(String, String)> {
     // URL parsing puts the first path segment in the host (`hf://org/repo/file` →
     // host=org, path=/repo/file). Reassemble org/repo/.../file before splitting.
     let mut segments: Vec<&str> = Vec::new();
-    if let Some(host) = url.host_str() {
-        if !host.is_empty() {
-            segments.push(host);
-        }
+    if let Some(host) = url.host_str()
+        && !host.is_empty()
+    {
+        segments.push(host);
     }
     let path = url.path().trim_start_matches('/');
     if !path.is_empty() {

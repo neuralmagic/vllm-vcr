@@ -20,20 +20,7 @@ version = 2
 # (excluding dev/build deps). Add an id to `ignore` with a justification only
 # when a vuln fix isn't yet available.
 unmaintained = "workspace"
-ignore = [
-    # rustls-webpki 0.101.7 cert-validation/CRL bugs. Reached only through the AWS
-    # SDK's legacy hyper-0.14 connector (aws-smithy-http-client `legacy-rustls-ring`);
-    # our S3 client uses the rustls-aws-lc path (rustls 0.23 / webpki 0.103), so this
-    # code is compiled but never on our TLS path. Clears when aws-smithy-http-client
-    # drops the legacy connector (or we prune the AWS feature graph). TODO: revisit.
-    { id = "RUSTSEC-2026-0098", reason = "AWS SDK legacy rustls-0.21 connector, not our TLS path" },
-    { id = "RUSTSEC-2026-0099", reason = "AWS SDK legacy rustls-0.21 connector, not our TLS path" },
-    { id = "RUSTSEC-2026-0104", reason = "AWS SDK legacy rustls-0.21 connector, not our TLS path" },
-    # h2 0.3 (hyper 0.14) unbounded empty DATA frames; only 0.4.16+ is patched and
-    # 0.3 is reached solely through the same legacy AWS connector. Our own HTTP
-    # servers and clients are on hyper 1 / h2 0.4.
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via AWS SDK legacy hyper-0.14 connector; h2 0.4 is patched" },
-]
+ignore = []
 
 [licenses]
 version = 2
@@ -79,4 +66,5 @@ allow-git = [
     "https://github.com/vllm-project/vllm.git",
     "https://github.com/wseaton/vllm.git",
     "https://github.com/ai-dynamo/nixl.git",
+    "https://github.com/zeromq/zmq.rs",
 ]

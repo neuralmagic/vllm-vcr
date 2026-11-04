@@ -18,9 +18,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::json;
-use sim_protocol::vllm::{
-    EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams, LoraRequest,
-};
+use sim_protocol::vllm::{EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams};
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 use vllm_vcr::{Opt, run};
@@ -106,7 +104,7 @@ async fn token_stream_round_trip() {
     let (client, _guard) = harness("token_stream_round_trip", &[]).await;
 
     let req = make_request("rt-1", 8, 5);
-    let stream = client.call(req).await.expect("call failed");
+    let stream = sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
 
     let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
         .await
@@ -175,7 +173,7 @@ async fn replay_tokens_serves_recorded_stream() {
 
     // replay-0 = the arrival_ms 0.0 record (file order is finish order).
     let req = make_request("replay-0", 8, recorded_early.len() as u32);
-    let stream = client.call(req).await.expect("call failed");
+    let stream = sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
     let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
         .await
         .expect("stream collect timed out");
@@ -191,7 +189,7 @@ async fn replay_tokens_serves_recorded_stream() {
     );
 
     let req = make_request("replay-1", 8, recorded_late.len() as u32);
-    let stream = client.call(req).await.expect("call failed");
+    let stream = sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
     let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
         .await
         .expect("stream collect timed out");
@@ -203,7 +201,7 @@ async fn replay_tokens_serves_recorded_stream() {
 
     // An unmatched request still streams (random fallback).
     let req = make_request("adhoc", 8, 2);
-    let stream = client.call(req).await.expect("call failed");
+    let stream = sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
     let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
         .await
         .expect("stream collect timed out");
@@ -225,7 +223,8 @@ async fn abort_terminates_stream() {
     .await;
 
     let req = make_request("abort-1", 4, 10000);
-    let mut stream = client.call(req).await.expect("call failed");
+    let mut stream =
+        sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
 
     // Take the first output to prove it started generating.
     let first = tokio::time::timeout(TIMEOUT, stream.next())
@@ -267,7 +266,8 @@ async fn graceful_shutdown_drains_in_flight() {
     .await;
 
     let req = make_request("drain-1", 4, 10);
-    let mut stream = client.call(req).await.expect("call failed");
+    let mut stream =
+        sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
 
     // Wait for the first output so the request is in flight, then request shutdown.
     let first = tokio::time::timeout(TIMEOUT, stream.next())
@@ -280,7 +280,8 @@ async fn graceful_shutdown_drains_in_flight() {
 
     // A request arriving during the drain is rejected with an immediate Abort.
     let late = make_request("late-1", 4, 5);
-    let late_stream = client.call(late).await.expect("late call failed");
+    let late_stream =
+        sim_protocol::vllm::output_stream(client.call(late).await.expect("late call failed"));
     let late_outputs: Vec<_> = tokio::time::timeout(TIMEOUT, late_stream.collect::<Vec<_>>())
         .await
         .expect("late stream timed out");
@@ -323,7 +324,8 @@ async fn shutdown_default_aborts_in_flight() {
     .await;
 
     let req = make_request("abort-on-shutdown-1", 4, 10000);
-    let mut stream = client.call(req).await.expect("call failed");
+    let mut stream =
+        sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
 
     let first = tokio::time::timeout(TIMEOUT, stream.next())
         .await
@@ -358,7 +360,7 @@ async fn reset_prefix_cache_busy_vs_idle() {
     // Submit a request that will park in prefill for 10 seconds (never emits a token
     // during this test).
     let req = make_request("rpc-1", 4, 5);
-    let _stream = client.call(req).await.expect("call failed");
+    let _stream = sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
 
     // Give the engine a moment to admit the request into the batch.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -397,15 +399,7 @@ async fn reset_prefix_cache_busy_vs_idle() {
 async fn lora_load_unload_lifecycle() {
     let (client, _guard) = harness("lora_load_unload_lifecycle", &[]).await;
 
-    let lora = LoraRequest {
-        lora_name: "test-adapter".to_string(),
-        lora_int_id: 42,
-        lora_path: "/fake/path".to_string(),
-        base_model_name: None,
-        tensorizer_config_dict: None,
-        load_inplace: false,
-        is_3d_lora_weight: false,
-    };
+    let lora = sim_protocol::vllm::lora_request("test-adapter", 42, "/fake/path");
 
     // add_lora -> true
     let added = tokio::time::timeout(TIMEOUT, client.add_lora(&lora))
@@ -453,7 +447,8 @@ async fn pd_handoff_advertise_then_pull() {
     );
     req_a.sampling_params.as_mut().unwrap().extra_args = Some(extra_a);
 
-    let stream_a = client.call(req_a).await.expect("call A failed");
+    let stream_a =
+        sim_protocol::vllm::output_stream(client.call(req_a).await.expect("call A failed"));
     let outputs_a: Vec<_> = tokio::time::timeout(TIMEOUT, stream_a.collect::<Vec<_>>())
         .await
         .expect("stream A timed out");
@@ -525,7 +520,8 @@ async fn pd_handoff_advertise_then_pull() {
     );
     req_b.sampling_params.as_mut().unwrap().extra_args = Some(extra_b);
 
-    let stream_b = client.call(req_b).await.expect("call B failed");
+    let stream_b =
+        sim_protocol::vllm::output_stream(client.call(req_b).await.expect("call B failed"));
     let outputs_b: Vec<_> = tokio::time::timeout(TIMEOUT, stream_b.collect::<Vec<_>>())
         .await
         .expect("stream B timed out");

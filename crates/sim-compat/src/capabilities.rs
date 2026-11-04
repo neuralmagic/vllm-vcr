@@ -17,7 +17,11 @@ use crate::{CompatManifest, minor_line};
 
 /// Every capability cfg this workspace can emit, declared to Rust's check-cfg so
 /// a typo in a `#[cfg(...)]` warns instead of silently compiling the other arm.
-const ALL: &[&str] = &["vllm_engine_id_u16"];
+const ALL: &[&str] = &[
+    "vllm_lora_tensorizer",
+    "vllm_stream_delivery",
+    "vllm_weight_version",
+];
 
 /// Resolve the vLLM tag this build targets.
 ///
@@ -49,11 +53,24 @@ pub fn emit(tag: &str) {
         println!("cargo::rustc-check-cfg=cfg({name})");
     }
 
-    // `vllm_engine_id_u16`: `EngineId::from_engine_index` narrowed its parameter
-    // from u32 to u16 on vLLM main (the wire encoding was always two-byte
-    // little-endian). Gates `sim_protocol::vllm::engine_id_from_index`.
-    if line_at_least(tag, 0, 28) {
-        println!("cargo::rustc-cfg=vllm_engine_id_u16");
+    // `vllm_weight_version`: 0.32 added `RequestBatchOutputs.weight_version`, the
+    // label set by the `set_weight_version` utility. Gates
+    // `sim_protocol::vllm::request_batch`.
+    if line_at_least(tag, 0, 32) {
+        println!("cargo::rustc-cfg=vllm_weight_version");
+    }
+
+    // `vllm_stream_delivery`: 0.32's `EngineCoreOutputStream` yields
+    // `EngineCoreStreamDelivery` batches instead of single outputs. Gates
+    // `sim_protocol::vllm::output_stream`.
+    if line_at_least(tag, 0, 32) {
+        println!("cargo::rustc-cfg=vllm_stream_delivery");
+    }
+
+    // `vllm_lora_tensorizer`: `LoraRequest.tensorizer_config_dict`, a positional
+    // slot 0.33 removed. Gates `sim_protocol::vllm::lora_request`.
+    if !line_at_least(tag, 0, 33) {
+        println!("cargo::rustc-cfg=vllm_lora_tensorizer");
     }
 }
 

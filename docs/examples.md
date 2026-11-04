@@ -8,7 +8,7 @@ Running the simulator on a Mac for testing and development. No GPU or model weig
 
 ### Prerequisites
 
-- Rust 1.85 or newer
+- Rust 1.94.1 or newer
 - A vLLM checkout with the Rust frontend built
 
 ### 1. Build the simulator

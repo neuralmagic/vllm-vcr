@@ -1170,7 +1170,7 @@ async fn measure_one(
     let rid = request.request_id.clone();
     let call_start = Instant::now();
     let mut stream = match client.call(request).await {
-        Ok(s) => s,
+        Ok(s) => sim_protocol::vllm::output_stream(s),
         Err(e) => {
             tracing::warn!("{rid}: call failed: {e:#}");
             return (None, Vec::new(), Vec::new());
