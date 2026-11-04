@@ -49,28 +49,28 @@ release.
 [[vllm]]
 line = "nightly"              # tracks vLLM main for drift detection
 tag  = "nightly"
-protocol_rev = "62a86318..."
+protocol_rev = "ef9339e6..."
 
 [[vllm]]
 line = "rc"                   # tracks the newest release candidate
-tag  = "v0.28.0rc2"           # bumped (tag + rev) by the release watcher
-protocol_rev = "74a6576b..."
+tag  = "v0.32.1rc0"           # bumped (tag + rev) by the release watcher
+protocol_rev = "2365177d..."
 
 [[vllm]]
-line = "0.29"                 # current default line
-tag  = "v0.29.0"              # vLLM release tag; also the e2e frontend version
-protocol_rev = "98dff2a8..."  # rev for vllm-engine-core-client at this line
+line = "0.33"                 # current default line
+tag  = "v0.33.0"              # vLLM release tag; also the e2e frontend version
+protocol_rev = "4ba787ec..."  # rev for vllm-engine-core-client at this line
 default = true                # what :latest / unsuffixed builds point at
 
 [[vllm]]
-line = "0.28"                 # N-1 supported release line
-tag  = "v0.28.0"
-protocol_rev = "2cf0a691..."
+line = "0.32"                 # N-1 supported release line
+tag  = "v0.32.0"
+protocol_rev = "5df63a72..."
 
 [[vllm]]
-line = "0.27"                 # N-2 supported release line
-tag  = "v0.27.1"
-protocol_rev = "6e448d0e..."
+line = "0.31"                 # N-2 supported release line
+tag  = "v0.31.0"
+protocol_rev = "db9527a4..."
 ```
 
 Rules:
@@ -93,14 +93,14 @@ Conflating them is the classic mistake.
 
 Image tags:
 
-- `vllm-vcr:0.2.3-vllm0.29` — immutable, the real artifact (sim version ×
+- `vllm-vcr:0.2.3-vllm0.33` — immutable, the real artifact (sim version ×
   vLLM line).
 - `vllm-vcr:0.2.3` — immutable, the same artifact for the `default = true` line
   at release time. One tag that pins both axes, for consumers that want "this
   sim on the newest vLLM line" without naming the line: a plain version bump of
   this tag advances both. A new vLLM line without a sim release produces no new
   unsuffixed tag, so adding a line is followed by a patch release.
-- `vllm-vcr:vllm0.29` — floating, latest sim for that line.
+- `vllm-vcr:vllm0.33` — floating, latest sim for that line.
 - `vllm-vcr:latest` — sim-head × the `default = true` line.
 
 ## CI matrix mechanics

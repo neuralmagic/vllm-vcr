@@ -46,8 +46,8 @@ block first, so it's idempotent. After the rewrite the rev no longer matches
 older-line build must too:
 
 ```sh
-cargo xtask pin-vllm 0.27
-VLLM_TARGET_VERSION=v0.27.1 cargo build --workspace   # no --locked
+cargo xtask pin-vllm 0.31
+VLLM_TARGET_VERSION=v0.31.0 cargo build --workspace   # no --locked
 ```
 
 ## Capability cfgs
@@ -57,16 +57,24 @@ field whose *type* differs per line), the engine gates on a discrete capability,
 not a version number. `build.rs` maps the target line to cfgs and declares them
 with `cargo::rustc-check-cfg`:
 
-- `vllm_engine_id_u16` — `EngineId::from_engine_index` narrowed its parameter
-  from u32 to u16 in 0.28 (the wire encoding was always two-byte
-  little-endian). Gates `sim_protocol::vllm::engine_id_from_index`. On 0.28+.
+- `vllm_weight_version` — 0.32 added `RequestBatchOutputs.weight_version`.
+  Gates `sim_protocol::vllm::request_batch`. On 0.32+.
+- `vllm_stream_delivery` — 0.32's `EngineCoreOutputStream` yields
+  `EngineCoreStreamDelivery` batches instead of single outputs. Gates
+  `sim_protocol::vllm::output_stream`, which flattens them back to one item per
+  output. On 0.32+.
+- `vllm_lora_tensorizer` — `LoraRequest.tensorizer_config_dict`, a positional
+  slot 0.33 removed. Gates `sim_protocol::vllm::lora_request`. On lines below
+  0.33.
 
 Retired cfgs: `vllm_outputs_enum` (the 0.25 protocol restructure: types moved
 into `protocol::{request, output, sampling}` and `EngineCoreOutputs` became the
 classified enum over a private flat struct) went when 0.24 left the window, and
 `vllm_cache_creation_tokens` (`PrefillStats.num_cache_creation_tokens`, added
-in 0.26) went when 0.25 did. Every supported line shares both, so the outputs
-shim is unconditional and the field is assigned directly.
+in 0.26) went when 0.25 did, and `vllm_engine_id_u16`
+(`EngineId::from_engine_index` narrowed to u16 in 0.28) went when 0.27 did.
+Every supported line shares all three, so the outputs shim is unconditional,
+the field is assigned directly, and `engine_id_from_index` passes the u16 through.
 
 The capability list itself lives in `sim_compat::capabilities`, not in a build
 script: cfgs from `build.rs` only reach the crate that owns it, so both the root
@@ -90,11 +98,16 @@ deserialize the same wire on every line (serde ignores unknown fields).
 | Lora request | wire form is a positional array whose trailing fields differ per line | `LoraSpec{lora_int_id,lora_name}` (own, reads positions 0/1) for the add_lora call + registry |
 | Protocol type paths | none since 0.24 rolled off; every line uses `protocol::{request,output,sampling}` | `sim-protocol::vllm` re-exports the whole surface; every crate imports from there, never from `vllm_engine_core_client::protocol` directly, so the next path move lands in one file |
 | Output envelope | the classified enum serializes through a private flat struct, so it cannot be built inline | `sim-protocol::vllm::Envelope` alias + `request_batch()`/`utility()` constructors and `request_outputs()`/`scheduler_stats()`/`utility_output()` accessors |
-| Engine identity | `EngineId::from_engine_index` takes u32 (0.27) vs u16 (0.28+) | `sim-protocol::vllm::engine_id_from_index(u32)`, `vllm_engine_id_u16`-gated; validates the two-byte wire range on every line |
+| Engine identity | `EngineId::from_engine_index` takes u16; the CLI counts engines in u32 | `sim-protocol::vllm::engine_id_from_index(u32)` validates the two-byte wire range |
+| Request-batch envelope | `RequestBatchOutputs.weight_version` exists on 0.32+ only | `request_batch()` sets it to `None` behind `vllm_weight_version` |
+| Client output stream | `EngineCoreOutputStream` yields one output per item (<=0.31) vs `EngineCoreStreamDelivery` batches (0.32+) | `sim-protocol::vllm::output_stream()`, `vllm_stream_delivery`-gated; every `EngineCoreClient::call` site goes through it |
+| Boxed output fields | 0.32 boxed `prefill_stats`, `kv_transfer_params`, and the other sparse `EngineCoreOutput` fields | the engine assigns `Some(value.into())`, which builds `T` or `Box<T>`; serde encodes both the same, no cfg |
+| zeromq source | 0.32+ pins zmq.rs by git rev; older lines use crates.io 0.6.0 | root `[patch.crates-io]` points `zeromq` at the same git rev, so one `zeromq` (and one `PeerIdentity`) exists on every line |
+| Multimodal modality | `MmFeatureSpec.modality` is the typed `MmModality` on every line | re-exported from `sim-protocol::vllm` |
 | Ready response (decode) | `EngineCoreReadyResponse.vllm_version` absent before 0.23 | tap decodes its own tolerant `CapturedReadyInfo{vllm_version:Option<String>}` |
 | Ready response (emit) | 0.27 frontends require the parallel-config sizes, scheduler caps, `instance_id`, and `kv_events_config`; 0.29 frontends require `supports_lora` and `max_loras` (and reject `supports_lora != (max_loras > 0)`) | sim-owned map-encoded `SimReadyResponse` superset: every field any line requires is always emitted, older frontends skip unknown keys, no cfg |
 | Output decode | `decode_engine_core_outputs` takes any `AsRef<[u8]>` (<=0.28) vs `&[Bytes]` (0.29+) | the tap passes the `Bytes` frames zeromq already hands it, which satisfy both signatures, no cfg |
-| Lora request | `LoraRequest::new` returned `Self` (<=0.28), `Result` (0.29), and is gone on main | tests build the struct literal; the fields are stable across the window |
+| Lora request | the positional `tensorizer_config_dict` slot exists below 0.33 only | `sim-protocol::vllm::lora_request()` builds it, `vllm_lora_tensorizer`-gated; the engine side reads positions 0/1 through `LoraSpec` and is unaffected |
 | Utility request | `EngineCoreUtilityRequest` derives `Deserialize` only on 0.23+ (crate was client-only) | `engine_core::UtilityRequestSpec` (`Deserialize_tuple`, matches the wire tuple) |
 
 The wire types still come from the crate (the matrix's whole point: catch drift at
@@ -135,23 +148,21 @@ upstream, so the repo has no external-fork dependency.
   all capability cfgs are on. It exists to catch wire drift before a release lands: the
   live-HEAD nightly canary pins to upstream `main`, builds, runs unit tests, runs the
   HEAD-client protocol e2e suite, and runs the conformance runner.
-- **rc** (`v0.28.0rc2`): the newest release candidate ahead of the stable window,
+- **rc** (`v0.32.1rc0`): the newest release candidate ahead of the stable window,
   bumped (tag + rev) by the release watcher. Never `default`, never fidelity-validated.
-- **0.29** (`v0.29.0`, default): builds against upstream `98dff2a8`. Grew the
-  handshake again: `supports_lora` and `max_loras` are required (absorbed by the
-  `SimReadyResponse` superset), `decode_engine_core_outputs` takes `&[Bytes]`,
-  and `LoraRequest::new` became fallible.
-- **0.28** (`v0.28.0`): builds against upstream `2cf0a691`. Narrowed
-  `EngineId::from_engine_index` to u16 (`vllm_engine_id_u16`); everything else
-  it added is a trailing `#[serde(default)]` field.
-- **0.27** (`v0.27.1`): builds against upstream `6e448d0e`. The oldest line and
-  the only one without `vllm_engine_id_u16`, so it is what keeps that branch
-  honest.
+- **0.33** (`v0.33.0`, default): builds against upstream `4ba787ec` (the tag
+  peels to the rc3 commit). Dropped the positional
+  `LoraRequest.tensorizer_config_dict` slot (`vllm_lora_tensorizer` is on below
+  0.33) and added `EngineCoreOutput.error`.
+- **0.32** (`v0.32.0`): builds against upstream `5df63a72`. Boxed the sparse
+  `EngineCoreOutput` fields, added `RequestBatchOutputs.weight_version`
+  (`vllm_weight_version`), switched the client stream to batched deliveries
+  (`vllm_stream_delivery`), and moved zmq.rs to a git rev.
+- **0.31** (`v0.31.0`): builds against upstream `db9527a4`. The oldest line and
+  the only stable one without the 0.32 cfgs, so it keeps those branches honest.
 
-0.27 hard-gates CI: it has its three goldens (two prefix-cached multiturn seeds
-plus one nocache multiturn, Qwen3-8B on H200), captured against that line's
-released engine image and replaying byte-identically. 0.28 and 0.29 entered the
-window without goldens and run non-gating until the Golden Capture workflow
+No stable line has goldens yet: 0.27's were the last, and they left the window
+with it. 0.31, 0.32, and 0.33 run non-gating until the Golden Capture workflow
 registers theirs. See `conformance.md`.
 
 ### Fork patches

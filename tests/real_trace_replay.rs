@@ -73,7 +73,8 @@ async fn replays_real_trace_byte_identical() {
             }),
             ..Default::default()
         };
-        let stream = client.call(req).await.expect("call failed");
+        let stream =
+            sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("stream timed out");

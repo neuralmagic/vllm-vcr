@@ -703,7 +703,9 @@ async fn calibrate_e2e_impl(
                     ..Default::default()
                 };
 
-                let stream = client.call(request).await.context("call failed")?;
+                let stream = sim_protocol::vllm::output_stream(
+                    client.call(request).await.context("call failed")?,
+                );
                 let cb = concurrency_bucket(rec.concurrency);
                 handles.push((cb, stream, Instant::now()));
             }

@@ -105,7 +105,7 @@ async fn replay_simple_trace() -> Result<()> {
     for (i, record) in records.iter().enumerate() {
         let req = make_replay_request(i, record.prompt_tokens, record.output_tokens as u32);
 
-        let stream = client.call(req).await?;
+        let stream = sim_protocol::vllm::output_stream(client.call(req).await?);
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("stream collect timed out");
@@ -161,7 +161,7 @@ async fn replay_batch_context_trace() -> Result<()> {
     for (i, record) in records.iter().enumerate() {
         let req = make_replay_request(i, record.prompt_tokens, record.output_tokens as u32);
 
-        let stream = client.call(req).await?;
+        let stream = sim_protocol::vllm::output_stream(client.call(req).await?);
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("stream collect timed out");
@@ -224,7 +224,7 @@ async fn replay_speculative_trace() -> Result<()> {
     for (i, record) in records.iter().enumerate() {
         let req = make_replay_request(i, record.prompt_tokens, record.output_tokens as u32);
 
-        let stream = client.call(req).await?;
+        let stream = sim_protocol::vllm::output_stream(client.call(req).await?);
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("stream collect timed out");
@@ -288,7 +288,7 @@ async fn replay_edge_cases_trace() -> Result<()> {
     for (i, record) in records.iter().enumerate() {
         let req = make_replay_request(i, record.prompt_tokens, record.output_tokens as u32);
 
-        let stream = client.call(req).await?;
+        let stream = sim_protocol::vllm::output_stream(client.call(req).await?);
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("stream collect timed out");

@@ -23,14 +23,14 @@ impl SimGuard {
     /// Check whether the simulator task exited early (error or panic).
     /// Call this after connect succeeds but before issuing requests.
     pub fn assert_sim_running(&mut self) {
-        if let Some(ref handle) = self.sim_handle {
-            if handle.is_finished() {
-                let handle = self.sim_handle.take().unwrap();
-                match futures::executor::block_on(handle) {
-                    Ok(Ok(())) => panic!("simulator exited unexpectedly (no error)"),
-                    Ok(Err(e)) => panic!("simulator failed to start: {e:#}"),
-                    Err(e) => panic!("simulator task panicked: {e}"),
-                }
+        if let Some(ref handle) = self.sim_handle
+            && handle.is_finished()
+        {
+            let handle = self.sim_handle.take().unwrap();
+            match futures::executor::block_on(handle) {
+                Ok(Ok(())) => panic!("simulator exited unexpectedly (no error)"),
+                Ok(Err(e)) => panic!("simulator failed to start: {e:#}"),
+                Err(e) => panic!("simulator task panicked: {e}"),
             }
         }
     }

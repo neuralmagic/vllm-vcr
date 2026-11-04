@@ -156,7 +156,8 @@ async fn tap_records_trace() {
 
     // Request 1: 10 prompt tokens, 5 output tokens.
     let req1 = make_request("tap-req-1", 10, 5);
-    let stream1 = client.call(req1).await.expect("call 1 failed");
+    let stream1 =
+        sim_protocol::vllm::output_stream(client.call(req1).await.expect("call 1 failed"));
     let outputs1: Vec<_> = tokio::time::timeout(TIMEOUT, stream1.collect::<Vec<_>>())
         .await
         .expect("stream 1 timed out");
@@ -170,7 +171,8 @@ async fn tap_records_trace() {
 
     // Request 2: 20 prompt tokens, 3 output tokens.
     let req2 = make_request("tap-req-2", 20, 3);
-    let stream2 = client.call(req2).await.expect("call 2 failed");
+    let stream2 =
+        sim_protocol::vllm::output_stream(client.call(req2).await.expect("call 2 failed"));
     let outputs2: Vec<_> = tokio::time::timeout(TIMEOUT, stream2.collect::<Vec<_>>())
         .await
         .expect("stream 2 timed out");
@@ -184,7 +186,8 @@ async fn tap_records_trace() {
 
     // Request 3 (aborted): large max_tokens, abort after first output.
     let req3 = make_request("tap-req-abort", 4, 10000);
-    let mut stream3 = client.call(req3).await.expect("call 3 failed");
+    let mut stream3 =
+        sim_protocol::vllm::output_stream(client.call(req3).await.expect("call 3 failed"));
     let first3 = tokio::time::timeout(TIMEOUT, stream3.next())
         .await
         .expect("first output timed out")
@@ -202,7 +205,8 @@ async fn tap_records_trace() {
 
     // Request 4: one more to make sure the tap is still working after an abort.
     let req4 = make_request("tap-req-3", 15, 4);
-    let stream4 = client.call(req4).await.expect("call 4 failed");
+    let stream4 =
+        sim_protocol::vllm::output_stream(client.call(req4).await.expect("call 4 failed"));
     let outputs4: Vec<_> = tokio::time::timeout(TIMEOUT, stream4.collect::<Vec<_>>())
         .await
         .expect("stream 4 timed out");
@@ -361,7 +365,9 @@ async fn tap_records_trace() {
     let captured: Vec<(usize, &Vec<u32>)> = vec![(10, &tokens1), (20, &tokens2), (15, &tokens4)];
     for (i, (prompt_len, expected)) in captured.into_iter().enumerate() {
         let req = make_request(&format!("replay-{i}"), prompt_len, expected.len() as u32);
-        let stream = replay_client.call(req).await.expect("replay call failed");
+        let stream = sim_protocol::vllm::output_stream(
+            replay_client.call(req).await.expect("replay call failed"),
+        );
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("replay stream timed out");

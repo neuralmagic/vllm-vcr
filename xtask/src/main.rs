@@ -831,13 +831,13 @@ fn replace_goldens_block(manifest: &str, entries: &str, line: &str) -> String {
     let entries = entries.trim();
     let block = format!("{start}\n{entries}\n{end}");
 
-    if let Some(start_idx) = manifest.find(&start) {
-        if let Some(end_rel) = manifest[start_idx..].find(&end) {
-            let end_idx = start_idx + end_rel + end.len();
-            let before = manifest[..start_idx].trim_end();
-            let after = manifest[end_idx..].trim_start_matches('\n');
-            return format!("{before}\n\n{block}\n{after}");
-        }
+    if let Some(start_idx) = manifest.find(&start)
+        && let Some(end_rel) = manifest[start_idx..].find(&end)
+    {
+        let end_idx = start_idx + end_rel + end.len();
+        let before = manifest[..start_idx].trim_end();
+        let after = manifest[end_idx..].trim_start_matches('\n');
+        return format!("{before}\n\n{block}\n{after}");
     }
 
     format!("{}\n\n{block}\n", manifest.trim_end())

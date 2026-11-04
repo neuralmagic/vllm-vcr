@@ -89,7 +89,8 @@ async fn test_basic_trace_token_replay() {
             record.output_tokens as u32,
         );
 
-        let stream = client.call(req).await.expect("call failed");
+        let stream =
+            sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("stream collect timed out");
@@ -132,7 +133,8 @@ async fn test_basic_trace_latency_replay() {
             record.output_tokens as u32,
         );
 
-        let stream = client.call(req).await.expect("call failed");
+        let stream =
+            sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("stream collect timed out");
@@ -167,7 +169,8 @@ async fn test_batch_context_replay() {
             record.output_tokens as u32,
         );
 
-        let stream = client.call(req).await.expect("call failed");
+        let stream =
+            sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("stream collect timed out");
@@ -202,7 +205,7 @@ async fn test_speculative_burst_structure() {
         record.output_tokens as u32,
     );
 
-    let stream = client.call(req).await.expect("call failed");
+    let stream = sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
     let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
         .await
         .expect("stream collect timed out");
@@ -235,7 +238,7 @@ async fn test_diffusion_block_outputs() {
         record.output_tokens as u32,
     );
 
-    let stream = client.call(req).await.expect("call failed");
+    let stream = sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
     let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
         .await
         .expect("stream collect timed out");
@@ -272,7 +275,7 @@ async fn test_edge_cases_single_token() {
         record.prompt_tokens,
         record.output_tokens as u32,
     );
-    let stream = client.call(req).await.expect("call failed");
+    let stream = sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
     let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
         .await
         .expect("stream collect timed out");
@@ -302,7 +305,8 @@ async fn test_gzip_compressed_trace() {
             record.output_tokens as u32,
         );
 
-        let stream = client.call(req).await.expect("call failed");
+        let stream =
+            sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("stream collect timed out");
@@ -333,7 +337,8 @@ async fn test_mixed_concurrency_levels() {
             record.output_tokens as u32,
         );
 
-        let stream = client.call(req).await.expect("call failed");
+        let stream =
+            sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
         let outputs: Vec<_> = tokio::time::timeout(TIMEOUT, stream.collect::<Vec<_>>())
             .await
             .expect("stream collect timed out");

@@ -12,17 +12,21 @@
 //! - The output envelope ([`Envelope`]) serializes through a private struct, so
 //!   the constructor/accessor functions below are the only way to build or read
 //!   one. They also keep call sites stable if the envelope shape drifts again.
-//! - [`engine_id_from_index`] absorbs `EngineId::from_engine_index` narrowing
-//!   its parameter to u16 on vLLM main (`vllm_engine_id_u16`, see
-//!   `sim_compat::capabilities`).
+//! - [`request_batch`] fills `RequestBatchOutputs.weight_version`, added in 0.32
+//!   (`vllm_weight_version`).
+//! - [`lora_request`] builds a `LoraRequest`, which lost the positional
+//!   `tensorizer_config_dict` slot in 0.33 (`vllm_lora_tensorizer`).
+//! - [`output_stream`] flattens the per-delivery stream 0.32 introduced back to
+//!   one item per output (`vllm_stream_delivery`).
 
 use std::collections::BTreeSet;
 
 use anyhow::{Result, anyhow};
+use futures::Stream;
 
-pub use vllm_engine_core_client::EngineId;
 pub use vllm_engine_core_client::protocol::dtype::ModelDtype;
 pub use vllm_engine_core_client::protocol::lora::LoraRequest;
+pub use vllm_engine_core_client::protocol::multimodal::MmModality;
 pub use vllm_engine_core_client::protocol::output::{
     EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
     decode_engine_core_outputs,
@@ -32,6 +36,7 @@ pub use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 pub use vllm_engine_core_client::protocol::stats::SchedulerStats;
 pub use vllm_engine_core_client::protocol::utility::UtilityOutput;
 pub use vllm_engine_core_client::protocol::{decode_msgpack, encode_msgpack};
+pub use vllm_engine_core_client::{EngineCoreOutputStream, EngineCoreStreamOutput, EngineId};
 
 /// The engine-core output envelope: what the engine sends back to a frontend
 /// client, and what [`decode_engine_core_outputs`] returns.
@@ -42,16 +47,40 @@ pub type Envelope = vllm_engine_core_client::protocol::output::EngineCoreOutputs
 
 /// Engine identity from the sim's engine index.
 ///
-/// The wire encoding was always two-byte little-endian; vLLM main narrowed the
-/// constructor parameter from u32 to u16 to match. Callers keep the CLI's u32
+/// The wire encoding is two-byte little-endian. Callers keep the CLI's u32
 /// engine-count type and the range check lives here.
 pub fn engine_id_from_index(engine_index: u32) -> Result<EngineId> {
     let narrow = u16::try_from(engine_index)
         .map_err(|_| anyhow!("engine index {engine_index} exceeds the wire's u16 range"))?;
-    #[cfg(vllm_engine_id_u16)]
-    return Ok(EngineId::from_engine_index(narrow));
-    #[cfg(not(vllm_engine_id_u16))]
-    return Ok(EngineId::from_engine_index(u32::from(narrow)));
+    Ok(EngineId::from_engine_index(narrow))
+}
+
+/// A plain LoRA adapter request: no base-model override, tensorizer config, or
+/// in-place reload.
+pub fn lora_request(lora_name: &str, lora_int_id: u64, lora_path: &str) -> LoraRequest {
+    LoraRequest {
+        lora_name: lora_name.to_string(),
+        lora_int_id,
+        lora_path: lora_path.to_string(),
+        base_model_name: None,
+        #[cfg(vllm_lora_tensorizer)]
+        tensorizer_config_dict: None,
+        load_inplace: false,
+        is_3d_lora_weight: false,
+    }
+}
+
+/// One item per engine output from a client request stream.
+///
+/// 0.32 groups outputs held back by the stream interval into a single
+/// delivery; earlier lines already yield one output per item.
+pub fn output_stream(
+    stream: EngineCoreOutputStream,
+) -> impl Stream<Item = vllm_engine_core_client::Result<EngineCoreStreamOutput>> + Send + Unpin {
+    #[cfg(vllm_stream_delivery)]
+    return stream.into_outputs();
+    #[cfg(not(vllm_stream_delivery))]
+    return stream;
 }
 
 /// Build a request-batch envelope: per-request outputs for one engine tick,
@@ -73,6 +102,8 @@ pub fn request_batch(
         scheduler_stats,
         timestamp,
         finished_requests,
+        #[cfg(vllm_weight_version)]
+        weight_version: None,
     }
     .into()
 }

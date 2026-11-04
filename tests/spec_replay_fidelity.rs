@@ -94,7 +94,8 @@ async fn replay_fixture(fixture: &str, requests: usize) -> (Vec<TraceRecord>, Ve
             }),
             ..Default::default()
         };
-        let mut stream = client.call(req).await.expect("call failed");
+        let mut stream =
+            sim_protocol::vllm::output_stream(client.call(req).await.expect("call failed"));
         let mut chunks = Vec::new();
         let mut gaps_ms = Vec::new();
         let mut last: Option<Instant> = None;

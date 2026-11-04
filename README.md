@@ -26,7 +26,7 @@ calibration, versioning and conformance, and operations. Source lives in
 
 ## Install
 
-Requires Rust 1.85 or newer. From a checkout:
+Requires Rust 1.94.1 or newer. From a checkout:
 
 ```bash
 cargo install --path . --locked

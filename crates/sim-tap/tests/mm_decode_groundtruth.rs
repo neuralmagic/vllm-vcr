@@ -12,11 +12,11 @@
 //! succeeds, the request path is sound and the blocker lives upstream of the tap
 //! (frontend mm-preprocessing stall / DP handshake wedge), not in serde.
 
-use sim_protocol::vllm::{EngineCoreRequest, decode_msgpack};
+use sim_protocol::vllm::{EngineCoreRequest, MmModality, decode_msgpack};
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     let hex = hex.trim();
-    assert!(hex.len() % 2 == 0, "odd-length hex");
+    assert!(hex.len().is_multiple_of(2), "odd-length hex");
     (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex byte"))
@@ -35,7 +35,7 @@ fn decodes_real_multimodal_request_with_aux_tensor() {
     assert_eq!(req.request_id, "req-mm-large");
     let mm = req.mm_features.as_ref().expect("mm_features present");
     assert_eq!(mm.len(), 1, "one image feature");
-    assert_eq!(mm[0].modality, "image");
+    assert_eq!(mm[0].modality, MmModality::Image);
     // 2 text + 256 image placeholders + 1 text.
     assert_eq!(req.prompt_token_ids.as_ref().map(Vec::len), Some(259));
 }

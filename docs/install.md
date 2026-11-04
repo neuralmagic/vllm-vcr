@@ -1,6 +1,6 @@
 # Install
 
-`vllm-vcr` requires Rust 1.85 or newer. The default build is pure Rust and does not
+`vllm-vcr` requires Rust 1.94.1 or newer. The default build is pure Rust and does not
 include NIXL.
 
 From a checkout:
