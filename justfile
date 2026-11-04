@@ -52,6 +52,28 @@ image-build-line line:
 image-push:
     podman push {{image}}
 
+# --- slim image + kind e2e ---------------------------------------------------------
+
+# Build the slim model-server image (vllm-rs + vllm-vcr, no UCX/NIXL) for a compat.toml
+# line, native arch. Pins Cargo.toml/Cargo.lock to the line like image-build-line.
+# Tags localhost/vllm-vcr-slim:vllm<line>.
+image-build-slim line:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo xtask pin-vllm "{{line}}"
+    cargo update -p vllm-engine-core-client
+    eval "$(cargo xtask frontend-args "{{line}}")"
+    podman build -f Dockerfile.slim \
+        --build-arg VLLM_TARGET_VERSION="$TAG" \
+        --build-arg VLLM_REPO="$FREPO" \
+        --build-arg VLLM_REF="$FREF" \
+        -t localhost/vllm-vcr-slim:vllm{{line}} .
+
+# Run the kind e2e gate against a line's slim image (build it first with image-build-slim).
+# With podman, export KIND_EXPERIMENTAL_PROVIDER=podman.
+kind-e2e line:
+    IMAGE=localhost/vllm-vcr-slim:vllm{{line}} ci/kind-e2e.sh
+
 # --- cluster capture rig ----------------------------------------------------------
 
 # Apply only resources tagged with the given rig label (see llm-d.ai/rig in base/).

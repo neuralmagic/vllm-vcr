@@ -126,6 +126,9 @@ The matrix runs per line (see `ci.yml`):
 - `cargo build --workspace` — the "does the wire still compile" gate.
 - `cargo test --workspace --lib` — unit tests (compile + pass on every line).
 - `cargo test --test conformance` — the conformance runner (skips until goldens).
+- `ci/kind-e2e.sh` (the `kind-e2e` job) — the line's slim image on kind: the real
+  vllm-rs frontend and the engine over the in-pod handshake, driven over HTTP (see
+  [testing.md](testing.md#per-line-kind-e2e)).
 
 The full-stack e2e integration tests (`tests/engine_core_e2e.rs`,
 `tests/tap_e2e.rs`) drive the *real* `EngineCoreClient`, whose API

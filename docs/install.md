@@ -38,3 +38,11 @@ vLLM Rust frontend, the simulator, libnixl, and UCX:
 ```bash
 podman build -t ghcr.io/neuralmagic/vllm-vcr:dev .
 ```
+
+When the llm-d P/D path is not needed, `Dockerfile.slim` builds the same frontend and
+simulator with the same entrypoint and env contract, but without UCX/libnixl, so it
+builds in minutes and weighs about 200 MB:
+
+```bash
+just image-build-slim 0.33
+```
