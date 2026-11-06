@@ -31,7 +31,8 @@
           { "context": "build-and-test" },
           { "context": "deny" },
           { "context": "synthetic-e2e" },
-          { "context": "conformance-gate" }
+          { "context": "conformance-gate" },
+          { "context": "kind-e2e-gate" }
         ]
       }
     }

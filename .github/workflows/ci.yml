@@ -256,6 +256,77 @@ jobs:
           set -euo pipefail
           cargo test --test conformance -- --nocapture
 
+  # Per-line kind e2e. Builds the slim image (Dockerfile.slim: the line's vllm-rs
+  # frontend + vllm-vcr, no UCX/NIXL) and runs ci/kind-e2e.sh against it: one pod on
+  # a kind cluster, real HTTP through the shipped frontend, engine counters checked on
+  # the control API. Where conformance replay proves timing fidelity against GPU
+  # goldens, this proves the frontend and engine interoperate on every line without
+  # a GPU. Stable lines gate; the nightly/rc trackers report without blocking.
+  kind-e2e:
+    needs: compat-matrix
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.line == 'nightly' || matrix.line == 'rc' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.compat-matrix.outputs.include) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Pin vLLM rev (line ${{ matrix.line }})
+        run: |
+          cargo xtask pin-vllm "${{ matrix.line }}"
+          cargo update -p vllm-engine-core-client
+          eval "$(cargo xtask frontend-args "${{ matrix.line }}")"
+          {
+            echo "TAG=${TAG}"
+            echo "FREPO=${FREPO}"
+            echo "FREF=${FREF}"
+          } >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build slim image (vLLM ${{ matrix.line }} @ ${{ matrix.tag }})
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.slim
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: localhost/vllm-vcr-slim:vllm${{ matrix.line }}
+          build-args: |
+            VLLM_TARGET_VERSION=${{ env.TAG }}
+            VLLM_REPO=${{ env.FREPO }}
+            VLLM_REF=${{ env.FREF }}
+          cache-from: type=gha,scope=slim-vllm${{ matrix.line }}
+          cache-to: type=gha,mode=max,scope=slim-vllm${{ matrix.line }}
+
+      - name: kind e2e (vLLM ${{ matrix.line }})
+        env:
+          IMAGE: localhost/vllm-vcr-slim:vllm${{ matrix.line }}
+          ARTIFACTS: ${{ runner.temp }}/kind-e2e
+        run: ci/kind-e2e.sh
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ failure() }}
+        with:
+          name: kind-e2e-vllm${{ matrix.line }}
+          path: ${{ runner.temp }}/kind-e2e
+          retention-days: 7
+
+  # One stable status context over the kind e2e matrix, like conformance-gate below.
+  kind-e2e-gate:
+    needs: kind-e2e
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.kind-e2e.result }}" = "success"
+
   # One stable status context over the whole per-line matrix, for the branch
   # ruleset's required checks (matrix leg names carry the line and rev, so they
   # can't be required by name). Green iff every gated leg is green.

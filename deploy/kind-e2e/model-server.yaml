@@ -1,0 +1,40 @@
+# Single-pod model server for the per-line kind e2e gate (ci/kind-e2e.sh): the
+# vllm-rs frontend and the vllm-vcr engine from one image, joined over the in-pod
+# engine-core handshake by entrypoint.sh. ci/kind-e2e.sh substitutes @IMAGE@.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-vcr-e2e
+  labels:
+    app: vllm-vcr-e2e
+spec:
+  restartPolicy: Never
+  containers:
+    - name: model-server
+      image: "@IMAGE@"
+      imagePullPolicy: Never
+      ports:
+        - { name: http, containerPort: 8000 }
+        - { name: control, containerPort: 8001 }
+      env:
+        - { name: MODEL, value: Qwen/Qwen3-0.6B }
+        - { name: MOCK_MAX_LORAS, value: "4" }
+        - { name: MOCK_KV_CACHE_SIZE, value: "1024" }
+        - { name: VLLM_ALLOW_RUNTIME_LORA_UPDATING, value: "1" }
+        - { name: VLLM_RUNTIME_LORA_ALLOWED_PATH_PREFIXES, value: /adapters }
+        - { name: VLLM_SERVER_DEV_MODE, value: "1" }
+        - { name: VLLM_EXTRA_ARGS, value: "--enable-prompt-tokens-details" }
+        - name: POD_IP
+          valueFrom: { fieldRef: { fieldPath: status.podIP } }
+        - name: POD_NAME
+          valueFrom: { fieldRef: { fieldPath: metadata.name } }
+      volumeMounts:
+        - { name: adapter, mountPath: /adapters/e2e }
+      readinessProbe:
+        httpGet: { path: /health, port: http }
+        periodSeconds: 2
+        failureThreshold: 150
+      resources:
+        requests: { cpu: 500m, memory: 512Mi }
+  volumes:
+    - { name: adapter, emptyDir: {} }
