@@ -14,10 +14,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
-use hf_hub::api::sync::Api;
+use hf_hub::RepoType;
 use rand::Rng as _;
 use rand::rngs::StdRng;
 use sim_protocol::vllm::EngineCoreFinishReason;
+use sim_s3::hub::HubSettings;
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
@@ -299,33 +300,17 @@ pub(crate) const DEFAULT_DATASET_TOKENIZER: &str = "Qwen/Qwen3-0.6B";
 
 /// Load a HuggingFace `tokenizer.json` for `model_id`: a local `tokenizer.json`
 /// path or a directory holding one is used as-is (keeps the sim hermetic);
-/// anything else is treated as a Hub model id and downloaded.
-fn load_hf_tokenizer(model_id: &str) -> Result<Tokenizer> {
+/// anything else is a Hub model id resolved through `hub`.
+fn load_hf_tokenizer(model_id: &str, hub: &HubSettings) -> Result<Tokenizer> {
     let as_path = Path::new(model_id);
-    let local = if as_path.is_dir() {
-        Some(as_path.join("tokenizer.json"))
+    let tokenizer_file = if as_path.is_dir() {
+        as_path.join("tokenizer.json")
     } else if as_path.is_file() {
-        Some(as_path.to_path_buf())
+        as_path.to_path_buf()
     } else {
-        None
+        hub.get_blocking(RepoType::Model, model_id, "tokenizer.json")?
     };
-    let tokenizer_file = match local {
-        Some(path) => {
-            info!(tokenizer = %path.display(), "loading dataset tokenizer from disk");
-            path
-        }
-        None => {
-            info!(
-                model = model_id,
-                "loading dataset tokenizer from HuggingFace"
-            );
-            let api =
-                Api::new().map_err(|e| anyhow::anyhow!("initializing HuggingFace API: {e}"))?;
-            let repo = api.model(model_id.to_string());
-            repo.get("tokenizer.json")
-                .map_err(|e| anyhow::anyhow!("downloading tokenizer for {model_id}: {e}"))?
-        }
-    };
+    info!(tokenizer = %tokenizer_file.display(), model = model_id, "loading dataset tokenizer");
     Tokenizer::from_file(tokenizer_file)
         .map_err(|e| anyhow::anyhow!("loading tokenizer for {model_id}: {e}"))
 }
@@ -362,7 +347,7 @@ impl HFDatasetTokens {
             "loading HuggingFace dataset for replay"
         );
 
-        let tokenizer = load_hf_tokenizer(tokenizer_model)?;
+        let tokenizer = load_hf_tokenizer(tokenizer_model, &HubSettings::from_env())?;
         let vocab_size = tokenizer.get_vocab_size(true) as u32;
 
         let json_rows = sim_trace::dataset_convert::parse_dataset(dataset_path)
@@ -606,9 +591,89 @@ impl TokenSource for EchoTokens {
 
 #[cfg(test)]
 mod tests {
-    use rand::SeedableRng as _;
+    use std::path::{Path, PathBuf};
 
-    use super::{DatasetRow, HFDatasetTokens, RandomTokens, TokenCtx, TokenSource};
+    use rand::SeedableRng as _;
+    use sim_s3::hub::HubSettings;
+    use tokenizers::Tokenizer;
+    use tokenizers::models::wordlevel::WordLevel;
+
+    use crate::tokens::{
+        DatasetRow, HFDatasetTokens, RandomTokens, TokenCtx, TokenSource, load_hf_tokenizer,
+    };
+
+    const SNAPSHOT_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("vllm-vcr-tokens-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a three-word WordLevel `tokenizer.json` to `path`.
+    fn write_tokenizer(path: &Path) {
+        let vocab = [("[UNK]", 0), ("hello", 1), ("world", 2)]
+            .map(|(word, id): (&str, u32)| (word.to_string(), id));
+        let model = WordLevel::builder()
+            .vocab(vocab.into())
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        Tokenizer::new(model).save(path, false).unwrap();
+    }
+
+    /// Lay out `model_id` in the Hub cache format: `refs/main` naming a
+    /// snapshot holding a `tokenizer.json`.
+    fn seed_hub_cache(cache: &Path, model_id: &str) {
+        let repo = cache.join(format!("models--{}", model_id.replace('/', "--")));
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs").join("main"), SNAPSHOT_SHA).unwrap();
+        let snapshot = repo.join("snapshots").join(SNAPSHOT_SHA);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        write_tokenizer(&snapshot.join("tokenizer.json"));
+    }
+
+    fn offline(cache: &Path) -> HubSettings {
+        HubSettings::new(cache.to_path_buf(), true)
+    }
+
+    #[test]
+    fn load_tokenizer_from_hub_cache_offline() {
+        let cache = scratch_dir("cached");
+        seed_hub_cache(&cache, "org/model");
+        let tokenizer = load_hf_tokenizer("org/model", &offline(&cache)).unwrap();
+        assert_eq!(tokenizer.get_vocab_size(true), 3);
+        let err = load_hf_tokenizer("org/absent", &offline(&cache))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HF_HUB_OFFLINE"), "{err}");
+        std::fs::remove_dir_all(&cache).unwrap();
+    }
+
+    #[test]
+    fn load_tokenizer_from_local_dir_and_file_ignores_hub() {
+        let dir = scratch_dir("local");
+        let file = dir.join("tokenizer.json");
+        write_tokenizer(&file);
+        let empty_cache = dir.join("empty-cache");
+        for model_id in [dir.to_str().unwrap(), file.to_str().unwrap()] {
+            let tokenizer = load_hf_tokenizer(model_id, &offline(&empty_cache)).unwrap();
+            assert_eq!(tokenizer.get_vocab_size(true), 3);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_tokenizer_from_local_dir_without_tokenizer_errors() {
+        let dir = scratch_dir("local-empty");
+        let err = load_hf_tokenizer(dir.to_str().unwrap(), &offline(&dir.join("cache")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("loading tokenizer"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn random_tokens_draws_correct_count() {

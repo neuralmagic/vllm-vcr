@@ -14,6 +14,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use tracing::{debug, info};
 use url::Url;
 
+pub mod hub;
+
 /// Whether a raw path string is an `s3://` or `hf://` URI rather than a local path.
 pub fn is_remote(uri: &str) -> bool {
     uri.len() >= 5
@@ -143,35 +145,18 @@ impl TraceUri {
     }
 
     async fn fetch_hf(&self, repo: &str, filename: &str) -> Result<PathBuf> {
-        use hf_hub::api::tokio::Api;
-
-        info!(
-            uri = %self,
-            repo = repo,
-            file = filename,
-            "HF GET: downloading from HuggingFace Hub"
-        );
-
         let started = Instant::now();
-
-        let api = Api::new().map_err(|e| anyhow::anyhow!("initializing HF API: {}", e))?;
-        let repo_api = api.dataset(repo.to_string());
-        let local_path = repo_api
-            .get(filename)
-            .await
-            .map_err(|e| anyhow::anyhow!("downloading {} from {}: {}", filename, repo, e))?;
-
-        let elapsed = started.elapsed();
+        let local_path = hub::HubSettings::from_env()
+            .get(hf_hub::RepoType::Dataset, repo, filename)
+            .await?;
         let size = std::fs::metadata(&local_path).map(|m| m.len()).ok();
-
         info!(
             uri = %self,
             path = %local_path.display(),
             bytes = size,
-            elapsed_ms = elapsed.as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
             "HF GET: file cached"
         );
-
         Ok(local_path)
     }
 }
