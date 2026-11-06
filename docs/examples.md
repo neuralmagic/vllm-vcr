@@ -228,6 +228,16 @@ Key env vars read by `entrypoint.sh`:
 
 See `entrypoint.sh` for the full list (latency std-devs, KV-cache events, failure injection, NIXL side-channel).
 
+### Disconnected clusters
+
+The frontend, the `--replay-tokens` dataset loader, and `hf://` trace URIs resolve Hub files the same way: a local directory as `MODEL` is read as-is; a Hub id is looked up in `HF_HUB_CACHE` (else `$HF_HOME/hub`), then downloaded from `HF_ENDPOINT` unless `HF_HUB_OFFLINE=1`. Tokenizers need no weights. Seed a cache on a connected machine (add `hf download --repo-type dataset <repo> <file>` for `hf://` traces):
+
+```bash
+HF_HUB_CACHE=./hf-cache hf download Qwen/Qwen3-0.6B --exclude '*.safetensors' '*.bin' '*.pt'
+```
+
+Mount it in the pod (PVC or image volume) and set `HF_HUB_CACHE=<mount>` and `HF_HUB_OFFLINE=1`, keeping `MODEL` as the Hub id so the served model name and KV-event topic are unchanged. A cache miss then fails at startup instead of hanging on the network.
+
 ### Accessing the service
 
 Port-forward to test:
