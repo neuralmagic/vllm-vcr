@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
       # `cargo xtask release-matrix` crosses every compat.toml line with the
       # native-arch release platforms (defined in xtask). The default line also
       # publishes the line-agnostic trace tooling.
@@ -76,7 +76,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           target: ${{ matrix.target }}
 
@@ -138,7 +138,7 @@ jobs:
       # graph transitively covers the sim-* members. The default-line inspect tarball
       # is the same binary as that line's main tarball, so it shares this SBOM.
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-cyclonedx@0.5.9
 
@@ -155,7 +155,7 @@ jobs:
       # only; a workflow_dispatch stays a build+SBOM smoke test that publishes nothing.
       - name: Install cosign
         if: ${{ github.ref_type == 'tag' }}
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           # cosign v3 sign-blob writes a sigstore bundle and errors on the detached
           # --output-signature/--output-certificate flow the README documents; stay

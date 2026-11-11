@@ -47,7 +47,7 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
 
       - uses: ./.github/actions/setup-sccache
         if: ${{ vars.SCCACHE_ROLE_ARN != '' }}
@@ -86,7 +86,7 @@ jobs:
       - name: Mint App token
         id: app-token
         if: ${{ steps.moved.outputs.moved == 'true' && env.CANARY_APP_ID != '' }}
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.CANARY_APP_ID }}
           private-key: ${{ secrets.CANARY_APP_PRIVATE_KEY }}
@@ -94,7 +94,7 @@ jobs:
       - name: Open the release PR
         id: pr
         if: ${{ steps.moved.outputs.moved == 'true' && env.CANARY_APP_ID != '' }}
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v8.1.2
         with:
           token: ${{ steps.app-token.outputs.token }}
           sign-commits: true
@@ -127,7 +127,7 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
 
       - name: Did the version change?
         id: version
@@ -150,7 +150,7 @@ jobs:
       - name: Mint App token
         id: app-token
         if: ${{ steps.version.outputs.changed == 'true' && env.CANARY_APP_ID != '' }}
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.CANARY_APP_ID }}
           private-key: ${{ secrets.CANARY_APP_PRIVATE_KEY }}
