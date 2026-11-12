@@ -18,6 +18,7 @@ spec:
   template:
     metadata:
       labels:
+        llm-d.ai/inference-serving: "true"
         llm-d.ai/guide: pd-disaggregation
         llm-d.ai/model: qwen3-0-6b
         llm-d.ai/role: prefill
@@ -40,6 +41,9 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # NIXL over plain TCP: no RDMA devices or GPUs needed.
+            - name: UCX_TLS
+              value: tcp
             # Simulated latency (ms): prefill overhead + per-token, then ITL.
             - name: MOCK_PREFILL_OVERHEAD_MS
               value: "30"

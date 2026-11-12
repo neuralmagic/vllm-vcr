@@ -1,13 +1,11 @@
-# Vendored from llm-d v0.7.0 router guide. Base EPP scheduler + Envoy proxy sizing.
-# Layered under pd-disaggregation.values.yaml for P/D-specific routing.
+# Vendored from llm-d v1.0.0 (guides/recipes/router/base.values.yaml). Base EPP
+# scheduler + Envoy proxy settings, layered under pd-disaggregation.values.yaml.
+# Differs from upstream in two ways: resource requests are halved (this rig serves
+# mock engines, not a GPU fleet), and the tracing block is left out (no collector).
+# The EPP image is the chart's own pinned default.
 router:
   epp:
     replicas: 1
-    image:
-      registry: ghcr.io/llm-d
-      repository: llm-d-router-endpoint-picker-dev
-      tag: main
-      pullPolicy: Always
     flags:
       v: 2
     pluginsConfigFile: "default-plugins.yaml"
@@ -25,6 +23,7 @@ router:
     protocol: http
 
   proxy:
+    proxyType: envoy
     args:
       - "--service-node"
       - "envoy-sidecar"
