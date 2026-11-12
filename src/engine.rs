@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use crate::lora::{LoraSpec, request_lora_name};
+use crate::lora::request_lora_name;
 use anyhow::{Result, anyhow};
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
@@ -45,7 +45,7 @@ use crate::tokens::{RandomTokens, TokenCtx, TokenSource};
 use crate::{Opt, SchedulingPolicy};
 
 /// Derive a stable per-request seed from the CLI seed, engine, and request id.
-fn request_seed(base_seed: u64, engine_index: u32, request_id: &str) -> u64 {
+pub(crate) fn request_seed(base_seed: u64, engine_index: u32, request_id: &str) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::hash::DefaultHasher::new();
     base_seed.hash(&mut hasher);
@@ -56,7 +56,7 @@ fn request_seed(base_seed: u64, engine_index: u32, request_id: &str) -> u64 {
 
 /// Seconds on the system monotonic clock, the same clock as Python's `time.monotonic()` on
 /// Linux. vLLM stamps both output envelopes and request lifecycle events with it.
-fn now_monotonic() -> f64 {
+pub(crate) fn now_monotonic() -> f64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -69,7 +69,7 @@ fn now_monotonic() -> f64 {
 }
 
 /// Build one request output with only token IDs and terminal status populated.
-fn request_output(
+pub(crate) fn request_output(
     request_id: String,
     new_token_ids: Vec<u32>,
     finish_reason: Option<EngineCoreFinishReason>,
@@ -83,7 +83,7 @@ fn request_output(
 }
 
 /// Produce an empty output with a terminal finish reason for an invalid request.
-fn empty_finish_outputs(
+pub(crate) fn empty_finish_outputs(
     engine_index: u32,
     request_id: String,
     finish_reason: EngineCoreFinishReason,
@@ -101,7 +101,7 @@ fn empty_finish_outputs(
 }
 
 /// Encode a utility result into the protocol's msgpack value envelope.
-fn utility_envelope<T>(value: T) -> Result<UtilityResultEnvelope>
+pub(crate) fn utility_envelope<T>(value: T) -> Result<UtilityResultEnvelope>
 where
     T: Serialize,
 {
@@ -111,7 +111,7 @@ where
 }
 
 /// Wrap a utility result envelope in the `Envelope` the frontend awaits for `call_id`.
-fn utility_result_outputs(
+pub(crate) fn utility_result_outputs(
     engine_index: u32,
     call_id: UtilityCallId,
     result: UtilityResultEnvelope,
@@ -129,7 +129,7 @@ fn utility_result_outputs(
 
 /// Produce the minimal utility responses needed by a real frontend. Stateful utilities
 /// (`add_lora`/`remove_lora`, `reset_prefix_cache`) are handled on `Engine` instead.
-fn utility_response(engine_index: u32, request: UtilityRequestSpec) -> Result<Envelope> {
+pub(crate) fn utility_response(engine_index: u32, request: UtilityRequestSpec) -> Result<Envelope> {
     let result = match request.method_name.as_str() {
         "get_supported_tasks" => utility_envelope(vec!["generate"]),
         "is_sleeping" => utility_envelope(false),
@@ -610,36 +610,35 @@ pub(crate) struct SimEngine {
     stats: Stats,
 }
 
-impl SimEngine {
-    /// Decide whether to fail a request on arrival (Phase 5). First the deterministic
-    /// context-length check (`prompt + max_tokens > max_model_len`), then the random
-    /// injection at `failure_injection_rate`. Returns the finish reason to fail with, if any.
-    fn maybe_fail(&mut self, request: &EngineCoreRequest) -> Option<EngineCoreFinishReason> {
-        if self.opt.max_model_len > 0 {
-            let prompt_len = request.prompt_token_ids.as_ref().map(Vec::len).unwrap_or(0) as u64;
-            let max_tokens = request
-                .sampling_params
-                .as_ref()
-                .map(|s| s.max_tokens as u64)
-                .unwrap_or(0);
-            if prompt_len + max_tokens > self.opt.max_model_len {
-                return Some(EngineCoreFinishReason::Length);
-            }
+/// Decide whether to fail a request on arrival (Phase 5). First the deterministic
+/// context-length check (`prompt + max_tokens > max_model_len`), then the random
+/// injection at `failure_injection_rate`. Returns the finish reason to fail with, if any.
+pub(crate) fn fail_on_arrival(
+    opt: &Opt,
+    rng: &mut StdRng,
+    request: &EngineCoreRequest,
+) -> Option<EngineCoreFinishReason> {
+    if opt.max_model_len > 0 {
+        let prompt_len = request.prompt_token_ids.as_ref().map(Vec::len).unwrap_or(0) as u64;
+        let max_tokens = request
+            .sampling_params
+            .as_ref()
+            .map(|s| s.max_tokens as u64)
+            .unwrap_or(0);
+        if prompt_len + max_tokens > opt.max_model_len {
+            return Some(EngineCoreFinishReason::Length);
         }
-
-        let rate = self.opt.failure_injection_rate;
-        if rate > 0.0
-            && !self.opt.failure_types.is_empty()
-            && self.failure_rng.random::<f64>() < rate
-        {
-            let idx = self
-                .failure_rng
-                .random_range(0..self.opt.failure_types.len());
-            return Some(self.opt.failure_types[idx].finish_reason());
-        }
-        None
     }
 
+    let rate = opt.failure_injection_rate;
+    if rate > 0.0 && !opt.failure_types.is_empty() && rng.random::<f64>() < rate {
+        let idx = rng.random_range(0..opt.failure_types.len());
+        return Some(opt.failure_types[idx].finish_reason());
+    }
+    None
+}
+
+impl SimEngine {
     /// Answer a control-API call. A config patch can raise the batch cap, so it may
     /// admit waiting requests; those outputs go to the frontend like any other.
     fn handle_control(
@@ -661,22 +660,7 @@ impl SimEngine {
     }
 
     fn config(&self) -> Config {
-        Config {
-            time_to_first_token: self.opt.time_to_first_token,
-            time_to_first_token_std_dev: self.opt.time_to_first_token_std_dev,
-            inter_token_latency: self.opt.inter_token_latency,
-            inter_token_latency_std_dev: self.opt.inter_token_latency_std_dev,
-            prefill_overhead: self.opt.prefill_overhead,
-            prefill_time_per_token: self.opt.prefill_time_per_token,
-            prefill_time_std_dev: self.opt.prefill_time_std_dev,
-            time_factor_under_load: self.opt.time_factor_under_load,
-            max_num_seqs: self.opt.max_num_seqs,
-            max_num_batched_tokens: self.opt.max_num_batched_tokens,
-            max_model_len: self.opt.max_model_len,
-            failure_injection_rate: self.opt.failure_injection_rate,
-            failure_types: self.opt.failure_types.clone(),
-            log_requests: self.opt.log_requests,
-        }
+        Config::from_opt(&self.opt)
     }
 
     fn stats(&self) -> Stats {
@@ -699,29 +683,7 @@ impl SimEngine {
             ));
         }
         let mut opt = self.opt.clone();
-        macro_rules! set {
-            ($($field:ident),* $(,)?) => {
-                $(if let Some(value) = patch.$field { opt.$field = value; })*
-            };
-        }
-        set!(
-            time_to_first_token,
-            time_to_first_token_std_dev,
-            inter_token_latency,
-            inter_token_latency_std_dev,
-            prefill_overhead,
-            prefill_time_per_token,
-            prefill_time_std_dev,
-            time_factor_under_load,
-            max_num_seqs,
-            max_num_batched_tokens,
-            max_model_len,
-            failure_injection_rate,
-            log_requests,
-        );
-        if let Some(types) = patch.failure_types {
-            opt.failure_types = types;
-        }
+        patch.apply(&mut opt);
         if rebuild_latency {
             self.latency = opt.build_latency().map_err(|error| {
                 ControlError::internal(format!("rebuilding latency model: {error:#}"))
@@ -736,38 +698,13 @@ impl SimEngine {
 
     /// Handle a LoRA load/unload utility call, mutating the adapter registry. Returns the
     /// `bool`-carrying response the frontend awaits, or `None` if this isn't a LoRA method (so
-    /// the caller falls back to the generic `utility_response`). The frontend encodes both
-    /// methods' args as a one-element tuple: `(LoraRequest,)` for `add_lora`, `(lora_int_id,)`
-    /// for `remove_lora`.
+    /// the caller falls back to the generic `utility_response`).
     fn lora_utility_outputs(&mut self, request: &UtilityRequestSpec) -> Result<Option<Envelope>> {
-        let ok = match request.method_name.as_str() {
-            "add_lora" => {
-                // args is the one-element tuple `(LoraRequest,)`; the LoraRequest itself
-                // is a positional array whose trailing fields vary by line, so pull it out
-                // as an opaque value and read the identity by position (LoraSpec::from_wire).
-                let (lora_value,): (rmpv::Value,) = rmpv::ext::from_value(request.args.clone())
-                    .map_err(|error| anyhow!("decoding add_lora args tuple: {error}"))?;
-                let lora = LoraSpec::from_wire(&lora_value)
-                    .map_err(|error| anyhow!("decoding add_lora lora_request: {error}"))?;
-                let name = lora.lora_name.clone();
-                let id = lora.lora_int_id;
-                let ok = self.loras.add(lora);
-                info!(engine_index = self.engine_index, lora = %name, id, "add_lora");
-                ok
-            }
-            "remove_lora" => {
-                let (lora_int_id,): (u64,) = rmpv::ext::from_value(request.args.clone())
-                    .map_err(|error| anyhow!("decoding remove_lora args: {error}"))?;
-                let ok = self.loras.remove(lora_int_id);
-                info!(
-                    engine_index = self.engine_index,
-                    id = lora_int_id,
-                    ok,
-                    "remove_lora"
-                );
-                ok
-            }
-            _ => return Ok(None),
+        let Some(ok) = self
+            .loras
+            .handle_utility(&request.method_name, &request.args)?
+        else {
+            return Ok(None);
         };
         Ok(Some(utility_result_outputs(
             self.engine_index,
@@ -861,7 +798,7 @@ impl SimEngine {
 
                 // Phase 5: fail the request on arrival if the context-length check trips or
                 // the injector rolls a failure. It never enters the queue or the pool.
-                if let Some(reason) = self.maybe_fail(&request) {
+                if let Some(reason) = fail_on_arrival(&self.opt, &mut self.failure_rng, &request) {
                     self.stats.requests_failed += 1;
                     if self.opt.log_requests {
                         info!(request_id, ?reason, "request failed on arrival (injected)");
@@ -1947,6 +1884,7 @@ mod tests {
     use crate::dataplane::{NixlConfig, PdRole, make_data_plane};
     use crate::engine::*;
     use crate::engine_core::{EngineInput, EngineOutput};
+    use crate::lora::LoraSpec;
 
     /// Build a value for `EngineCoreRequest.lora_request`.
     fn lora_field(name: &str, id: u64) -> LoraRequest {
