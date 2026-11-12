@@ -87,12 +87,14 @@ RUN git clone ${VLLM_REPO} /src/vllm \
 #    libnixl. The context's Cargo.toml is already pinned to this line's rev/fork
 #    by cargo xtask pin-vllm (so no --locked: the rev no longer matches Cargo.lock).
 COPY . /src/vllm-vcr
+# Cargo features of the vllm-vcr binary; add `rust-core` for `play --use-rust-core`.
+ARG VCR_FEATURES=nixl
 # The nixl feature lives on the root package, which owns the single vllm-vcr
 # binary. VLLM_TARGET_VERSION drives the per-line capability cfgs in build.rs
 # (else it falls back to the compat default).
 RUN cd /src/vllm-vcr \
     && VLLM_TARGET_VERSION="${VLLM_TARGET_VERSION}" \
-       cargo build --release -p vllm-vcr --features nixl \
+       cargo build --release -p vllm-vcr --features "${VCR_FEATURES}" \
     && cp target/release/vllm-vcr /usr/local/bin/vllm-vcr
 
 # ---------------------------------------------------------------------------------------

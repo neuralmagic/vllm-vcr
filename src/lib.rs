@@ -31,6 +31,8 @@ mod io;
 pub mod kvevents;
 pub mod lora;
 mod replay_steps;
+#[cfg(feature = "rust-core")]
+mod rust_core;
 mod sched;
 mod tokens;
 
@@ -81,6 +83,17 @@ pub enum ReplayMatch {
     /// `block_hashes`, consume-once. Works for live clients (an agent loop
     /// re-run offline against the sim), which name requests however they like.
     Prefix,
+}
+
+/// Which side moves the KV blocks of a prefill/decode handoff, matching the NIXL
+/// connector's `transfer_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum KvTransferMode {
+    /// The decode engine reads the blocks from the prefill engine (vLLM `NixlConnector`).
+    Pull,
+    /// The prefill engine writes the blocks into the decode engine (vLLM
+    /// `NixlPushConnector`).
+    Push,
 }
 
 /// Waiting-queue ordering, matching vLLM's `--scheduling-policy`.
@@ -367,6 +380,21 @@ pub struct Opt {
     #[arg(long, value_enum, value_delimiter = ',', default_value = "error")]
     pub failure_types: Vec<FailureType>,
 
+    /// Run vLLM's Rust engine core (vLLM `VLLM_USE_RUST_CORE`): its real scheduler and KV
+    /// cache manager, stepped against a simulated GPU worker. Unset runs the built-in
+    /// approximation of the Python engine core. Needs a build with the `rust-core` feature.
+    #[arg(
+        long,
+        env = "VLLM_USE_RUST_CORE",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub use_rust_core: bool,
+
+    /// Direction of prefill/decode KV transfers. `push` needs `--use-rust-core`, and
+    /// both engines of a pair must agree.
+    #[arg(long, value_enum, env = "MOCK_KV_TRANSFER_MODE", default_value_t = KvTransferMode::Pull)]
+    pub kv_transfer_mode: KvTransferMode,
+
     /// Graceful-shutdown grace period in seconds (vLLM `shutdown_timeout`). On
     /// SIGTERM/SIGINT the engine rejects new requests and lets in-flight ones finish for
     /// up to this long; whatever remains is then aborted. `0` (vLLM's default) aborts
@@ -639,6 +667,26 @@ impl Opt {
         Ok(())
     }
 
+    /// Check the options against the engine `--use-rust-core` selects.
+    pub fn validate_engine(&self, latency: &dyn latency::LatencyModel) -> Result<()> {
+        if !self.use_rust_core {
+            if self.kv_transfer_mode == KvTransferMode::Push {
+                bail!("--kv-transfer-mode push needs --use-rust-core");
+            }
+            return Ok(());
+        }
+        #[cfg(feature = "rust-core")]
+        return rust_core::validate(self, latency);
+        #[cfg(not(feature = "rust-core"))]
+        {
+            let _ = latency;
+            bail!(
+                "--use-rust-core (VLLM_USE_RUST_CORE) needs a vllm-vcr built with the \
+                 `rust-core` feature"
+            )
+        }
+    }
+
     /// Build the latency model: either trace-replay (from `--latency-trace`) or
     /// knob-based. Returns an error if both are configured or if the trace file is
     /// unreadable.
@@ -763,15 +811,17 @@ async fn run_engine(
             tracing::warn!(%error, "kv-event publisher failed to start; continuing without events");
             None
         });
-    let shutdown_timeout = std::time::Duration::from_secs(opt.shutdown_timeout);
-    let sim_engine = engine::SimEngine::new(engine_index, opt, events).await?;
-    let mut engine_loop = tokio::spawn(engine_core::run_loop(
-        sim_engine,
+    let engine_abort = CancellationToken::new();
+    let mut engine_loop = spawn_engine_loop(
+        engine_index,
+        opt,
+        events,
         input_rx,
         output_tx,
         shutdown.clone(),
-        shutdown_timeout,
-    ));
+        engine_abort.clone(),
+    )
+    .await?;
 
     tokio::select! {
         biased;
@@ -803,6 +853,7 @@ async fn run_engine(
         result = &mut io_loop => {
             error!(engine_index, "engine IO loop exited unexpectedly");
             engine_done.cancel();
+            engine_abort.cancel();
             engine_loop.abort();
             engine_loop.await.ok();
             result??;
@@ -811,6 +862,41 @@ async fn run_engine(
 
     info!(engine_index, "engine shut down");
     Ok(())
+}
+
+/// Start the engine loop for the engine `--use-rust-core` selects. `abort` stops a
+/// loop that `JoinHandle::abort` cannot reach.
+async fn spawn_engine_loop(
+    engine_index: u32,
+    opt: Opt,
+    events: Option<kvevents::KvEventTx>,
+    input_rx: mpsc::UnboundedReceiver<engine_core::EngineInput>,
+    output_tx: mpsc::UnboundedSender<engine_core::EngineOutput>,
+    shutdown: CancellationToken,
+    abort: CancellationToken,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    #[cfg(feature = "rust-core")]
+    if opt.use_rust_core {
+        return Ok(rust_core::spawn(
+            engine_index,
+            opt,
+            events,
+            input_rx,
+            output_tx,
+            shutdown,
+            abort,
+        ));
+    }
+    drop(abort);
+    let shutdown_timeout = std::time::Duration::from_secs(opt.shutdown_timeout);
+    let sim_engine = engine::SimEngine::new(engine_index, opt, events).await?;
+    Ok(tokio::spawn(engine_core::run_loop(
+        sim_engine,
+        input_rx,
+        output_tx,
+        shutdown,
+        shutdown_timeout,
+    )))
 }
 
 /// Materialize any `s3://` replay inputs (`--replay-tokens`, `--replay-steps`,
@@ -933,7 +1019,8 @@ pub async fn run_with_log_filter(
     // Validate the latency configuration (knob/trace conflict, trace parse) before any
     // transport setup, so a bad config fails immediately instead of after the 30s
     // frontend handshake timeout. Engines rebuild their own copy in SimEngine::new.
-    opt.build_latency()?;
+    let latency = opt.build_latency()?;
+    opt.validate_engine(latency.as_ref())?;
     // Refuse a trace captured under a different config before doing any work.
     opt.verify_config_hash()?;
 

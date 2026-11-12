@@ -155,6 +155,41 @@ pub fn pattern_for(request_id: &str) -> u8 {
         | 1
 }
 
+/// Fill byte for a KV block holding `tokens`. Both sides of a transfer derive it from
+/// the prompt, so blocks shared between requests carry the same bytes.
+pub fn block_pattern(tokens: &[u32]) -> u8 {
+    let hash = tokens
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &token| {
+            (hash ^ u64::from(token)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    (hash >> 56) as u8 | 1
+}
+
+/// Where a remote engine's KV pool is reached.
+#[derive(Debug, Clone)]
+pub struct RemotePool {
+    pub engine_id: String,
+    pub host: String,
+    pub port: u32,
+}
+
+/// One block to read from a remote pool into a local slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRead {
+    pub remote_block_id: i64,
+    pub local_block_id: usize,
+    /// The fill byte the block must carry (see [`block_pattern`]).
+    pub expected: u8,
+}
+
+/// One block to write from a local slot into a remote pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockWrite {
+    pub local_block_id: usize,
+    pub remote_block_id: i64,
+}
+
 /// The minimal view of a request the data plane needs, decoupled from the wire
 /// `EngineCoreRequest` so the protocol crate can evolve without touching this trait.
 #[derive(Debug, Clone, Copy)]
@@ -179,6 +214,53 @@ pub trait KvDataPlane: Send {
 
     /// Release any resources staged for a request (prefill dropping its KV buffer).
     fn release(&mut self, _request_id: &str) {}
+
+    /// Whether transfers move bytes between engines. When they do not, nothing reports
+    /// a remote read back to the engine that staged the blocks.
+    fn moves_bytes(&self) -> bool {
+        false
+    }
+
+    /// Write KV for `(block id, fill byte)` pairs into the local pool.
+    fn write_blocks(&mut self, _blocks: &[(usize, u8)]) {}
+
+    /// Read blocks from a remote pool, verify them, and tell the remote engine that
+    /// `notify` was read. Returns the number of bytes moved.
+    fn read_blocks(
+        &mut self,
+        _remote: &RemotePool,
+        _reads: &[BlockRead],
+        _notify: &str,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    /// Write local blocks into a remote pool and tell the remote engine `notify`
+    /// once they have landed. Returns the number of bytes moved.
+    fn push_blocks(
+        &mut self,
+        _remote: &RemotePool,
+        _writes: &[BlockWrite],
+        _notify: &str,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    /// Check that local `(block id, fill byte)` pairs hold the bytes a remote
+    /// engine was to write.
+    fn check_blocks(&self, _blocks: &[(usize, u8)]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Send a remote engine a message.
+    fn notify(&mut self, _remote: &RemotePool, _message: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Messages remote engines sent since the last call.
+    fn take_notifications(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Control-plane-only data plane: produces/consumes the real `kv_transfer_params`
@@ -275,6 +357,15 @@ mod tests {
     }
 
     #[test]
+    fn block_pattern_is_stable_nonzero_and_content_specific() {
+        assert_eq!(block_pattern(&[1, 2, 3]), block_pattern(&[1, 2, 3]));
+        assert_ne!(block_pattern(&[1, 2, 3]), block_pattern(&[3, 2, 1]));
+        for tokens in [&[][..], &[0], &[1, 2, 3], &[u32::MAX; 16]] {
+            assert_ne!(block_pattern(tokens), 0);
+        }
+    }
+
+    #[test]
     fn pattern_is_stable_nonzero_and_request_specific() {
         // Both sides derive the verify pattern from the request id, so it must be a pure,
         // stable function of the id, and never zero (zero would alias an unwritten slot).
@@ -292,11 +383,13 @@ mod nixl {
     use anyhow::{Result, anyhow, bail};
     use nixl_sys::{
         Agent, AgentConfig, Backend, MemType, MemoryRegion as _, NixlError, NixlRegistration as _,
-        OptArgs, SystemStorage, XferDescList, XferOp, is_stub,
+        NotificationMap, OptArgs, SystemStorage, XferDescList, XferOp, is_stub,
     };
     use tracing::debug;
 
-    use super::{KvDataPlane, NixlConfig, PdRole, RemoteKv, RequestKv};
+    use super::{
+        BlockRead, BlockWrite, KvDataPlane, NixlConfig, PdRole, RemoteKv, RemotePool, RequestKv,
+    };
 
     /// How long to poll a NIXL transfer before giving up.
     const XFER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -362,18 +455,17 @@ mod nixl {
                 // SAFETY: the pool's heap buffer address is stable for the agent's lifetime.
                 let pool_base = unsafe { pool.as_ptr() as u64 };
 
-                // The prefill is the metadata producer: serve our PoolDescriptor (agent md +
-                // pool base) over the side channel so decode peers can address + connect to us.
-                if matches!(role, PdRole::Prefill) {
-                    let descriptor = PoolDescriptor {
-                        engine_id: cfg.engine_id.clone(),
-                        nixl_agent_md: agent.get_local_md().map_err(ne)?,
-                        pool_base,
-                        block_bytes: cfg.kv_block_bytes as u64,
-                        num_blocks: cfg.kv_cache_blocks as u64,
-                    };
-                    serve_descriptor(cfg.side_channel_port, descriptor)?;
-                }
+                // Serve our PoolDescriptor (agent md + pool base) over the side channel so
+                // peers can address + connect to us: decode peers reading a prefill's pool,
+                // and prefill peers writing into a decode's pool in push mode.
+                let descriptor = PoolDescriptor {
+                    engine_id: cfg.engine_id.clone(),
+                    nixl_agent_md: agent.get_local_md().map_err(ne)?,
+                    pool_base,
+                    block_bytes: cfg.kv_block_bytes as u64,
+                    num_blocks: cfg.kv_cache_blocks as u64,
+                };
+                serve_descriptor(cfg.side_channel_port, descriptor)?;
             }
 
             debug!(
@@ -462,19 +554,45 @@ mod nixl {
             })
         }
 
-        /// Pull a remote prefill's KV: load the peer's metadata over the side channel (once),
-        /// then post a single multi-descriptor NIXL READ, one descriptor per advertised block,
-        /// gathering each remote slot (`pool_base + id*block_bytes`) into a contiguous local
-        /// landing buffer, and verify the per-request pattern. Decode and prefill are distinct
-        /// agents.
+        /// Pull a remote prefill's KV into this request's slots and verify the
+        /// per-request pattern.
         fn do_pull(&mut self, kv: RequestKv<'_>, remote: &RemoteKv) -> Result<u64> {
-            let n_blocks = remote.block_ids.len();
+            // Both sides derive the verify pattern from the prefill's request id; nothing about
+            // the bytes' identity travels on the wire.
+            let expected = pattern_for(&remote.request_id);
+            let reads: Vec<BlockRead> = remote
+                .block_ids
+                .iter()
+                .zip(kv.block_ids)
+                .map(|(&remote_block_id, &local_block_id)| BlockRead {
+                    remote_block_id,
+                    local_block_id,
+                    expected,
+                })
+                .collect();
+            let pool = RemotePool {
+                engine_id: remote.engine_id.clone(),
+                host: remote.host.clone(),
+                port: remote.port,
+            };
+            self.read(&pool, &reads, None)
+        }
+
+        /// Load the peer's metadata over the side channel (once), then post a single
+        /// multi-descriptor NIXL READ, one descriptor per block, gathering each remote slot
+        /// (`pool_base + id*block_bytes`) into a contiguous local landing buffer. Each landed
+        /// block is verified against its expected fill byte and copied into its local slot.
+        /// `notify` rides the READ, so the peer hears of it once the transfer completes.
+        fn read(
+            &mut self,
+            remote: &RemotePool,
+            reads: &[BlockRead],
+            notify: Option<&str>,
+        ) -> Result<u64> {
+            let n_blocks = reads.len();
             if n_blocks == 0 {
                 return Ok(0);
             }
-            // Both sides derive the verify pattern from the prefill's request id; nothing about
-            // the bytes' identity travels on the wire.
-            let pattern = pattern_for(&remote.request_id);
 
             let (peer_agent, pool_base, block_bytes) = {
                 let peer = self.ensure_peer(&remote.engine_id, &remote.host, remote.port)?;
@@ -491,8 +609,8 @@ mod nixl {
 
             // One remote descriptor per block, at its paged address in the prefill's pool.
             let mut remote_descs = XferDescList::new(MemType::Dram).map_err(ne)?;
-            for &block_id in &remote.block_ids {
-                let addr = pool_base as usize + block_id as usize * block_bytes;
+            for read in reads {
+                let addr = pool_base as usize + read.remote_block_id as usize * block_bytes;
                 remote_descs.add_desc(addr, block_bytes, 0);
             }
 
@@ -512,42 +630,136 @@ mod nixl {
                 local.add_desc(dst_base + j * block_bytes, block_bytes, 0);
             }
 
+            self.run_xfer(
+                XferOp::Read,
+                &local,
+                &remote_descs,
+                &peer_agent,
+                opt,
+                notify,
+            )?;
+
+            // Verify each landed block carries the expected pattern, and copy it into our own
+            // pool slot so a later request can prefix-hit it locally.
+            let landed: Vec<Option<u8>> = (0..n_blocks)
+                .map(|j| dst.as_slice().get(j * block_bytes).copied())
+                .collect();
+            for (j, (read, got)) in reads.iter().zip(landed).enumerate() {
+                if got != Some(read.expected) {
+                    bail!(
+                        "KV verify failed for block {j}: expected 0x{:02x}, got {got:?}",
+                        read.expected
+                    );
+                }
+                self.fill_slot(read.local_block_id, read.expected);
+            }
+            debug!(
+                bytes = total,
+                blocks = n_blocks,
+                engine_id = remote.engine_id,
+                "pulled + verified paged KV over NIXL"
+            );
+            Ok(total as u64)
+        }
+    }
+
+    impl NixlDataPlane {
+        /// Post one transfer and poll it to completion. `notify` rides the transfer, so
+        /// the peer hears of it once the bytes have moved.
+        fn run_xfer(
+            &self,
+            op: XferOp,
+            local: &XferDescList,
+            remote: &XferDescList,
+            peer_agent: &str,
+            mut opt: OptArgs,
+            notify: Option<&str>,
+        ) -> Result<()> {
+            if let Some(message) = notify {
+                opt.set_has_notification(true).map_err(ne)?;
+                opt.set_notification_message(message.as_bytes())
+                    .map_err(ne)?;
+            }
             let req = self
                 .agent
-                .create_xfer_req(XferOp::Read, &local, &remote_descs, &peer_agent, Some(&opt))
+                .create_xfer_req(op, local, remote, peer_agent, Some(&opt))
                 .map_err(ne)?;
             self.agent.post_xfer_req(&req, Some(&opt)).map_err(ne)?;
 
             let start = Instant::now();
             loop {
                 if self.agent.get_xfer_status(&req).map_err(ne)?.is_success() {
-                    break;
+                    return Ok(());
                 }
                 if start.elapsed() > XFER_TIMEOUT {
-                    bail!(
-                        "NIXL READ from {} timed out after {XFER_TIMEOUT:?}",
-                        remote.engine_id
-                    );
+                    bail!("NIXL transfer with {peer_agent} timed out after {XFER_TIMEOUT:?}");
                 }
                 std::thread::sleep(Duration::from_micros(200));
             }
+        }
 
-            // Verify each landed block carries the expected pattern, and copy it into our own
-            // pool slot so a later request can prefix-hit it locally.
-            let landed = dst.as_slice();
-            for (j, &local_id) in kv.block_ids.iter().take(n_blocks).enumerate() {
-                let got = landed.get(j * block_bytes).copied();
-                if got != Some(pattern) {
-                    bail!("KV verify failed for block {j}: expected 0x{pattern:02x}, got {got:?}");
-                }
-                self.fill_slot(local_id, pattern);
+        /// Write local pool slots straight into a peer's pool, one descriptor per block.
+        fn push(
+            &mut self,
+            remote: &RemotePool,
+            writes: &[BlockWrite],
+            notify: &str,
+        ) -> Result<u64> {
+            if writes.is_empty() {
+                return Ok(0);
             }
+            let (peer_agent, pool_base, block_bytes) = {
+                let peer = self.ensure_peer(&remote.engine_id, &remote.host, remote.port)?;
+                (
+                    peer.agent_name.clone(),
+                    peer.pool_base,
+                    peer.block_bytes as usize,
+                )
+            };
+            if block_bytes != self.cfg.kv_block_bytes {
+                bail!(
+                    "KV block size mismatch: local {} bytes, {} has {block_bytes}",
+                    self.cfg.kv_block_bytes,
+                    remote.engine_id
+                );
+            }
+            // SAFETY: the pool's heap buffer address is stable for the agent's lifetime.
+            let local_base = unsafe { self.pool.as_ptr() as usize };
+            let mut local = XferDescList::new(MemType::Dram).map_err(ne)?;
+            let mut remote_descs = XferDescList::new(MemType::Dram).map_err(ne)?;
+            for write in writes {
+                if write.local_block_id >= self.cfg.kv_cache_blocks {
+                    bail!(
+                        "local block {} is outside the KV pool",
+                        write.local_block_id
+                    );
+                }
+                local.add_desc(
+                    local_base + write.local_block_id * block_bytes,
+                    block_bytes,
+                    0,
+                );
+                remote_descs.add_desc(
+                    pool_base as usize + write.remote_block_id as usize * block_bytes,
+                    block_bytes,
+                    0,
+                );
+            }
+            let opt = self.opt_args()?;
+            self.run_xfer(
+                XferOp::Write,
+                &local,
+                &remote_descs,
+                &peer_agent,
+                opt,
+                Some(notify),
+            )?;
+            let total = writes.len() * block_bytes;
             debug!(
-                request_id = kv.request_id,
                 bytes = total,
-                blocks = n_blocks,
+                blocks = writes.len(),
                 engine_id = remote.engine_id,
-                "pulled + verified paged KV over NIXL"
+                "pushed paged KV over NIXL"
             );
             Ok(total as u64)
         }
@@ -571,6 +783,95 @@ mod nixl {
             // Block lifetime is the block pool's job now; the registered KV pool persists for
             // the agent's lifetime, so there is nothing per-request to free here.
             debug!(request_id, role = ?self.role, "release (paged pool persists)");
+        }
+
+        fn moves_bytes(&self) -> bool {
+            !is_stub()
+        }
+
+        fn write_blocks(&mut self, blocks: &[(usize, u8)]) {
+            for &(block_id, pattern) in blocks {
+                if block_id < self.cfg.kv_cache_blocks {
+                    self.fill_slot(block_id, pattern);
+                }
+            }
+        }
+
+        fn read_blocks(
+            &mut self,
+            remote: &RemotePool,
+            reads: &[BlockRead],
+            notify: &str,
+        ) -> Result<u64> {
+            if is_stub() {
+                return Ok(0);
+            }
+            self.read(remote, reads, Some(notify))
+        }
+
+        fn push_blocks(
+            &mut self,
+            remote: &RemotePool,
+            writes: &[BlockWrite],
+            notify: &str,
+        ) -> Result<u64> {
+            if is_stub() {
+                return Ok(0);
+            }
+            self.push(remote, writes, notify)
+        }
+
+        fn check_blocks(&self, blocks: &[(usize, u8)]) -> Result<()> {
+            if is_stub() {
+                return Ok(());
+            }
+            // SAFETY: the pool is a live allocation of `kv_cache_blocks * kv_block_bytes`
+            // bytes for the agent's lifetime, and slots outside it are rejected below.
+            let pool = unsafe {
+                std::slice::from_raw_parts(
+                    self.pool.as_ptr(),
+                    self.cfg.kv_cache_blocks.max(1) * self.cfg.kv_block_bytes,
+                )
+            };
+            for &(block_id, expected) in blocks {
+                let got = pool.get(block_id * self.cfg.kv_block_bytes).copied();
+                if got != Some(expected) {
+                    bail!(
+                        "KV verify failed for block {block_id}: expected 0x{expected:02x}, got {got:?}"
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        fn notify(&mut self, remote: &RemotePool, message: &str) -> Result<()> {
+            if is_stub() {
+                return Ok(());
+            }
+            let peer_agent = self
+                .ensure_peer(&remote.engine_id, &remote.host, remote.port)?
+                .agent_name
+                .clone();
+            self.agent
+                .send_notification(&peer_agent, message.as_bytes(), Some(&self.backend))
+                .map_err(ne)
+        }
+
+        fn take_notifications(&mut self) -> Vec<String> {
+            if is_stub() {
+                return Vec::new();
+            }
+            let taken = NotificationMap::new().and_then(|mut notifications| {
+                self.agent.get_notifications(&mut notifications, None)?;
+                notifications.take_notifs()
+            });
+            match taken {
+                Ok(by_agent) => by_agent.into_values().flatten().collect(),
+                Err(error) => {
+                    debug!(?error, "reading NIXL notifications failed");
+                    Vec::new()
+                }
+            }
         }
     }
 

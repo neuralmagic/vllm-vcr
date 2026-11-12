@@ -57,6 +57,13 @@ pub struct KvEventTx {
 }
 
 impl KvEventTx {
+    /// A sender whose batches land on the returned receiver instead of a socket.
+    #[cfg(all(test, feature = "rust-core"))]
+    pub(crate) fn channel() -> (Self, mpsc::Receiver<Vec<KvCacheEvent>>) {
+        let (tx, rx) = mpsc::channel(1024);
+        (KvEventTx { tx }, rx)
+    }
+
     /// Queue a batch of events for publishing. Non-blocking: like vLLM's high-water-mark
     /// behavior, a full queue drops the batch (with a warning) rather than stalling the
     /// engine loop. No-op for an empty batch.

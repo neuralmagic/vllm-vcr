@@ -12,6 +12,8 @@
 image := env_var_or_default("IMAGE", "ghcr.io/neuralmagic/vllm-vcr:dev")
 namespace := env_var_or_default("NAMESPACE", "inference-sim")
 deploy := "trace-capture-h200"
+# Cargo features built into the image, e.g. `FEATURES=nixl,rust-core just image-build`.
+features := env_var_or_default("FEATURES", "nixl")
 
 # List available recipes.
 default:
@@ -25,12 +27,19 @@ check:
     cargo clippy --workspace --benches --tests --examples --all-features
     cargo test --workspace
 
+# Test the `--use-rust-core` engine: its unit tests, then the end-to-end and tap
+# suites with the engine switched by env. The skipped test asserts behavior of the
+# built-in engine (KV pins held through emission lag).
+test-rust-core:
+    cargo test --features rust-core --lib rust_core
+    VLLM_USE_RUST_CORE=1 cargo test --features rust-core --test engine_core_e2e --test tap_e2e --test engine_synthetic_e2e -- --skip reset_prefix_cache_busy_vs_idle
+
 # --- capture image ----------------------------------------------------------------
 
 # Build the tap + vllm-rs image for the cluster (linux/amd64, slow under emulation).
 # Builds the compat.toml default line; use image-build-line for an older line.
 image-build:
-    podman build --platform linux/amd64 -t {{image}} .
+    podman build --platform linux/amd64 --build-arg VCR_FEATURES={{features}} -t {{image}} .
 
 # Build the capture image for a specific compat.toml line, e.g. `just image-build-line 0.22`.
 # Pins Cargo.toml/Cargo.lock to the line's rev/fork, stamps VLLM_TARGET_VERSION for build.rs,
@@ -46,6 +55,7 @@ image-build-line line:
         --build-arg VLLM_TARGET_VERSION="$TAG" \
         --build-arg VLLM_REPO="$FREPO" \
         --build-arg VLLM_REF="$FREF" \
+        --build-arg VCR_FEATURES={{features}} \
         -t {{image}}-vllm{{line}} .
 
 # Push the capture image.

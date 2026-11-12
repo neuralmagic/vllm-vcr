@@ -49,7 +49,7 @@ pub(crate) struct EngineOutput {
 }
 
 /// The contract an engine implementation must satisfy to plug into the generic loop.
-pub(crate) trait EngineCore: Send {
+pub(crate) trait EngineCore {
     /// Engine-internal completion events (e.g. finished KV pulls). Engines without
     /// internal events use () and hand back a channel that never fires.
     type Internal: Send + 'static;

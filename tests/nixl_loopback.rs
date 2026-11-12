@@ -9,7 +9,10 @@
 
 #![cfg(feature = "nixl")]
 
-use vllm_vcr::dataplane::{NixlConfig, PdRole, RequestKv, make_data_plane, nixl_is_stub};
+use vllm_vcr::dataplane::{
+    BlockRead, BlockWrite, NixlConfig, PdRole, RemotePool, RequestKv, block_pattern,
+    make_data_plane, nixl_is_stub,
+};
 
 fn cfg(engine_id: &str, port: u32) -> NixlConfig {
     NixlConfig {
@@ -66,4 +69,125 @@ fn loopback_paged_dram_transfer() {
         3 * 4096,
         "expected all three paged blocks to transfer"
     );
+}
+
+/// The path the scheduler-backed engine drives: the prefill writes content-derived
+/// bytes per block, the decode reads and verifies them block by block, and the
+/// prefill hears which request was read.
+#[test]
+fn loopback_read_verifies_each_block_and_notifies_the_prefill() {
+    if nixl_is_stub() {
+        eprintln!("skipping NIXL loopback: built against stub bindings (no real libnixl)");
+        return;
+    }
+
+    let mut prefill = make_data_plane(PdRole::Prefill, cfg("mock-prefill-b", 5610));
+    let mut decode = make_data_plane(PdRole::Decode, cfg("mock-decode-b", 5611));
+    assert!(prefill.moves_bytes());
+
+    let patterns = [block_pattern(&[1; 16]), block_pattern(&[2; 16])];
+    prefill.write_blocks(&[(4, patterns[0]), (11, patterns[1])]);
+
+    let pool = RemotePool {
+        engine_id: "mock-prefill-b".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: 5610,
+    };
+    let reads = [
+        BlockRead {
+            remote_block_id: 4,
+            local_block_id: 0,
+            expected: patterns[0],
+        },
+        BlockRead {
+            remote_block_id: 11,
+            local_block_id: 1,
+            expected: patterns[1],
+        },
+    ];
+    let bytes = decode
+        .read_blocks(&pool, &reads, "req-loopback-2")
+        .expect("decode should read and verify both blocks");
+    assert_eq!(bytes, 2 * 4096);
+
+    let swapped = [
+        BlockRead {
+            expected: patterns[1],
+            ..reads[0]
+        },
+        reads[1],
+    ];
+    assert!(
+        decode
+            .read_blocks(&pool, &swapped, "req-loopback-3")
+            .is_err(),
+        "a block carrying the wrong bytes must fail verification"
+    );
+
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut notified = Vec::new();
+    while !notified.contains(&"req-loopback-2".to_string()) {
+        assert!(
+            std::time::Instant::now() < give_up,
+            "prefill was never notified"
+        );
+        notified.extend(prefill.take_notifications());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Push mode: the prefill writes its blocks straight into the decode's pool, the
+/// decode hears which request landed, and the bytes check out block by block.
+#[test]
+fn loopback_push_writes_into_the_decode_pool_and_notifies_it() {
+    if nixl_is_stub() {
+        eprintln!("skipping NIXL loopback: built against stub bindings (no real libnixl)");
+        return;
+    }
+
+    let mut prefill = make_data_plane(PdRole::Prefill, cfg("mock-prefill-c", 5620));
+    let mut decode = make_data_plane(PdRole::Decode, cfg("mock-decode-c", 5621));
+
+    let patterns = [block_pattern(&[3; 16]), block_pattern(&[4; 16])];
+    prefill.write_blocks(&[(6, patterns[0]), (7, patterns[1])]);
+    assert!(
+        decode
+            .check_blocks(&[(1, patterns[0]), (2, patterns[1])])
+            .is_err(),
+        "the decode pool must not hold the bytes before the push"
+    );
+
+    let pool = RemotePool {
+        engine_id: "mock-decode-c".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: 5621,
+    };
+    let writes = [
+        BlockWrite {
+            local_block_id: 6,
+            remote_block_id: 1,
+        },
+        BlockWrite {
+            local_block_id: 7,
+            remote_block_id: 2,
+        },
+    ];
+    let bytes = prefill
+        .push_blocks(&pool, &writes, "req-loopback-4:1")
+        .expect("prefill should write both blocks into the decode pool");
+    assert_eq!(bytes, 2 * 4096);
+
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut notified = Vec::new();
+    while !notified.contains(&"req-loopback-4:1".to_string()) {
+        assert!(
+            std::time::Instant::now() < give_up,
+            "decode was never notified"
+        );
+        notified.extend(decode.take_notifications());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    decode
+        .check_blocks(&[(1, patterns[0]), (2, patterns[1])])
+        .expect("the pushed blocks carry the prefill's bytes");
 }
