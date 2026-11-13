@@ -1,0 +1,89 @@
+# P/D KV transfer capture: a prefill and a decode vLLM on one GPU, joined by the
+# NIXL connector, both running vcr_step_recorder.py. No tap and no frontend:
+# deploy/trace-capture/pd_kv_drive.py runs inside the pod and plays the P/D
+# proxy. Writes /trace/{prefill,decode}-steps.jsonl. See `just capture-kv-up`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pd-kv-capture
+  labels:
+    llm-d.ai/guide: pd-kv-capture
+    llm-d.ai/model: Qwen3-8B
+    llm-d.ai/rig: pd-kv
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      llm-d.ai/guide: pd-kv-capture
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        llm-d.ai/guide: pd-kv-capture
+        llm-d.ai/model: Qwen3-8B
+    spec:
+      containers:
+        - name: engines
+          image: vllm/vllm-openai:v0.33.0
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              healthy() {
+                python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:$1/health', timeout=2)" 2>/dev/null
+              }
+              serve() {
+                role=$1 port=$2 side=$3 internal=$4 config=$5
+                VLLM_PORT=$internal VLLM_NIXL_SIDE_CHANNEL_PORT=$side \
+                VCR_STEP_TRACE_OUT=/trace/$role-steps.jsonl \
+                  vllm serve Qwen/Qwen3-8B --port "$port" \
+                    --gpu-memory-utilization 0.40 --max-model-len 16384 --enforce-eager \
+                    --kv-transfer-config "$config" \
+                    --scheduler-cls vcr_step_recorder.recording_scheduler \
+                    > /trace/$role.log 2>&1 &
+              }
+              serve prefill 8100 5601 20000 \
+                '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_connector_extra_config":{"kv_lease_duration":12}}'
+              until healthy 8100; do sleep 2; done
+              serve decode 8200 5602 30000 \
+                '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"recompute"}'
+              wait
+          env:
+            - { name: HF_HUB_CACHE, value: /models }
+            - { name: HF_HUB_DISABLE_XET, value: "1" }
+            - { name: UCX_NET_DEVICES, value: all }
+            - { name: PYTHONPATH, value: /opt/vcr }
+          readinessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - |
+                  import urllib.request
+                  for port in (8100, 8200):
+                      urllib.request.urlopen(f"http://localhost:{port}/health", timeout=2)
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: 96Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - { mountPath: /dev/shm, name: shm }
+            - { mountPath: /models, name: model-cache }
+            - { mountPath: /trace, name: trace }
+            - { mountPath: /opt/vcr, name: vcr-pd-kv-capture, readOnly: true }
+      volumes:
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }
+        - name: model-cache
+          emptyDir: { sizeLimit: 100Gi }
+        - name: trace
+          emptyDir: {}
+        - name: vcr-pd-kv-capture
+          configMap: { name: vcr-pd-kv-capture }

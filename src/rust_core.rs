@@ -1982,6 +1982,99 @@ mod tests {
         assert!(prefill.num_external_cached_tokens > 0);
     }
 
+    /// Replays the remote KV loads of an engine-step trace captured from a vLLM
+    /// decode engine (`VCR_STEP_TRACE`, e.g. the `decode-steps.jsonl` that
+    /// `just capture-kv-run` fetches) and records them again. Every replayed
+    /// load must take the time and outcome of a captured load of its size. Run
+    /// it through `just replay-kv-capture <trace>`. With `VCR_REPLAY_OUT` set to
+    /// a directory, the replay's step trace is kept there as `replay-kv.jsonl`.
+    #[test]
+    #[ignore = "needs VCR_STEP_TRACE, an engine-step trace captured from a vLLM decode engine"]
+    fn a_captured_step_trace_replays_its_kv_loads() {
+        const LOADS_PER_SIZE: usize = 32;
+        let source = std::env::var("VCR_STEP_TRACE").expect("VCR_STEP_TRACE names a step trace");
+        let captured = read_step_trace_file(std::path::Path::new(&source)).unwrap();
+        let mut by_blocks: std::collections::BTreeMap<u32, Vec<&KvTransferRecord>> =
+            std::collections::BTreeMap::new();
+        for load in &captured.kv_transfers {
+            if load.direction == KvDirection::Recv {
+                by_blocks.entry(load.blocks).or_default().push(load);
+            }
+        }
+        assert!(!by_blocks.is_empty(), "the capture has no remote loads");
+
+        let path = temp_path("kv-capture-replay");
+        let mut opt = test_opt();
+        opt.pd_role = PdRole::Decode;
+        opt.step_trace_out = Some(path.clone());
+        let mut engine = engine_with_costs(opt, &captured.steps, &captured.kv_transfers);
+        let mut seed = 0;
+        for &blocks in by_blocks.keys() {
+            for _ in 0..LOADS_PER_SIZE {
+                seed += 1;
+                let tokens = prompt(seed, blocks as usize * 16);
+                let params = prefill(tokens.clone());
+                add(
+                    &mut engine,
+                    kv_request(&format!("d-{seed}"), tokens, 1, params),
+                );
+                run_to_idle(&mut engine);
+            }
+        }
+        drop(engine);
+
+        let replayed = read_step_trace_file(&path).unwrap();
+        if let Ok(keep) = std::env::var("VCR_REPLAY_OUT") {
+            std::fs::copy(&path, std::path::Path::new(&keep).join("replay-kv.jsonl")).unwrap();
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            replayed.kv_transfers.len(),
+            by_blocks.len() * LOADS_PER_SIZE
+        );
+        for load in &replayed.kv_transfers {
+            let matches_a_capture = by_blocks[&load.blocks].iter().any(|recorded| {
+                recorded.outcome == load.outcome
+                    && (-1.0..=5.0).contains(&(load.wall_ms - recorded.wall_ms))
+            });
+            assert!(
+                matches_a_capture,
+                "{} blocks, {:?}: no captured load took the replayed {:.2}ms",
+                load.blocks, load.outcome, load.wall_ms
+            );
+        }
+        for (blocks, recorded) in &by_blocks {
+            let outcomes = |loads: &mut dyn Iterator<Item = &KvTransferRecord>| {
+                let mut outcomes: Vec<String> =
+                    loads.map(|load| format!("{:?}", load.outcome)).collect();
+                outcomes.sort();
+                outcomes.dedup();
+                outcomes
+            };
+            let replayed_loads: Vec<&KvTransferRecord> = replayed
+                .kv_transfers
+                .iter()
+                .filter(|load| load.blocks == *blocks)
+                .collect();
+            assert_eq!(
+                outcomes(&mut replayed_loads.iter().copied()),
+                outcomes(&mut recorded.iter().copied()),
+                "outcomes of {blocks}-block loads"
+            );
+            let mut walls: Vec<f64> = replayed_loads.iter().map(|load| load.wall_ms).collect();
+            walls.sort_by(f64::total_cmp);
+            println!(
+                "{blocks} blocks: {} replayed loads, median {:.2}ms, {} not ok",
+                walls.len(),
+                walls[walls.len() / 2],
+                replayed_loads
+                    .iter()
+                    .filter(|load| load.outcome != KvOutcome::Ok)
+                    .count()
+            );
+        }
+    }
+
     #[test]
     fn a_recorded_load_failure_is_replayed_recomputed_and_recorded_again() {
         let path = temp_path("kv-failure");

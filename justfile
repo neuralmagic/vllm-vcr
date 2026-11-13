@@ -54,6 +54,13 @@ replay-step-capture trace:
     VCR_STEP_TRACE={{trace}} cargo test --features rust-core --test rust_core_round_trip \
       a_captured_step_trace_replays_its_step_times -- --ignored --nocapture
 
+# Replay the remote KV loads of a decode engine's step trace (the decode-steps.jsonl
+# that `just capture-kv-run` fetches) and check each replayed load against the
+# captured loads of its size.
+replay-kv-capture trace:
+    VCR_STEP_TRACE={{trace}} cargo test --features rust-core --lib \
+      a_captured_step_trace_replays_its_kv_loads -- --ignored --nocapture
+
 # --- capture image ----------------------------------------------------------------
 
 # Build the tap + vllm-rs image for the cluster (linux/amd64, slow under emulation).
@@ -121,6 +128,39 @@ capture-steps-on:
       kubectl patch --local -f - --type=json \
         --patch-file deploy/trace-capture/step-recorder-patch.yaml -o yaml | \
       kubectl apply -f -
+
+# Schedule a prefill and a decode vLLM on one GPU, joined by the NIXL connector, both
+# running the step recorder (deploy/trace-capture/base/pd-kv-capture.yaml).
+capture-kv-up:
+    kubectl -n {{namespace}} create configmap vcr-pd-kv-capture \
+      --from-file=deploy/trace-capture/vcr_step_recorder.py \
+      --from-file=deploy/trace-capture/pd_kv_drive.py --dry-run=client -o yaml | \
+      kubectl apply -f -
+    just _apply-rig pd-kv
+    kubectl -n {{namespace}} scale deploy pd-kv-capture --replicas=1
+
+# Drive P/D requests from inside the pod (deploy/trace-capture/pd_kv_drive.py), then
+# fetch both engines' step traces, the per-request results and /metrics snapshots.
+capture-kv-run out="/tmp/pd-kv-capture":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "{{out}}"
+    kubectl -n {{namespace}} exec deploy/pd-kv-capture -- python3 /opt/vcr/pd_kv_drive.py
+    for file in prefill-steps.jsonl decode-steps.jsonl pd-results.json \
+        metrics-prefill-before.txt metrics-prefill-after.txt \
+        metrics-decode-before.txt metrics-decode-after.txt prefill.log decode.log; do
+      kubectl -n {{namespace}} exec deploy/pd-kv-capture -- cat "/trace/$file" > "{{out}}/$file"
+    done
+    wc -l "{{out}}"/*.jsonl
+
+# Compare the KV transfer records of a P/D capture with the driver's results and
+# vLLM's own NIXL metrics.
+check-kv-capture dir="/tmp/pd-kv-capture":
+    python3 deploy/trace-capture/check_pd_kv_capture.py {{dir}}
+
+# Scale the P/D KV capture pod down.
+capture-kv-down:
+    kubectl -n {{namespace}} scale deploy pd-kv-capture --replicas=0
 
 # Fetch the tap trace without running load (e.g. mid-capture peek).
 capture-fetch out="/tmp/tap-trace.jsonl":

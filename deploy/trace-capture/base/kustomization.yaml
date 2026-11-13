@@ -5,6 +5,7 @@ kind: Kustomization
 resources:
   - h200-capture.yaml
   - h200-capture-agentic.yaml
+  - pd-kv-capture.yaml
   - offline-replay.yaml
   - conformance-queue.yaml
   - gemma3-capture.yaml
