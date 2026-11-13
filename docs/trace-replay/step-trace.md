@@ -34,7 +34,8 @@ One line per executed step:
 One line per KV transfer: `direction` (`recv` or `send`), `blocks`, `start_step`,
 `end_step`, `wall_ms`, and `outcome` (`ok`, `failed`, `invalid_blocks`). A transfer
 starts in the step whose connector metadata names it and ends in the step whose
-connector output reports it. NIXL's own per-transfer telemetry (bytes, post and
+connector output reports it. A send whose lease expired is recorded as an `ok`
+send that lasted the lease. NIXL's own per-transfer telemetry (bytes, post and
 transfer duration) is in the tap's `--step-stats-out` sidecar, under
 `scheduler.kv_connector_stats`.
 
@@ -118,5 +119,8 @@ output lengths still come from `--latency-trace` and the `--replay-*` flags.
 simulated run.
 
 `just replay-step-capture <engine-steps.jsonl>` replays a capture and compares
-the median step gap with the median recorded step time at decode concurrency 1
-and 16.
+the decode-only step gaps with the decode-only step times recorded at decode
+concurrency 1 and 16. `just replay-kv-capture <decode-steps.jsonl>` replays the remote KV loads
+of a decode engine's capture and checks each against the captured loads of its
+size. `just capture-kv-up` and `just capture-kv-run` take such a capture from a
+prefill/decode pair on one GPU.
