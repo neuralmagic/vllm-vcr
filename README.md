@@ -74,7 +74,8 @@ Measured on one H200 with vLLM v0.33.0 and Qwen3-8B (2026-11-12):
 - Against the tap-trace replay on the built-in engine, same capture and
   schedule: worst ITL quantile error 0.9% instead of 51.7%, worst request decode
   time error 1.6% instead of 15.0%. TTFT under load is 14 ms short (28.6 ms
-  against 42.9 ms), about one step, because the capture ran async scheduling.
+  against 42.9 ms), about one step, because the capture ran async scheduling;
+  on a capture taken with `--no-async-scheduling` it is 40.7 ms against 38.1 ms.
 - KV transfers on a prefill/decode pair joined by NIXL (`just capture-kv-up`):
   the trace has 104 completed and 6 failed loads where vLLM's metrics count 104
   and 6, and the same 20,864 blocks the prefill handed over. Replayed loads take

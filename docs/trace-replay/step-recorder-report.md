@@ -152,8 +152,27 @@ load does not: 28.6 ms at p50 where the capture has 42.9 ms, 14.3 ms short, whic
 is about one step (13.2 ms). The capture ran async scheduling, where vLLM
 schedules a step before the one before it has finished, so a new arrival waits a
 step longer. The simulator schedules each step after the previous one
-completes. That explanation fits the numbers and has not been tested; the Rust
-scheduler has an `async_scheduling` setting the simulator does not use yet.
+completes; the Rust scheduler has an `async_scheduling` setting the simulator
+does not use yet.
+
+A capture taken with `--no-async-scheduling` bears that out. It is the 45 s
+run at concurrency 16 from the draft-count check (873 requests, 865 of them at
+concurrency 9 to 16), replayed the same two ways:
+
+| Concurrency 9 to 16 | Captured | Tap trace + built-in engine | Step trace + vLLM scheduler |
+| --- | --- | --- | --- |
+| Async capture, TTFT p50 / p90 (ms), 2988 requests | 42.9 / 71.5 | 51.1 / 115.3 | 28.6 / 53.3 |
+| Sync capture, TTFT p50 / p90 (ms), 865 requests | 38.1 / 63.4 | 52.0 / 78.2 | 40.7 / 73.9 |
+| Sync capture, ITL p50 / p90 / p99 (ms) | 13.04 / 23.92 / 54.72 | 12.88 / 14.58 / 25.47 | 13.30 / 24.50 / 56.32 |
+| Sync capture, request decode time p50 / p90 (ms), all 873 | 603 / 796 | 470 / 634 | 619 / 802 |
+
+With sync scheduling on both sides the step-trace replay's TTFT under load is
+2.6 ms above the capture at p50, where it was 14.3 ms below on the async
+capture. This capture starts cold, so its first 16 requests waited on steps of
+3,626 and 2,656 ms. Those two steps are removed from the step trace, and those
+16 requests from the tap trace the built-in engine's model is fitted on; the
+capture's own p99s still contain them, so only p50 and p90 are compared for
+TTFT and request decode time.
 
 The step-trace numbers have one record removed: the engine's first step, which
 took 4,079 ms. Left in, a replay can draw it for any 795-token prefill on an idle
@@ -245,9 +264,10 @@ handshakes.
   size. It does not compare distributions, and it prices by block count alone.
 - The replay check compares decode-only steps at two concurrencies, not mixed
   prefill and decode steps, and only its median is asserted.
-- The comparison with the tap-trace approach is one capture and one replay of
-  each kind, both fitted on the capture they replay, on a laptop. It says
-  nothing yet about replaying a workload other than the one captured.
+- The comparison with the tap-trace approach is two captures and one replay of
+  each kind per capture, each fitted on the capture it replays, on a laptop. It
+  says nothing yet about replaying a workload other than the one captured. The
+  sync-scheduling capture is 45 s at one concurrency.
 
 ## Reproducing
 
