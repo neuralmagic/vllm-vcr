@@ -50,6 +50,10 @@ allow = ["MPL-2.0"]
 name = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
 
+[[licenses.exceptions]]
+name = "xxhash-rust"
+allow = ["BSL-1.0"]
+
 [bans]
 # Duplicate versions are a warning, not a gate (the AWS SDK + git deps pull a
 # wide graph; surfacing dupes without blocking).

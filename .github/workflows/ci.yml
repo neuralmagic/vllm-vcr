@@ -80,6 +80,25 @@ jobs:
       - name: Check (nixl-stub)
         run: cargo check --all-targets --locked --features nixl-stub
 
+      # The `--use-rust-core` engine: its own unit tests, then the end-to-end, tap and
+      # trace-replay suites with the engine switched by env. The skipped test asserts
+      # the built-in engine's behavior (KV pins held through emission lag).
+      - name: Clippy (rust-core)
+        run: cargo clippy --all-targets --locked --no-deps --features rust-core -- -D warnings
+
+      - name: Test (rust-core)
+        run: cargo test --locked --features rust-core --lib rust_core
+
+      - name: End-to-end (rust-core)
+        run: >-
+          cargo test --locked --features rust-core
+          --test engine_core_e2e --test tap_e2e --test engine_synthetic_e2e
+          --test spec_replay_fidelity --test diffusion_replay_demo
+          --test trace_validation_ci --test rust_core_round_trip
+          -- --skip reset_prefix_cache_busy_vs_idle
+        env:
+          VLLM_USE_RUST_CORE: "1"
+
   # Synthetic E2E engine tests - validates engine behavior against programmatically
   # generated traces covering all schema variants and edge cases. Fast (no real GPU
   # captures), deterministic (seeded RNG), parallel-safe (unique IPC per test).

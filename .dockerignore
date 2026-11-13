@@ -3,3 +3,4 @@
 /deploy
 *.md
 /target-linux
+/.claude

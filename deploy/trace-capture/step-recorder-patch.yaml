@@ -1,0 +1,24 @@
+# JSON patch: run the trace-capture-h200 engine with vcr_step_recorder.py, writing
+# /trace/engine-steps.jsonl. `just capture-steps-on` patches the rendered manifest
+# with it and applies the result; `just capture-up` applies the manifest without it.
+# containers/0 is the engine container.
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: vcr-step-recorder
+    configMap: { name: vcr-step-recorder }
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value: { mountPath: /opt/vcr, name: vcr-step-recorder, readOnly: true }
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value: { mountPath: /trace, name: trace }
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value: { name: PYTHONPATH, value: /opt/vcr }
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value: { name: VCR_STEP_TRACE_OUT, value: /trace/engine-steps.jsonl }
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --scheduler-cls=vcr_step_recorder.recording_scheduler

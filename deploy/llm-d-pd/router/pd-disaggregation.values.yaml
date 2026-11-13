@@ -1,5 +1,7 @@
-# P/D routing: EPP plugins split prefill vs decode; InferencePool selects mock pods.
-# matchLabels: llm-d.ai/guide=pd-disaggregation
+# Vendored from llm-d v1.0.0 (guides/pd-disaggregation/router/pd-disaggregation.values.yaml).
+# P/D routing: the EPP always disaggregates, filters prefill vs decode pods by role,
+# keeps prefix groups on cache-warm prefill pods, and picks decode pods by load.
+# The InferencePool selects pods labeled llm-d.ai/guide=pd-disaggregation.
 router:
   extraServicePorts:
     - name: http
@@ -8,41 +10,47 @@ router:
       targetPort: 8081
 
   epp:
+    # Single EPP replica: the inflight-load-producer's in-flight token accounting
+    # (which the token-load-scorer and affinity filter consume) is local to each
+    # EPP process.
+    replicas: 1
     pluginsConfigFile: "pd-config.yaml"
-    # P/D decider, prefill/decode filters, prefix-cache + queue scorers.
     pluginsCustomConfig:
       pd-config.yaml: |
-        apiVersion: llm-d.ai/v1alpha1
+        apiVersion: llm-d.ai/v1
         kind: EndpointPickerConfig
         plugins:
-        - type: disagg-headers-handler
         - type: always-disagg-pd-decider
         - type: disagg-profile-handler
           parameters:
-            deciderPluginName: always-disagg-pd-decider
+            deciders:
+              prefill: always-disagg-pd-decider
         - type: prefill-filter
         - type: decode-filter
-        - type: prefix-cache-scorer
-        - type: queue-scorer
-        - type: kv-cache-utilization-scorer
+        - type: approx-prefix-cache-producer
+          parameters:
+            maxPrefixTokensToMatch: 131072
+        - type: inflight-load-producer
+        - type: prefix-cache-affinity-filter
+          parameters:
+            # Upstream's value, measured on its gpt-oss-120b H200 fleet. It is the
+            # prefill throughput above which the affinity filter stops pinning.
+            peakPrefillThroughput: 33821
+        - type: token-load-scorer
         - type: active-request-scorer
+        - type: max-score-picker
         schedulingProfiles:
         - name: prefill
           plugins:
           - pluginRef: prefill-filter
-          - pluginRef: prefix-cache-scorer
-            weight: 3
-          - pluginRef: queue-scorer
-            weight: 2
-          - pluginRef: kv-cache-utilization-scorer
-            weight: 2
+          - pluginRef: prefix-cache-affinity-filter
+          - pluginRef: token-load-scorer
+          - pluginRef: max-score-picker
         - name: decode
           plugins:
           - pluginRef: decode-filter
           - pluginRef: active-request-scorer
-            weight: 2
-          - pluginRef: prefix-cache-scorer
-            weight: 3
+          - pluginRef: max-score-picker
 
   modelServers:
     matchLabels:

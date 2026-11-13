@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use anyhow::{Result, anyhow};
 use serde_tuple::Serialize_tuple;
 use sim_protocol::vllm::EngineCoreRequest;
+use tracing::info;
 
 /// The lora identity (name + int id) the engine needs, off an `add_lora` utility
 /// call. Our own subset of the wire's `LoraRequest`, read the same way at every
@@ -97,6 +98,34 @@ impl LoraRegistry {
     /// `remove_lora` (the frontend treats `false` as "adapter was not loaded").
     pub(crate) fn remove(&mut self, lora_int_id: u64) -> bool {
         self.loaded.remove(&lora_int_id).is_some()
+    }
+
+    /// Answer an `add_lora` / `remove_lora` utility call, or `None` for any other method.
+    /// The frontend encodes both methods' args as a one-element tuple: `(LoraRequest,)`
+    /// for `add_lora`, `(lora_int_id,)` for `remove_lora`.
+    pub(crate) fn handle_utility(
+        &mut self,
+        method: &str,
+        args: &rmpv::Value,
+    ) -> Result<Option<bool>> {
+        match method {
+            "add_lora" => {
+                let (lora_value,): (rmpv::Value,) = rmpv::ext::from_value(args.clone())
+                    .map_err(|error| anyhow!("decoding add_lora args tuple: {error}"))?;
+                let lora = LoraSpec::from_wire(&lora_value)
+                    .map_err(|error| anyhow!("decoding add_lora lora_request: {error}"))?;
+                info!(lora = %lora.lora_name, id = lora.lora_int_id, "add_lora");
+                Ok(Some(self.add(lora)))
+            }
+            "remove_lora" => {
+                let (lora_int_id,): (u64,) = rmpv::ext::from_value(args.clone())
+                    .map_err(|error| anyhow!("decoding remove_lora args: {error}"))?;
+                let ok = self.remove(lora_int_id);
+                info!(id = lora_int_id, ok, "remove_lora");
+                Ok(Some(ok))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Whether a request needing adapter `lora_name` can join a running batch that currently

@@ -5,8 +5,8 @@ releases:
   # llm-d Router (EPP + Envoy); selects pods labeled pd-disaggregation.
   - name: pd-disaggregation
     namespace: llm-d-pd-mock
-    chart: oci://ghcr.io/llm-d/charts/llm-d-router-standalone-dev
-    version: v0
+    chart: oci://ghcr.io/llm-d/charts/llm-d-router-standalone
+    version: v1.0.0
     values:
       - router/base.values.yaml
       - router/pd-disaggregation.values.yaml

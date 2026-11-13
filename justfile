@@ -4,6 +4,7 @@
 #   just image-build && just image-push     # tap/frontend image (linux/amd64)
 #   just capture-up                         # schedule the rig on the cluster
 #   just capture-status                     # wait for "forwarding frames"
+#   just capture-steps-on                   # optional: also record engine steps
 #   just capture-run                        # drive load, fetch trace + reports
 #   just capture-down                       # release the GPU
 #   just calibrate /tmp/trace-capture-h200/tap-trace.jsonl
@@ -12,6 +13,8 @@
 image := env_var_or_default("IMAGE", "ghcr.io/neuralmagic/vllm-vcr:dev")
 namespace := env_var_or_default("NAMESPACE", "inference-sim")
 deploy := "trace-capture-h200"
+# Cargo features built into the image, e.g. `FEATURES=nixl,rust-core just image-build`.
+features := env_var_or_default("FEATURES", "nixl")
 
 # List available recipes.
 default:
@@ -25,12 +28,45 @@ check:
     cargo clippy --workspace --benches --tests --examples --all-features
     cargo test --workspace
 
+# Test the `--use-rust-core` engine: its unit tests, then the end-to-end, tap and
+# trace-replay suites with the engine switched by env. The skipped test asserts
+# behavior of the built-in engine (KV pins held through emission lag).
+test-rust-core:
+    cargo test --features rust-core --lib rust_core
+    VLLM_USE_RUST_CORE=1 cargo test --features rust-core --test engine_core_e2e --test tap_e2e --test engine_synthetic_e2e --test spec_replay_fidelity --test diffusion_replay_demo --test trace_validation_ci --test rust_core_round_trip -- --skip reset_prefix_cache_busy_vs_idle
+
+# Check deploy/trace-capture/vcr_step_recorder.py against the real scheduler of a
+# vLLM source checkout (no GPU): an exact-trace scenario, vLLM's differential
+# scheduler fuzz with the recorder attached, and the recorder's engine-thread
+# overhead. Rewrites tests/fixtures/engine_steps_vllm.jsonl. Off a GPU box the
+# CPU platform is used, which cannot build speculative-decoding configs.
+check-step-recorder vllm_src:
+    PYTHONPATH={{vllm_src}} PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 VLLM_TARGET_DEVICE=${VLLM_TARGET_DEVICE:-cpu} \
+      uv run --no-project --python 3.12 --with torch \
+      --with-requirements {{vllm_src}}/requirements/common.txt \
+      deploy/trace-capture/check_step_recorder.py --vllm-src {{vllm_src}} \
+      --write-fixture tests/fixtures/engine_steps_vllm.jsonl
+
+# Replay an engine-step trace captured from vLLM (the engine-steps.jsonl that
+# `just capture-run` fetches) on the `--use-rust-core` engine and compare the step
+# gaps with the recorded step times at decode concurrency 1 and 16.
+replay-step-capture trace:
+    VCR_STEP_TRACE={{trace}} cargo test --features rust-core --test rust_core_round_trip \
+      a_captured_step_trace_replays_its_step_times -- --ignored --nocapture
+
+# Replay the remote KV loads of a decode engine's step trace (the decode-steps.jsonl
+# that `just capture-kv-run` fetches) and check each replayed load against the
+# captured loads of its size.
+replay-kv-capture trace:
+    VCR_STEP_TRACE={{trace}} cargo test --features rust-core --lib \
+      a_captured_step_trace_replays_its_kv_loads -- --ignored --nocapture
+
 # --- capture image ----------------------------------------------------------------
 
 # Build the tap + vllm-rs image for the cluster (linux/amd64, slow under emulation).
 # Builds the compat.toml default line; use image-build-line for an older line.
 image-build:
-    podman build --platform linux/amd64 -t {{image}} .
+    podman build --platform linux/amd64 --build-arg VCR_FEATURES={{features}} -t {{image}} .
 
 # Build the capture image for a specific compat.toml line, e.g. `just image-build-line 0.22`.
 # Pins Cargo.toml/Cargo.lock to the line's rev/fork, stamps VLLM_TARGET_VERSION for build.rs,
@@ -46,6 +82,7 @@ image-build-line line:
         --build-arg VLLM_TARGET_VERSION="$TAG" \
         --build-arg VLLM_REPO="$FREPO" \
         --build-arg VLLM_REF="$FREF" \
+        --build-arg VCR_FEATURES={{features}} \
         -t {{image}}-vllm{{line}} .
 
 # Push the capture image.
@@ -78,6 +115,52 @@ capture-status:
 # Drive the benchmark load and fetch the tap trace + client-side reports.
 capture-run:
     bash deploy/trace-capture/run-capture.sh
+
+# Record engine steps and KV transfers at the model runner boundary on the next
+# capture (deploy/trace-capture/vcr_step_recorder.py). Restarts the engine pod.
+# `just capture-up` turns it off again. See docs/trace-replay/step-trace.md.
+capture-steps-on:
+    kubectl -n {{namespace}} create configmap vcr-step-recorder \
+      --from-file=deploy/trace-capture/vcr_step_recorder.py --dry-run=client -o yaml | \
+      kubectl apply -f -
+    kustomize build deploy/trace-capture/overlays/{{namespace}} | \
+      yq 'select(.metadata.labels["llm-d.ai/rig"] == "h200")' | \
+      kubectl patch --local -f - --type=json \
+        --patch-file deploy/trace-capture/step-recorder-patch.yaml -o yaml | \
+      kubectl apply -f -
+
+# Schedule a prefill and a decode vLLM on one GPU, joined by the NIXL connector, both
+# running the step recorder (deploy/trace-capture/base/pd-kv-capture.yaml).
+capture-kv-up:
+    kubectl -n {{namespace}} create configmap vcr-pd-kv-capture \
+      --from-file=deploy/trace-capture/vcr_step_recorder.py \
+      --from-file=deploy/trace-capture/pd_kv_drive.py --dry-run=client -o yaml | \
+      kubectl apply -f -
+    just _apply-rig pd-kv
+    kubectl -n {{namespace}} scale deploy pd-kv-capture --replicas=1
+
+# Drive P/D requests from inside the pod (deploy/trace-capture/pd_kv_drive.py), then
+# fetch both engines' step traces, the per-request results and /metrics snapshots.
+capture-kv-run out="/tmp/pd-kv-capture":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "{{out}}"
+    kubectl -n {{namespace}} exec deploy/pd-kv-capture -- python3 /opt/vcr/pd_kv_drive.py
+    for file in prefill-steps.jsonl decode-steps.jsonl pd-results.json \
+        metrics-prefill-before.txt metrics-prefill-after.txt \
+        metrics-decode-before.txt metrics-decode-after.txt prefill.log decode.log; do
+      kubectl -n {{namespace}} exec deploy/pd-kv-capture -- cat "/trace/$file" > "{{out}}/$file"
+    done
+    wc -l "{{out}}"/*.jsonl
+
+# Compare the KV transfer records of a P/D capture with the driver's results and
+# vLLM's own NIXL metrics.
+check-kv-capture dir="/tmp/pd-kv-capture":
+    python3 deploy/trace-capture/check_pd_kv_capture.py {{dir}}
+
+# Scale the P/D KV capture pod down.
+capture-kv-down:
+    kubectl -n {{namespace}} scale deploy pd-kv-capture --replicas=0
 
 # Fetch the tap trace without running load (e.g. mid-capture peek).
 capture-fetch out="/tmp/tap-trace.jsonl":

@@ -46,6 +46,47 @@ vllm-vcr play --handshake-address tcp://127.0.0.1:29550 --log-requests
 Full walkthrough (frontend wiring, prefill/decode smoke, capture and replay) in the
 [Quick start](https://neuralmagic.github.io/vllm-vcr/quick-start.html).
 
+## Engine-step capture
+
+`play --use-rust-core` drives vLLM's Rust scheduler, and can price each step from
+steps recorded inside a real engine (`--step-trace`). The recorder is one Python
+file loaded with `--scheduler-cls`:
+
+```bash
+just capture-up                 # 1x GPU rig: loadgen, vllm-rs, tap, headless vLLM
+just capture-steps-on           # restart the engine with the step recorder
+just capture-run                # drive load; fetch tap trace and engine-steps.jsonl
+just capture-down               # release the GPU
+just replay-step-capture /tmp/trace-capture-h200/engine-steps.jsonl
+```
+
+Measured on one H200 with vLLM v0.33.0 and Qwen3-8B (2026-11-12):
+
+- Recorder on versus off: no effect visible. Median step gap at concurrency 1 was
+  12.12 to 12.74 ms across recorder-off pods and 12.32 ms with the recorder on;
+  throughput at concurrency 16 was 24.82 to 25.48 req/s off and 24.97 req/s on.
+  Pod-to-pod spread (about 0.6 ms per step) is the resolution of the comparison.
+- Trace versus vLLM's own counters under sync scheduling: draft tokens
+  125,060 = 125,060, accepted drafts 81,233 = 81,233, prefill tokens
+  698,930 = 698,930 (873 requests).
+- Replaying the capture: median decode step 12.30 ms against 12.31 ms captured
+  at concurrency 1, and 12.99 ms against 12.80 ms at 16.
+- Against the tap-trace replay on the built-in engine, same capture and
+  schedule: worst ITL quantile error 0.9% instead of 51.7%, worst request decode
+  time error 1.6% instead of 15.0%. TTFT under load is 14 ms short (28.6 ms
+  against 42.9 ms), about one step, because the capture ran async scheduling;
+  on a capture taken with `--no-async-scheduling` it is 40.7 ms against 38.1 ms.
+- KV transfers on a prefill/decode pair joined by NIXL (`just capture-kv-up`):
+  the trace has 104 completed and 6 failed loads where vLLM's metrics count 104
+  and 6, and the same 20,864 blocks the prefill handed over. Replayed loads take
+  the time and outcome of a captured load of their size.
+
+![Captured against both replays](docs/images/step-vs-tap-replay.png)
+
+Method, full tables and limits:
+[Step recorder on a GPU](docs/trace-replay/step-recorder-report.md). Format and
+flags: [Engine-step traces](docs/trace-replay/step-trace.md).
+
 ## Contributing
 
 Run `cargo fmt` and `cargo clippy --all --benches --tests --examples --all-features`

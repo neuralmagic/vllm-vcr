@@ -25,6 +25,9 @@ sim-s3 = { path = "crates/sim-s3" }
 # Tracks the compat.toml `default = true` line (v0.33.0); `cargo xtask pin-vllm`
 # rewrites this rev for a per-line build.
 vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "4ba787ec9959e566d3b587a796dff07673324da5" }
+# vLLM's Rust scheduler and KV cache manager (vllm-project/vllm#66862).
+vllm-engine-core = { git = "https://github.com/vllm-project/vllm.git", rev = "1ca395628d620fb7d681e4cbfcafef57c938c3c8" }
+vllm-engine-core-connectors = { git = "https://github.com/vllm-project/vllm.git", rev = "1ca395628d620fb7d681e4cbfcafef57c938c3c8" }
 
 anyhow = "1.0.100"
 bytes = "1.12.1"
@@ -97,6 +100,8 @@ nixl = ["dep:nixl-sys", "dep:base64"]
 # Compile the NIXL bindings against stubs so the data-plane code typechecks on
 # machines without libnixl (e.g. macOS dev boxes). Won't actually move bytes.
 nixl-stub = ["nixl", "nixl-sys/stub-api"]
+# `play --use-rust-core`: vLLM's scheduler behind a simulated GPU worker.
+rust-core = ["dep:vllm-engine-core", "dep:vllm-engine-core-connectors"]
 
 [dependencies]
 sim-trace = { workspace = true }
@@ -108,6 +113,8 @@ sim-s3 = { workspace = true }
 # dev-dependency cycle (allowed) not a build cycle.
 sim-tap = { workspace = true }
 vllm-engine-core-client = { workspace = true }
+vllm-engine-core = { workspace = true, optional = true }
+vllm-engine-core-connectors = { workspace = true, optional = true }
 
 # NIXL bindings, pinned to the same nixl source the container builds libnixl from, so the
 # crate resolves identically on macOS (stub) and in the image (real). Optional: only

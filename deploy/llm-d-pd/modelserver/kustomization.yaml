@@ -10,4 +10,4 @@ resources:
 # Bump image tag here without editing the Deployments.
 images:
   - name: ghcr.io/neuralmagic/vllm-vcr
-    newTag: vllm0.23
+    newTag: vllm0.33

@@ -71,15 +71,21 @@ fn schedule_from_record(r: &TraceRecord) -> Option<ScriptedDecode> {
     })
 }
 
-/// Configured speculative budget K = widest recorded burst - 1, or `None` when
-/// every recorded chunk is a single token. Mirrors `TraceLatency::spec_tokens`
-/// so a `--replay-steps` run emits `spec_decoding_stats` even without a
-/// `--latency-trace` model.
+/// Configured speculative budget K = widest replayable chunk - 1, the first
+/// chunk included, or `None` when every recorded chunk is a single token.
+/// Mirrors `TraceLatency::spec_tokens` so a `--replay-steps` run emits
+/// `spec_decoding_stats` even without a `--latency-trace` model.
 fn derive_spec_tokens(records: &[TraceRecord]) -> Option<u32> {
     let max_chunk = records
         .iter()
-        .filter_map(|r| r.itl_tokens.as_ref())
-        .flat_map(|t| t.iter().copied())
+        .filter_map(schedule_from_record)
+        .map(|schedule| {
+            schedule
+                .steps
+                .iter()
+                .map(|step| step.tokens)
+                .fold(schedule.first_chunk_tokens, u32::max)
+        })
         .max()
         .unwrap_or(1);
     (max_chunk > 1).then(|| max_chunk - 1)
@@ -247,6 +253,13 @@ mod tests {
         let s = schedule_from_record(&r).unwrap();
         assert_eq!(s.first_chunk_tokens, 64);
         assert_eq!(s.output_tokens(), 320);
+    }
+
+    #[test]
+    fn spec_tokens_cover_a_first_chunk_wider_than_every_burst() {
+        let records = vec![record(64, 100, vec![80.0], Some(vec![36]))];
+        let src = IndexSteps::from_records(records);
+        assert_eq!(src.spec_tokens(), Some(63));
     }
 
     #[test]

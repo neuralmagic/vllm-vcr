@@ -31,6 +31,8 @@ mod io;
 pub mod kvevents;
 pub mod lora;
 mod replay_steps;
+#[cfg(feature = "rust-core")]
+mod rust_core;
 mod sched;
 mod tokens;
 
@@ -81,6 +83,17 @@ pub enum ReplayMatch {
     /// `block_hashes`, consume-once. Works for live clients (an agent loop
     /// re-run offline against the sim), which name requests however they like.
     Prefix,
+}
+
+/// Which side moves the KV blocks of a prefill/decode handoff, matching the NIXL
+/// connector's `transfer_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum KvTransferMode {
+    /// The decode engine reads the blocks from the prefill engine (vLLM `NixlConnector`).
+    Pull,
+    /// The prefill engine writes the blocks into the decode engine (vLLM
+    /// `NixlPushConnector`).
+    Push,
 }
 
 /// Waiting-queue ordering, matching vLLM's `--scheduling-policy`.
@@ -229,6 +242,24 @@ pub struct Opt {
     #[arg(long)]
     pub latency_trace: Option<TraceUri>,
 
+    /// JSONL engine-step trace (path, `s3://bucket/key` or `hf://org/repo/file`)
+    /// captured at vLLM's model runner and KV connector boundaries by
+    /// `deploy/trace-capture/vcr_step_recorder.py`, or by `--step-trace-out`. Each
+    /// simulated step takes the recorded time of a step of the same shape (decode
+    /// request count and context, prefill tokens and KV depth), and each remote KV
+    /// load the time and outcome of a recorded load of similar size. This replaces
+    /// every time the latency model would supply: step times, KV-transfer times and
+    /// the first-token overhead, which the recorded steps already contain. Burst
+    /// sizes and output lengths still come from the latency model and the replay
+    /// flags. Needs `--use-rust-core`.
+    #[arg(long)]
+    pub step_trace: Option<TraceUri>,
+
+    /// Write this run's engine-step trace to a JSONL file: one record per executed
+    /// step and per remote KV load. Needs `--use-rust-core` and one engine.
+    #[arg(long)]
+    pub step_trace_out: Option<std::path::PathBuf>,
+
     /// Fixed time-to-first-token. When this and its std-dev are 0, the token-count prefill
     /// model (`--prefill-overhead` + `--prefill-time-per-token`) is used instead.
     #[arg(long, default_value_t = 0)]
@@ -366,6 +397,21 @@ pub struct Opt {
     /// Failure kinds to inject (one is chosen uniformly per injected failure).
     #[arg(long, value_enum, value_delimiter = ',', default_value = "error")]
     pub failure_types: Vec<FailureType>,
+
+    /// Run vLLM's Rust engine core (vLLM `VLLM_USE_RUST_CORE`): its real scheduler and KV
+    /// cache manager, stepped against a simulated GPU worker. Unset runs the built-in
+    /// approximation of the Python engine core. Needs a build with the `rust-core` feature.
+    #[arg(
+        long,
+        env = "VLLM_USE_RUST_CORE",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub use_rust_core: bool,
+
+    /// Direction of prefill/decode KV transfers. `push` needs `--use-rust-core`, and
+    /// both engines of a pair must agree.
+    #[arg(long, value_enum, env = "MOCK_KV_TRANSFER_MODE", default_value_t = KvTransferMode::Pull)]
+    pub kv_transfer_mode: KvTransferMode,
 
     /// Graceful-shutdown grace period in seconds (vLLM `shutdown_timeout`). On
     /// SIGTERM/SIGINT the engine rejects new requests and lets in-flight ones finish for
@@ -606,12 +652,13 @@ impl Opt {
         if self.expect_config_hash.is_empty() {
             return Ok(());
         }
-        // The three replay inputs are usually the same file; dedupe so we read
+        // The request-trace inputs are usually the same file; dedupe so we read
         // each trace's header once.
         let mut paths: Vec<&std::path::Path> = [
             self.replay_tokens.as_ref(),
             self.replay_steps.as_ref(),
             self.latency_trace.as_ref(),
+            self.step_trace.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -637,6 +684,30 @@ impl Opt {
             }
         }
         Ok(())
+    }
+
+    /// Check the options against the engine `--use-rust-core` selects.
+    pub fn validate_engine(&self) -> Result<()> {
+        if !self.use_rust_core {
+            if self.kv_transfer_mode == KvTransferMode::Push {
+                bail!("--kv-transfer-mode push needs --use-rust-core");
+            }
+            if self.step_trace.is_some() || self.step_trace_out.is_some() {
+                bail!("--step-trace and --step-trace-out need --use-rust-core");
+            }
+            return Ok(());
+        }
+        #[cfg(feature = "rust-core")]
+        {
+            rust_core::validate(self)?;
+            rust_core::step_costs(self, 0)?;
+            Ok(())
+        }
+        #[cfg(not(feature = "rust-core"))]
+        bail!(
+            "--use-rust-core (VLLM_USE_RUST_CORE) needs a vllm-vcr built with the \
+             `rust-core` feature"
+        )
     }
 
     /// Build the latency model: either trace-replay (from `--latency-trace`) or
@@ -763,15 +834,17 @@ async fn run_engine(
             tracing::warn!(%error, "kv-event publisher failed to start; continuing without events");
             None
         });
-    let shutdown_timeout = std::time::Duration::from_secs(opt.shutdown_timeout);
-    let sim_engine = engine::SimEngine::new(engine_index, opt, events).await?;
-    let mut engine_loop = tokio::spawn(engine_core::run_loop(
-        sim_engine,
+    let engine_abort = CancellationToken::new();
+    let mut engine_loop = spawn_engine_loop(
+        engine_index,
+        opt,
+        events,
         input_rx,
         output_tx,
         shutdown.clone(),
-        shutdown_timeout,
-    ));
+        engine_abort.clone(),
+    )
+    .await?;
 
     tokio::select! {
         biased;
@@ -803,6 +876,7 @@ async fn run_engine(
         result = &mut io_loop => {
             error!(engine_index, "engine IO loop exited unexpectedly");
             engine_done.cancel();
+            engine_abort.cancel();
             engine_loop.abort();
             engine_loop.await.ok();
             result??;
@@ -813,10 +887,45 @@ async fn run_engine(
     Ok(())
 }
 
+/// Start the engine loop for the engine `--use-rust-core` selects. `abort` stops a
+/// loop that `JoinHandle::abort` cannot reach.
+async fn spawn_engine_loop(
+    engine_index: u32,
+    opt: Opt,
+    events: Option<kvevents::KvEventTx>,
+    input_rx: mpsc::UnboundedReceiver<engine_core::EngineInput>,
+    output_tx: mpsc::UnboundedSender<engine_core::EngineOutput>,
+    shutdown: CancellationToken,
+    abort: CancellationToken,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    #[cfg(feature = "rust-core")]
+    if opt.use_rust_core {
+        return Ok(rust_core::spawn(
+            engine_index,
+            opt,
+            events,
+            input_rx,
+            output_tx,
+            shutdown,
+            abort,
+        ));
+    }
+    drop(abort);
+    let shutdown_timeout = std::time::Duration::from_secs(opt.shutdown_timeout);
+    let sim_engine = engine::SimEngine::new(engine_index, opt, events).await?;
+    Ok(tokio::spawn(engine_core::run_loop(
+        sim_engine,
+        input_rx,
+        output_tx,
+        shutdown,
+        shutdown_timeout,
+    )))
+}
+
 /// Materialize any `s3://` replay inputs (`--replay-tokens`, `--replay-steps`,
-/// `--latency-trace`) to local scratch files, rewriting the option fields to the
-/// local paths. Identical URIs are fetched once (the three inputs are usually
-/// the same trace), matching how `verify_config_hash` dedupes them.
+/// `--latency-trace`, `--step-trace`) to local scratch files, rewriting the option
+/// fields to the local paths. Identical URIs are fetched once (the request-trace
+/// inputs are usually the same trace), matching how `verify_config_hash` dedupes them.
 async fn materialize_remote_inputs(opt: &mut Opt) -> Result<()> {
     let scratch_dir = std::env::temp_dir();
     let mut fetched: std::collections::HashMap<String, std::path::PathBuf> =
@@ -826,6 +935,7 @@ async fn materialize_remote_inputs(opt: &mut Opt) -> Result<()> {
         &mut opt.replay_tokens,
         &mut opt.replay_steps,
         &mut opt.latency_trace,
+        &mut opt.step_trace,
     ] {
         let Some(uri) = field.as_ref().filter(|u| u.is_remote()) else {
             continue;
@@ -934,6 +1044,7 @@ pub async fn run_with_log_filter(
     // transport setup, so a bad config fails immediately instead of after the 30s
     // frontend handshake timeout. Engines rebuild their own copy in SimEngine::new.
     opt.build_latency()?;
+    opt.validate_engine()?;
     // Refuse a trace captured under a different config before doing any work.
     opt.verify_config_hash()?;
 

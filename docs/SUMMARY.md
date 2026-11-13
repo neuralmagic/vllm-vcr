@@ -34,6 +34,8 @@
   - [Content-identical replay](./trace-replay/content-identical.md)
   - [Replay pacing](./trace-replay/pacing.md)
   - [Speculative decoding & diffusion](./trace-replay/spec-diffusion.md)
+  - [Engine-step traces](./trace-replay/step-trace.md)
+  - [Step recorder on a GPU](./trace-replay/step-recorder-report.md)
 - [Visualizing traces (Perfetto)](./perfetto.md)
 
 # Operations

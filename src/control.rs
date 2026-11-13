@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::engine_core::EngineInput;
-use crate::{FailureType, LogFilter};
+use crate::{FailureType, LogFilter, Opt};
 
 /// A control call handed to one engine loop. The engine answers on `reply`.
 pub(crate) struct ControlCall {
@@ -92,6 +92,27 @@ pub struct Config {
     pub log_requests: bool,
 }
 
+impl Config {
+    pub(crate) fn from_opt(opt: &Opt) -> Self {
+        Config {
+            time_to_first_token: opt.time_to_first_token,
+            time_to_first_token_std_dev: opt.time_to_first_token_std_dev,
+            inter_token_latency: opt.inter_token_latency,
+            inter_token_latency_std_dev: opt.inter_token_latency_std_dev,
+            prefill_overhead: opt.prefill_overhead,
+            prefill_time_per_token: opt.prefill_time_per_token,
+            prefill_time_std_dev: opt.prefill_time_std_dev,
+            time_factor_under_load: opt.time_factor_under_load,
+            max_num_seqs: opt.max_num_seqs,
+            max_num_batched_tokens: opt.max_num_batched_tokens,
+            max_model_len: opt.max_model_len,
+            failure_injection_rate: opt.failure_injection_rate,
+            failure_types: opt.failure_types.clone(),
+            log_requests: opt.log_requests,
+        }
+    }
+}
+
 /// Partial update for `PATCH /config`. Absent fields keep their current value.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigPatch {
@@ -123,6 +144,30 @@ impl ConfigPatch {
             || self.prefill_time_std_dev.is_some()
             || self.time_factor_under_load.is_some()
             || self.max_num_seqs.is_some()
+    }
+
+    pub(crate) fn apply(self, opt: &mut Opt) {
+        macro_rules! set {
+            ($($field:ident),* $(,)?) => {
+                $(if let Some(value) = self.$field { opt.$field = value; })*
+            };
+        }
+        set!(
+            time_to_first_token,
+            time_to_first_token_std_dev,
+            inter_token_latency,
+            inter_token_latency_std_dev,
+            prefill_overhead,
+            prefill_time_per_token,
+            prefill_time_std_dev,
+            time_factor_under_load,
+            max_num_seqs,
+            max_num_batched_tokens,
+            max_model_len,
+            failure_injection_rate,
+            failure_types,
+            log_requests,
+        );
     }
 
     pub fn validate(&self) -> Result<(), ControlError> {

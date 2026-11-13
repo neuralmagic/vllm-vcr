@@ -1,5 +1,5 @@
 # H200 trace capture: loadgen → vllm-rs :5570 → tap → headless vLLM :5580 → /trace
-# Pin: engine image must match Cargo.toml protocol_rev (c9340e6f3).
+# Pin: engine image and tap/frontend image must be the same compat.toml line (0.33).
 # Ops: if any container restarts, delete the pod; fetch trace before scale-down (emptyDir).
 apiVersion: apps/v1
 kind: Deployment
@@ -25,7 +25,7 @@ spec:
       containers:
         # --- Real engine: headless vLLM at the protocol-pinned commit -------------------
         - name: engine
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:c9340e6f350a009cf835878abad2a0e379b9e6a4
+          image: vllm/vllm-openai:v0.33.0
           command: ["vllm", "serve"]
           args:
             - Qwen/Qwen3-8B
@@ -71,7 +71,7 @@ spec:
             - { mountPath: /models, name: model-cache }
         # --- Recording tap ---------------------------------------------------------------
         - name: tap
-          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v8
+          image: ghcr.io/neuralmagic/vllm-vcr:vllm0.33
           command: ["/usr/local/bin/vllm-vcr", "record"]
           # Handshake/data addresses use the binary's defaults (frontend
           # :5570, engine :5580, data :29560/:29561), matching the frontend
@@ -98,7 +98,7 @@ spec:
             - { mountPath: /trace, name: trace }
         # --- Rust frontend: OpenAI server, no local engine --------------------------------
         - name: frontend
-          image: quay.io/wseaton/mock-engine-nixl:trace-capture-v8
+          image: ghcr.io/neuralmagic/vllm-vcr:vllm0.33
           command: ["/usr/local/bin/vllm-rs", "serve"]
           args:
             - Qwen/Qwen3-8B
