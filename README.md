@@ -46,6 +46,36 @@ vllm-vcr play --handshake-address tcp://127.0.0.1:29550 --log-requests
 Full walkthrough (frontend wiring, prefill/decode smoke, capture and replay) in the
 [Quick start](https://neuralmagic.github.io/vllm-vcr/quick-start.html).
 
+## Engine-step capture
+
+`play --use-rust-core` drives vLLM's Rust scheduler, and can price each step from
+steps recorded inside a real engine (`--step-trace`). The recorder is one Python
+file loaded with `--scheduler-cls`:
+
+```bash
+just capture-up                 # 1x GPU rig: loadgen, vllm-rs, tap, headless vLLM
+just capture-steps-on           # restart the engine with the step recorder
+just capture-run                # drive load; fetch tap trace and engine-steps.jsonl
+just capture-down               # release the GPU
+just replay-step-capture /tmp/trace-capture-h200/engine-steps.jsonl
+```
+
+Measured on one H200 with vLLM v0.33.0 and Qwen3-8B (2026-11-12):
+
+- Recorder on versus off: no effect visible. Median step gap at concurrency 1 was
+  12.12 to 12.74 ms across recorder-off pods and 12.32 ms with the recorder on;
+  throughput at concurrency 16 was 24.82 to 25.48 req/s off and 24.97 req/s on.
+  Pod-to-pod spread (about 0.6 ms per step) is the resolution of the comparison.
+- Trace versus vLLM's own counters under sync scheduling: draft tokens
+  125,060 = 125,060, accepted drafts 81,233 = 81,233, prefill tokens
+  698,930 = 698,930 (873 requests).
+- Replaying the capture: median step gap 12.53 ms against 12.31 ms captured at
+  concurrency 1, and 12.67 ms against 12.80 ms at 16.
+
+Method, full tables and limits:
+[Step recorder on a GPU](docs/trace-replay/step-recorder-report.md). Format and
+flags: [Engine-step traces](docs/trace-replay/step-trace.md).
+
 ## Contributing
 
 Run `cargo fmt` and `cargo clippy --all --benches --tests --examples --all-features`
