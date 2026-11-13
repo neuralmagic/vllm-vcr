@@ -105,10 +105,21 @@ fn loopback_read_verifies_each_block_and_notifies_the_prefill() {
             expected: patterns[1],
         },
     ];
+    let landed = [(0, patterns[0]), (1, patterns[1])];
+    assert!(
+        decode.check_blocks(&landed).is_err(),
+        "the decode pool must not hold the bytes before the read"
+    );
     let bytes = decode
         .read_blocks(&pool, &reads, "req-loopback-2")
         .expect("decode should read and verify both blocks");
     assert_eq!(bytes, 2 * 4096);
+    decode
+        .check_blocks(&landed)
+        .expect("the read blocks sit in the decode's own pool slots");
+    prefill
+        .check_blocks(&[(4, patterns[0]), (11, patterns[1])])
+        .expect("a read leaves the prefill's blocks in place");
 
     let swapped = [
         BlockRead {
@@ -122,6 +133,17 @@ fn loopback_read_verifies_each_block_and_notifies_the_prefill() {
             .read_blocks(&pool, &swapped, "req-loopback-3")
             .is_err(),
         "a block carrying the wrong bytes must fail verification"
+    );
+
+    let outside = [BlockRead {
+        local_block_id: 16,
+        ..reads[0]
+    }];
+    assert!(
+        decode
+            .read_blocks(&pool, &outside, "req-loopback-outside")
+            .is_err(),
+        "a local slot past the end of the pool must be rejected"
     );
 
     let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -190,4 +212,65 @@ fn loopback_push_writes_into_the_decode_pool_and_notifies_it() {
     decode
         .check_blocks(&[(1, patterns[0]), (2, patterns[1])])
         .expect("the pushed blocks carry the prefill's bytes");
+}
+
+/// Blocks move slot to slot between the two registered pools, so a peer whose
+/// blocks are a different size cannot be read from or written to.
+#[test]
+fn loopback_rejects_a_peer_with_a_different_block_size() {
+    if nixl_is_stub() {
+        eprintln!("skipping NIXL loopback: built against stub bindings (no real libnixl)");
+        return;
+    }
+
+    let mut prefill = make_data_plane(PdRole::Prefill, cfg("mock-prefill-d", 5630));
+    let mut decode = make_data_plane(
+        PdRole::Decode,
+        NixlConfig {
+            kv_block_bytes: 8192,
+            ..cfg("mock-decode-d", 5631)
+        },
+    );
+
+    let pattern = block_pattern(&[5; 16]);
+    prefill.write_blocks(&[(3, pattern)]);
+
+    let prefill_pool = RemotePool {
+        engine_id: "mock-prefill-d".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: 5630,
+    };
+    let read = [BlockRead {
+        remote_block_id: 3,
+        local_block_id: 0,
+        expected: pattern,
+    }];
+    let error = decode
+        .read_blocks(&prefill_pool, &read, "req-loopback-5")
+        .expect_err("a read across block sizes must fail");
+    assert!(
+        error.to_string().contains("KV block size mismatch"),
+        "{error}"
+    );
+    assert!(
+        decode.check_blocks(&[(0, pattern)]).is_err(),
+        "a rejected read must not touch the decode pool"
+    );
+
+    let decode_pool = RemotePool {
+        engine_id: "mock-decode-d".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: 5631,
+    };
+    let write = [BlockWrite {
+        local_block_id: 3,
+        remote_block_id: 0,
+    }];
+    let error = prefill
+        .push_blocks(&decode_pool, &write, "req-loopback-6:1")
+        .expect_err("a push across block sizes must fail");
+    assert!(
+        error.to_string().contains("KV block size mismatch"),
+        "{error}"
+    );
 }
