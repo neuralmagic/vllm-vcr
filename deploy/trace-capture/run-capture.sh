@@ -48,9 +48,17 @@ kubectl -n "$NS" exec "deploy/$DEPLOY" -c tap -- cat /trace/step-stats.jsonl \
     > "$OUT_DIR/step-stats.jsonl" 2>/dev/null || \
     echo "  (no step-stats.jsonl; tap built without --step-stats-out support?)"
 
+echo "==> fetching engine-step trace (model runner and KV connector boundaries)"
+kubectl -n "$NS" exec "deploy/$DEPLOY" -c tap -- cat /trace/engine-steps.jsonl \
+    > "$OUT_DIR/engine-steps.jsonl" 2>/dev/null || {
+    rm -f "$OUT_DIR/engine-steps.jsonl"
+    echo "  (no engine-steps.jsonl; the step recorder is off, see: just capture-steps-on)"
+}
+
 echo "==> done"
 echo "  tap trace:    $OUT_DIR/tap-trace.jsonl ($(wc -l < "$OUT_DIR/tap-trace.jsonl" | tr -d ' ') lines)"
 echo "  step stats:   $OUT_DIR/step-stats.jsonl"
+[ -f "$OUT_DIR/engine-steps.jsonl" ] && echo "  engine steps: $OUT_DIR/engine-steps.jsonl"
 echo "  client trace: $OUT_DIR/client-trace.jsonl"
 echo "  client JSON:  $OUT_DIR/c1-loadgen.json $OUT_DIR/c16-loadgen.json"
 echo

@@ -4,6 +4,7 @@
 #   just image-build && just image-push     # tap/frontend image (linux/amd64)
 #   just capture-up                         # schedule the rig on the cluster
 #   just capture-status                     # wait for "forwarding frames"
+#   just capture-steps-on                   # optional: also record engine steps
 #   just capture-run                        # drive load, fetch trace + reports
 #   just capture-down                       # release the GPU
 #   just calibrate /tmp/trace-capture-h200/tap-trace.jsonl
@@ -27,12 +28,31 @@ check:
     cargo clippy --workspace --benches --tests --examples --all-features
     cargo test --workspace
 
-# Test the `--use-rust-core` engine: its unit tests, then the end-to-end and tap
-# suites with the engine switched by env. The skipped test asserts behavior of the
-# built-in engine (KV pins held through emission lag).
+# Test the `--use-rust-core` engine: its unit tests, then the end-to-end, tap and
+# trace-replay suites with the engine switched by env. The skipped test asserts
+# behavior of the built-in engine (KV pins held through emission lag).
 test-rust-core:
     cargo test --features rust-core --lib rust_core
-    VLLM_USE_RUST_CORE=1 cargo test --features rust-core --test engine_core_e2e --test tap_e2e --test engine_synthetic_e2e -- --skip reset_prefix_cache_busy_vs_idle
+    VLLM_USE_RUST_CORE=1 cargo test --features rust-core --test engine_core_e2e --test tap_e2e --test engine_synthetic_e2e --test spec_replay_fidelity --test diffusion_replay_demo --test trace_validation_ci --test rust_core_round_trip -- --skip reset_prefix_cache_busy_vs_idle
+
+# Check deploy/trace-capture/vcr_step_recorder.py against the real scheduler of a
+# vLLM source checkout (no GPU): an exact-trace scenario, vLLM's differential
+# scheduler fuzz with the recorder attached, and the recorder's engine-thread
+# overhead. Rewrites tests/fixtures/engine_steps_vllm.jsonl. Off a GPU box the
+# CPU platform is used, which cannot build speculative-decoding configs.
+check-step-recorder vllm_src:
+    PYTHONPATH={{vllm_src}} PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 VLLM_TARGET_DEVICE=${VLLM_TARGET_DEVICE:-cpu} \
+      uv run --no-project --python 3.12 --with torch \
+      --with-requirements {{vllm_src}}/requirements/common.txt \
+      deploy/trace-capture/check_step_recorder.py --vllm-src {{vllm_src}} \
+      --write-fixture tests/fixtures/engine_steps_vllm.jsonl
+
+# Replay an engine-step trace captured from vLLM (the engine-steps.jsonl that
+# `just capture-run` fetches) on the `--use-rust-core` engine and compare the step
+# gaps with the recorded step times at decode concurrency 1 and 16.
+replay-step-capture trace:
+    VCR_STEP_TRACE={{trace}} cargo test --features rust-core --test rust_core_round_trip \
+      a_captured_step_trace_replays_its_step_times -- --ignored --nocapture
 
 # --- capture image ----------------------------------------------------------------
 
@@ -88,6 +108,19 @@ capture-status:
 # Drive the benchmark load and fetch the tap trace + client-side reports.
 capture-run:
     bash deploy/trace-capture/run-capture.sh
+
+# Record engine steps and KV transfers at the model runner boundary on the next
+# capture (deploy/trace-capture/vcr_step_recorder.py). Restarts the engine pod.
+# `just capture-up` turns it off again. See docs/trace-replay/step-trace.md.
+capture-steps-on:
+    kubectl -n {{namespace}} create configmap vcr-step-recorder \
+      --from-file=deploy/trace-capture/vcr_step_recorder.py --dry-run=client -o yaml | \
+      kubectl apply -f -
+    kustomize build deploy/trace-capture/overlays/{{namespace}} | \
+      yq 'select(.metadata.labels["llm-d.ai/rig"] == "h200")' | \
+      kubectl patch --local -f - --type=json \
+        --patch-file deploy/trace-capture/step-recorder-patch.yaml -o yaml | \
+      kubectl apply -f -
 
 # Fetch the tap trace without running load (e.g. mid-capture peek).
 capture-fetch out="/tmp/tap-trace.jsonl":
