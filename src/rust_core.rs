@@ -114,7 +114,7 @@ pub(crate) fn spawn(
         let shutdown_timeout = Duration::from_secs(opt.shutdown_timeout);
         let engine = RustCoreEngine::new(engine_index, opt, events)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
+            .enable_all()
             .build()
             .context("building the engine-core runtime")?;
         runtime.block_on(async move {
