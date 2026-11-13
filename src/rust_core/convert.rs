@@ -23,7 +23,9 @@ use vllm_engine_core::sched::scheduler::{
 };
 use vllm_engine_core::sched::stats::SchedulerStats as CoreStats;
 use vllm_engine_core_client::protocol::output::StopReason as WireStopReason;
-use vllm_engine_core_client::protocol::stats::{BaseCacheStats, PrefillStats, PrefixCacheStats};
+use vllm_engine_core_client::protocol::stats::{
+    BaseCacheStats, PrefillStats, PrefixCacheStats, SpecDecodingStats,
+};
 use vllm_engine_core_connectors::nixl::{NixlFinishedParams, TransferMode};
 
 use crate::dataplane::PdRole;
@@ -31,7 +33,7 @@ use crate::{Opt, SchedulingPolicy, blockpool};
 
 const HASH_ALGO: HashAlgo = HashAlgo::Sha256Cbor;
 
-pub(crate) fn scheduler_config(opt: &Opt) -> SchedulerConfig {
+pub(crate) fn scheduler_config(opt: &Opt, num_spec_tokens: usize) -> SchedulerConfig {
     let max_model_len = if opt.max_model_len > 0 {
         opt.max_model_len
     } else {
@@ -53,6 +55,7 @@ pub(crate) fn scheduler_config(opt: &Opt) -> SchedulerConfig {
             is_kv_consumer: opt.pd_role != PdRole::Prefill,
             recompute_kv_load_failures: true,
         }),
+        num_spec_tokens,
         log_stats: true,
         enable_kv_cache_events: opt.enable_kv_cache_events,
         kv_events_use_int_block_hashes: true,
@@ -259,6 +262,13 @@ pub(crate) fn scheduler_stats(stats: CoreStats) -> SchedulerStats {
             .connector_prefix_cache_stats
             .as_ref()
             .map(|connector| prefix_cache_stats(&connector.stats)),
+        spec_decoding_stats: stats.spec_decoding_stats.map(|spec| SpecDecodingStats {
+            num_spec_tokens: spec.num_spec_tokens,
+            num_drafts: spec.num_drafts,
+            num_draft_tokens: spec.num_draft_tokens,
+            num_accepted_tokens: spec.num_accepted_tokens,
+            num_accepted_tokens_per_pos: spec.num_accepted_tokens_per_pos,
+        }),
         ..Default::default()
     }
 }
@@ -287,6 +297,22 @@ pub(crate) fn merge_stats(pending: &mut Option<SchedulerStats>, newer: Scheduler
         older.connector_prefix_cache_stats,
     ) {
         (Some(total), Some(older)) => add_prefix_cache_stats(total, &older),
+        (total @ None, older) => *total = older,
+        (Some(_), None) => {}
+    }
+    match (&mut merged.spec_decoding_stats, older.spec_decoding_stats) {
+        (Some(total), Some(older)) => {
+            total.num_drafts += older.num_drafts;
+            total.num_draft_tokens += older.num_draft_tokens;
+            total.num_accepted_tokens += older.num_accepted_tokens;
+            for (total, older) in total
+                .num_accepted_tokens_per_pos
+                .iter_mut()
+                .zip(older.num_accepted_tokens_per_pos)
+            {
+                *total += older;
+            }
+        }
         (total @ None, older) => *total = older,
         (Some(_), None) => {}
     }

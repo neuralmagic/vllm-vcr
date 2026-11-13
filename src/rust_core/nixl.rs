@@ -380,11 +380,16 @@ impl NixlWorker {
 
     /// Decode side: a load that failed before it started.
     pub(crate) fn fail_load(&mut self, request_id: &str, reason: &str) {
+        self.fail_load_after(request_id, reason, Duration::ZERO);
+    }
+
+    /// Decode side: a load that fails, reported no earlier than `delay` from now.
+    pub(crate) fn fail_load_after(&mut self, request_id: &str, reason: &str, delay: Duration) {
         warn!(request_id, reason, "remote KV load failed");
         self.loads.insert(
             request_id.to_string(),
             Load {
-                ready_at: Instant::now(),
+                ready_at: Instant::now() + delay,
                 succeeded: Some(false),
                 awaited: None,
             },

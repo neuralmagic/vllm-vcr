@@ -11,5 +11,6 @@ pub mod config_hash;
 pub mod dataset_convert;
 pub mod latency;
 pub mod perfetto;
+pub mod steps;
 pub mod trace;
 pub mod trace_convert;

@@ -242,6 +242,24 @@ pub struct Opt {
     #[arg(long)]
     pub latency_trace: Option<TraceUri>,
 
+    /// JSONL engine-step trace (path, `s3://bucket/key` or `hf://org/repo/file`)
+    /// captured at vLLM's model runner and KV connector boundaries by
+    /// `deploy/trace-capture/vcr_step_recorder.py`, or by `--step-trace-out`. Each
+    /// simulated step takes the recorded time of a step of the same shape (decode
+    /// request count and context, prefill tokens and KV depth), and each remote KV
+    /// load the time and outcome of a recorded load of similar size. This replaces
+    /// every time the latency model would supply: step times, KV-transfer times and
+    /// the first-token overhead, which the recorded steps already contain. Burst
+    /// sizes and output lengths still come from the latency model and the replay
+    /// flags. Needs `--use-rust-core`.
+    #[arg(long)]
+    pub step_trace: Option<TraceUri>,
+
+    /// Write this run's engine-step trace to a JSONL file: one record per executed
+    /// step and per remote KV load. Needs `--use-rust-core` and one engine.
+    #[arg(long)]
+    pub step_trace_out: Option<std::path::PathBuf>,
+
     /// Fixed time-to-first-token. When this and its std-dev are 0, the token-count prefill
     /// model (`--prefill-overhead` + `--prefill-time-per-token`) is used instead.
     #[arg(long, default_value_t = 0)]
@@ -634,12 +652,13 @@ impl Opt {
         if self.expect_config_hash.is_empty() {
             return Ok(());
         }
-        // The three replay inputs are usually the same file; dedupe so we read
+        // The request-trace inputs are usually the same file; dedupe so we read
         // each trace's header once.
         let mut paths: Vec<&std::path::Path> = [
             self.replay_tokens.as_ref(),
             self.replay_steps.as_ref(),
             self.latency_trace.as_ref(),
+            self.step_trace.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -668,23 +687,27 @@ impl Opt {
     }
 
     /// Check the options against the engine `--use-rust-core` selects.
-    pub fn validate_engine(&self, latency: &dyn latency::LatencyModel) -> Result<()> {
+    pub fn validate_engine(&self) -> Result<()> {
         if !self.use_rust_core {
             if self.kv_transfer_mode == KvTransferMode::Push {
                 bail!("--kv-transfer-mode push needs --use-rust-core");
             }
+            if self.step_trace.is_some() || self.step_trace_out.is_some() {
+                bail!("--step-trace and --step-trace-out need --use-rust-core");
+            }
             return Ok(());
         }
         #[cfg(feature = "rust-core")]
-        return rust_core::validate(self, latency);
-        #[cfg(not(feature = "rust-core"))]
         {
-            let _ = latency;
-            bail!(
-                "--use-rust-core (VLLM_USE_RUST_CORE) needs a vllm-vcr built with the \
-                 `rust-core` feature"
-            )
+            rust_core::validate(self)?;
+            rust_core::step_costs(self, 0)?;
+            Ok(())
         }
+        #[cfg(not(feature = "rust-core"))]
+        bail!(
+            "--use-rust-core (VLLM_USE_RUST_CORE) needs a vllm-vcr built with the \
+             `rust-core` feature"
+        )
     }
 
     /// Build the latency model: either trace-replay (from `--latency-trace`) or
@@ -900,9 +923,9 @@ async fn spawn_engine_loop(
 }
 
 /// Materialize any `s3://` replay inputs (`--replay-tokens`, `--replay-steps`,
-/// `--latency-trace`) to local scratch files, rewriting the option fields to the
-/// local paths. Identical URIs are fetched once (the three inputs are usually
-/// the same trace), matching how `verify_config_hash` dedupes them.
+/// `--latency-trace`, `--step-trace`) to local scratch files, rewriting the option
+/// fields to the local paths. Identical URIs are fetched once (the request-trace
+/// inputs are usually the same trace), matching how `verify_config_hash` dedupes them.
 async fn materialize_remote_inputs(opt: &mut Opt) -> Result<()> {
     let scratch_dir = std::env::temp_dir();
     let mut fetched: std::collections::HashMap<String, std::path::PathBuf> =
@@ -912,6 +935,7 @@ async fn materialize_remote_inputs(opt: &mut Opt) -> Result<()> {
         &mut opt.replay_tokens,
         &mut opt.replay_steps,
         &mut opt.latency_trace,
+        &mut opt.step_trace,
     ] {
         let Some(uri) = field.as_ref().filter(|u| u.is_remote()) else {
             continue;
@@ -1019,8 +1043,8 @@ pub async fn run_with_log_filter(
     // Validate the latency configuration (knob/trace conflict, trace parse) before any
     // transport setup, so a bad config fails immediately instead of after the 30s
     // frontend handshake timeout. Engines rebuild their own copy in SimEngine::new.
-    let latency = opt.build_latency()?;
-    opt.validate_engine(latency.as_ref())?;
+    opt.build_latency()?;
+    opt.validate_engine()?;
     // Refuse a trace captured under a different config before doing any work.
     opt.verify_config_hash()?;
 

@@ -4,10 +4,29 @@
 //!   Scheduler::schedule() ──SchedulerOutput──▶ SimRunner::execute()
 //!                                                │  per scheduled request:
 //!                                                │    prefill chunk -> LatencyModel::prefill_chunk_cost
-//!                                                │    decode step   -> LatencyModel::paced_step
+//!                                                │    decode step   -> recorded step, else LatencyModel::paced_step
 //!                                                │    prompt done   -> TokenSource::next_tokens
+//!                                                │  the step: its shape -> a recorded step's time,
+//!                                                │    when a step trace is replayed
 //!                                                ▼
 //!   Scheduler::update_from_output() ◀──ModelRunnerOutput + step duration
+//!   Scheduler::update_draft_token_ids() ◀──DraftTokenIds
+//! ```
+//!
+//! A burst of `n > 1` tokens goes through vLLM's speculative decoding path, with
+//! `K = spec_tokens` drafts per request per step:
+//!
+//! ```text
+//!   step N    samples 1 token              drafts K tokens for step N+1
+//!   step N+1  scheduled 1 + K tokens       returns n tokens: n - 1 drafts accepted,
+//!                                          K - (n - 1) rolled back by the scheduler
+//! ```
+//!
+//! A recorded first chunk of `F > 1` tokens takes the same path one step late:
+//!
+//! ```text
+//!   last prefill step  samples nothing     drafts F - 1 tokens
+//!   next step          scheduled F - 1     returns F tokens: F - 1 drafts accepted
 //! ```
 
 use std::collections::{HashMap, VecDeque};
@@ -16,21 +35,48 @@ use std::time::Duration;
 use rand::SeedableRng as _;
 use rand::rngs::StdRng;
 use sim_protocol::vllm::EngineCoreFinishReason;
+use sim_trace::steps::{KvOutcome, KvTransferTable, PrefillChunk, StepShape, StepTable};
 use tokio::time::Instant;
 use tracing::warn;
 use vllm_engine_core::sched::output::{NewRequestData, SchedulerOutput};
-use vllm_engine_core::sched::scheduler::{KvConnectorOutput, ModelRunnerOutput};
+use vllm_engine_core::sched::scheduler::{DraftTokenIds, KvConnectorOutput, ModelRunnerOutput};
 use vllm_engine_core_connectors::nixl::{NixlConnectorMetadata, TransferMode};
 
 use crate::dataplane::{BlockRead, block_pattern};
 use crate::latency::{BIG_CHUNK_TOKENS, Churn, DecodePacing, FirstTokenCtx, LatencyModel};
+use crate::replay_steps::{ScriptedDecode, StepSource};
 use crate::rust_core::nixl::{NixlWorker, remote_block_ids};
 use crate::tokens::{TokenCtx, TokenSource};
+
+/// Token id of every simulated draft.
+const DRAFT_TOKEN_ID: i32 = 0;
 
 /// One executed step: what the worker hands back and how long it took.
 pub(crate) struct StepResult {
     pub output: ModelRunnerOutput,
+    /// Drafts for the next step of each request that can use them.
+    pub drafts: DraftTokenIds,
     pub duration: Duration,
+    pub shape: StepShape,
+    /// Speculative drafts the step accepted.
+    pub accepted: usize,
+    /// Remote KV loads this step started, with the blocks each one moves.
+    pub loads_started: Vec<(String, usize)>,
+}
+
+/// Recorded step and KV load times that replace the latency model's.
+pub(crate) struct StepCosts {
+    pub steps: StepTable,
+    pub kv_loads: Option<KvTransferTable>,
+    pub rng: StdRng,
+}
+
+/// Where the worker gets its timing, output tokens and recorded decode steps.
+pub(crate) struct Sources {
+    pub latency: Box<dyn LatencyModel>,
+    pub token_source: Box<dyn TokenSource>,
+    pub step_source: Option<Box<dyn StepSource>>,
+    pub step_costs: Option<StepCosts>,
 }
 
 /// The output-length bounds a request arrives with.
@@ -48,8 +94,14 @@ struct WorkerRequest {
     num_tokens: usize,
     num_computed: usize,
     num_generated: usize,
-    /// The current prefill has sampled its first token.
+    /// Output tokens this request generates before it finishes.
+    output_len: usize,
+    /// The current prefill has reached its last prompt token.
     prefilled: bool,
+    /// Recorded decode steps left to replay.
+    script: Option<ScriptedDecode>,
+    /// Size of a recorded first chunk that is waiting for its drafts.
+    pending_first_chunk: Option<usize>,
     /// Prompt tokens already in KV when the request was first scheduled.
     num_cached_tokens: usize,
     pacing: Option<DecodePacing>,
@@ -70,6 +122,10 @@ impl WorkerRequest {
 pub(crate) struct SimRunner {
     latency: Box<dyn LatencyModel>,
     token_source: Box<dyn TokenSource>,
+    step_source: Option<Box<dyn StepSource>>,
+    step_costs: Option<StepCosts>,
+    /// Drafts proposed per request per step, vLLM's `num_speculative_tokens`.
+    spec_tokens: usize,
     requests: HashMap<String, WorkerRequest>,
     kv: NixlWorker,
     block_size: usize,
@@ -80,16 +136,29 @@ pub(crate) struct SimRunner {
 
 impl SimRunner {
     pub(crate) fn new(
-        latency: Box<dyn LatencyModel>,
-        token_source: Box<dyn TokenSource>,
+        sources: Sources,
         kv: NixlWorker,
         block_size: usize,
         max_num_batched_tokens: usize,
         time_scale: f64,
     ) -> Self {
+        let Sources {
+            latency,
+            token_source,
+            step_source,
+            step_costs,
+        } = sources;
+        let spec_tokens = step_source
+            .as_ref()
+            .and_then(|source| source.spec_tokens())
+            .max(latency.spec_tokens())
+            .unwrap_or(0) as usize;
         SimRunner {
             latency,
             token_source,
+            step_source,
+            step_costs,
+            spec_tokens,
             requests: HashMap::new(),
             kv,
             block_size: block_size.max(1),
@@ -101,6 +170,12 @@ impl SimRunner {
 
     pub(crate) fn set_latency(&mut self, latency: Box<dyn LatencyModel>) {
         self.latency = latency;
+    }
+
+    /// The widest recorded burst minus one: what the scheduler must be configured
+    /// with as `num_spec_tokens`. Zero when every step delivers one token.
+    pub(crate) fn spec_tokens(&self) -> usize {
+        self.spec_tokens
     }
 
     /// Start tracking a request and return the number of tokens it will generate.
@@ -125,6 +200,13 @@ impl SimRunner {
         {
             output_len = output_len.min(recorded).max(1);
         }
+        let script = self
+            .step_source
+            .as_mut()
+            .and_then(|source| source.take_schedule(request_id, &prompt_token_ids));
+        if let Some(script) = &script {
+            output_len = output_len.min(script.output_tokens()).max(1);
+        }
         self.requests.insert(
             request_id.to_string(),
             WorkerRequest {
@@ -133,7 +215,10 @@ impl SimRunner {
                 num_tokens: 0,
                 num_computed: 0,
                 num_generated: 0,
+                output_len,
                 prefilled: false,
+                script,
+                pending_first_chunk: None,
                 num_cached_tokens: 0,
                 pacing: None,
                 emit_offset: None,
@@ -167,10 +252,11 @@ impl SimRunner {
         self.token_source.finish_reason(request_id)
     }
 
-    /// Run one scheduled step: advance every scheduled request, sample a token for
-    /// each one whose prompt is fully computed, and price the step.
+    /// Run one scheduled step: advance every scheduled request, sample the tokens
+    /// due to each one whose prompt is fully computed, and price the step.
     pub(crate) fn execute(&mut self, scheduled: &SchedulerOutput, num_running: u64) -> StepResult {
-        let kv_connector_output = self.transfer_kv(scheduled, num_running);
+        let mut loads_started = Vec::new();
+        let kv_connector_output = self.transfer_kv(scheduled, num_running, &mut loads_started);
         for request_id in &scheduled.finished_req_ids {
             self.forget(request_id);
         }
@@ -194,10 +280,13 @@ impl SimRunner {
         let num_scheduled = scheduled.num_scheduled_tokens.len();
         let mut req_ids = Vec::with_capacity(num_scheduled);
         let mut sampled_token_ids = Vec::with_capacity(num_scheduled);
+        let mut drafts = DraftTokenIds::default();
         let mut decode_cost = Duration::ZERO;
         let mut deepest_context = None;
         let mut prefill_cost = Duration::ZERO;
         let mut prefill_tokens = 0;
+        let mut shape = StepShape::default();
+        let mut accepted = 0;
 
         for (request_id, &num_tokens) in &scheduled.num_scheduled_tokens {
             req_ids.push(request_id.clone());
@@ -206,17 +295,45 @@ impl SimRunner {
                 sampled_token_ids.push(Vec::new());
                 continue;
             };
+            let samples = request.num_computed + num_tokens >= request.num_tokens;
+            let num_drafts = scheduled
+                .scheduled_spec_decode_tokens
+                .get(request_id)
+                .map_or(0, Vec::len);
+            if request.prefilled && request.pacing.is_some() {
+                shape.decode.reqs += 1;
+                shape.decode.tokens += num_tokens as u32;
+                shape.decode.drafts += num_drafts as u32;
+                shape.decode.context_tokens += request.num_computed as u64;
+            } else {
+                shape.prefill.push(PrefillChunk {
+                    tokens: num_tokens as u32,
+                    kv_depth: request.num_computed as u32,
+                    last: samples,
+                });
+            }
 
+            let mut burst = 1;
             match request.pacing.as_mut().filter(|_| request.prefilled) {
+                Some(_) if request.pending_first_chunk.is_some() => {}
                 Some(pacing) => {
-                    let draw = self
-                        .latency
-                        .paced_step(&mut request.rng, num_running, pacing);
+                    let recorded = request
+                        .script
+                        .as_mut()
+                        .filter(|_| samples)
+                        .and_then(|script| script.steps.pop_front());
+                    let draw = match recorded {
+                        Some(step) => step,
+                        None => self
+                            .latency
+                            .paced_step(&mut request.rng, num_running, pacing),
+                    };
                     let context = pacing.context_bucket();
                     if deepest_context.is_none_or(|deepest| context > deepest) {
                         deepest_context = Some(context);
                         decode_cost = draw.delay;
                     }
+                    burst = draw.tokens as usize;
                 }
                 None => {
                     prefill_cost += self
@@ -227,35 +344,73 @@ impl SimRunner {
             }
 
             request.num_computed += num_tokens;
-            if request.num_computed < request.num_tokens {
+            if !samples {
                 sampled_token_ids.push(Vec::new());
                 continue;
             }
 
-            request.prefilled = true;
-            if request.emit_offset.is_none() {
-                request.emit_offset = Some(self.latency.first_token_overhead(
-                    &mut request.rng,
-                    &FirstTokenCtx {
-                        num_prompt_tokens: request.prompt_token_ids.len(),
-                        num_cached_tokens: request.num_cached_tokens,
-                        do_remote_prefill: false,
-                        num_running,
-                    },
-                ));
-            }
+            let remaining = request
+                .output_len
+                .saturating_sub(request.num_generated)
+                .max(1);
+            let wanted = if request.prefilled {
+                request.pending_first_chunk.take().unwrap_or(burst)
+            } else {
+                request.prefilled = true;
+                if request.emit_offset.is_none() {
+                    request.emit_offset = Some(match self.step_costs {
+                        Some(_) => Duration::ZERO,
+                        None => self.latency.first_token_overhead(
+                            &mut request.rng,
+                            &FirstTokenCtx {
+                                num_prompt_tokens: request.prompt_token_ids.len(),
+                                num_cached_tokens: request.num_cached_tokens,
+                                do_remote_prefill: false,
+                                num_running,
+                            },
+                        ),
+                    });
+                }
+                let first_chunk = request
+                    .script
+                    .as_ref()
+                    .filter(|_| request.num_generated == 0)
+                    .map_or(1, |script| script.first_chunk_tokens as usize)
+                    .min(remaining)
+                    .min(1 + self.spec_tokens);
+                if first_chunk > 1 + num_drafts {
+                    request.pending_first_chunk = Some(first_chunk);
+                    drafts.req_ids.push(request_id.clone());
+                    drafts
+                        .draft_token_ids
+                        .push(vec![DRAFT_TOKEN_ID; first_chunk - 1]);
+                    sampled_token_ids.push(Vec::new());
+                    continue;
+                }
+                first_chunk
+            };
+
             let tokens = self.token_source.next_tokens(
                 &TokenCtx {
                     request_id,
                     prompt_token_ids: &request.prompt_token_ids,
                     num_generated: request.num_generated,
                 },
-                1,
+                wanted.clamp(1, remaining.min(1 + num_drafts)),
                 &mut request.rng,
             );
             request.num_generated += tokens.len();
             request.num_tokens += tokens.len();
+            if num_drafts > 0 {
+                accepted += tokens.len().saturating_sub(1);
+            }
             sampled_token_ids.push(tokens.into_iter().map(|token| token as i32).collect());
+            if self.spec_tokens > 0 {
+                drafts.req_ids.push(request_id.clone());
+                drafts
+                    .draft_token_ids
+                    .push(vec![DRAFT_TOKEN_ID; self.spec_tokens]);
+            }
         }
 
         if prefill_tokens > 0 && scheduled.total_num_scheduled_tokens >= self.max_num_batched_tokens
@@ -263,6 +418,10 @@ impl SimRunner {
             prefill_cost = prefill_cost.max(self.latency.budget_full_chunk_floor());
         }
 
+        let cost = match &mut self.step_costs {
+            Some(costs) => costs.steps.price(&shape, &mut costs.rng),
+            None => decode_cost.max(prefill_cost),
+        };
         StepResult {
             output: ModelRunnerOutput {
                 req_ids,
@@ -270,7 +429,11 @@ impl SimRunner {
                 kv_connector_output,
                 ..Default::default()
             },
-            duration: decode_cost.max(prefill_cost).div_f64(self.time_scale),
+            drafts,
+            duration: cost.div_f64(self.time_scale),
+            shape,
+            accepted,
+            loads_started,
         }
     }
 
@@ -280,6 +443,7 @@ impl SimRunner {
         &mut self,
         scheduled: &SchedulerOutput,
         num_running: u64,
+        loads_started: &mut Vec<(String, usize)>,
     ) -> Option<KvConnectorOutput> {
         let metadata = scheduled
             .kv_connector_metadata
@@ -367,19 +531,32 @@ impl SimRunner {
                     .fail_load(request_id, "the prompt does not cover the blocks to load");
                 continue;
             };
-            let transfer_time = self
-                .latency
-                .first_token_overhead(
-                    &mut request.rng,
-                    &FirstTokenCtx {
-                        num_prompt_tokens: request.prompt_token_ids.len(),
-                        num_cached_tokens: 0,
-                        do_remote_prefill: true,
-                        num_running,
-                    },
-                )
-                .div_f64(self.time_scale);
+            let modeled = self.latency.first_token_overhead(
+                &mut request.rng,
+                &FirstTokenCtx {
+                    num_prompt_tokens: request.prompt_token_ids.len(),
+                    num_cached_tokens: 0,
+                    do_remote_prefill: true,
+                    num_running,
+                },
+            );
             request.emit_offset = Some(Duration::ZERO);
+            let recorded = self.step_costs.as_mut().and_then(|costs| {
+                let loads = costs.kv_loads.as_ref()?;
+                Some(loads.draw(local.len(), &mut costs.rng))
+            });
+            let transfer_time = recorded
+                .map_or(modeled, |load| load.duration)
+                .div_f64(self.time_scale);
+            loads_started.push((request_id.clone(), local.len()));
+            if recorded.is_some_and(|load| load.outcome != KvOutcome::Ok) {
+                if !push {
+                    self.kv.release_remote(remote);
+                }
+                self.kv
+                    .fail_load_after(request_id, "the recorded load failed", transfer_time);
+                continue;
+            }
 
             if push {
                 self.kv.expect_push(request_id, expected, transfer_time);
@@ -415,6 +592,7 @@ impl SimRunner {
         request.num_tokens = new.prefill_token_ids.len();
         request.num_computed = new.num_computed_tokens;
         request.prefilled = false;
+        request.pending_first_chunk = None;
         request.block_ids = new.block_ids.first().cloned().unwrap_or_default();
         if request.pacing.is_some() {
             return;
@@ -453,9 +631,11 @@ mod tests {
 
     use crate::Opt;
     use crate::latency::{FirstTokenCtx, LatencyModel};
+    use crate::replay_steps::{IndexSteps, StepSource};
     use crate::rust_core::nixl::NixlWorker;
-    use crate::rust_core::runner::{OutputLimits, SimRunner};
+    use crate::rust_core::runner::{OutputLimits, SimRunner, Sources};
     use crate::tokens::RandomTokens;
+    use crate::trace::TraceRecord;
 
     /// 10ms per decode step, 1ms per prefill token, 500ms first-token overhead.
     struct FixedCosts;
@@ -476,9 +656,30 @@ mod tests {
     }
 
     fn runner(time_scale: f64) -> SimRunner {
+        runner_with_steps(time_scale, None)
+    }
+
+    /// A runner replaying one recorded request, matched by the id `replay-0`.
+    fn replaying(output_tokens: usize, gaps_ms: &[f64], bursts: &[u32]) -> SimRunner {
+        let record = TraceRecord {
+            prompt_tokens: 20,
+            output_tokens,
+            ttft_ms: 1.0,
+            itl_ms: Some(gaps_ms.to_vec()),
+            itl_tokens: Some(bursts.to_vec()),
+            ..Default::default()
+        };
+        runner_with_steps(1.0, Some(Box::new(IndexSteps::from_records(vec![record]))))
+    }
+
+    fn runner_with_steps(time_scale: f64, step_source: Option<Box<dyn StepSource>>) -> SimRunner {
         SimRunner::new(
-            Box::new(FixedCosts),
-            Box::new(RandomTokens { vocab_size: 100 }),
+            Sources {
+                latency: Box::new(FixedCosts),
+                token_source: Box::new(RandomTokens { vocab_size: 100 }),
+                step_source,
+                step_costs: None,
+            },
             NixlWorker::new(&Opt::parse_from(["play"]), 0),
             16,
             128,
@@ -487,16 +688,26 @@ mod tests {
     }
 
     fn register(runner: &mut SimRunner, request_id: &str, prompt_len: usize) {
+        register_up_to(runner, request_id, prompt_len, 8);
+    }
+
+    /// Register a request and return the output length the worker settled on.
+    fn register_up_to(
+        runner: &mut SimRunner,
+        request_id: &str,
+        prompt_len: usize,
+        max_tokens: usize,
+    ) -> usize {
         runner.register(
             request_id,
             7,
             vec![1; prompt_len],
             OutputLimits {
-                max_tokens: 8,
+                max_tokens,
                 min_tokens: 0,
                 sample_output_len: false,
             },
-        );
+        )
     }
 
     fn new_request(request_id: &str, prefill_len: usize, num_computed: usize) -> NewRequestData {
@@ -626,5 +837,139 @@ mod tests {
         flush.finished_req_ids.insert("a".to_string());
         runner.execute(&flush, 0);
         assert_eq!(runner.emit_offset("a"), Duration::ZERO);
+    }
+
+    fn with_drafts(
+        mut scheduled: SchedulerOutput,
+        request_id: &str,
+        drafts: usize,
+    ) -> SchedulerOutput {
+        scheduled
+            .scheduled_spec_decode_tokens
+            .insert(request_id.to_string(), vec![0; drafts]);
+        scheduled
+    }
+
+    #[test]
+    fn a_recorded_burst_accepts_drafts_and_takes_its_recorded_gap() {
+        let mut runner = replaying(9, &[35.0, 45.0], &[4, 4]);
+        assert_eq!(runner.spec_tokens(), 3);
+        assert_eq!(register_up_to(&mut runner, "replay-0", 20, 100), 9);
+
+        let prefill = runner.execute(
+            &step(
+                vec![new_request("replay-0", 20, 0)],
+                &[],
+                &[("replay-0", 20)],
+            ),
+            1,
+        );
+        assert_eq!(prefill.output.sampled_token_ids[0].len(), 1);
+        assert_eq!(prefill.drafts.req_ids, ["replay-0"]);
+        assert_eq!(prefill.drafts.draft_token_ids, [vec![0; 3]]);
+
+        let burst = runner.execute(
+            &with_drafts(
+                step(Vec::new(), &[("replay-0", 20)], &[("replay-0", 4)]),
+                "replay-0",
+                3,
+            ),
+            1,
+        );
+        assert_eq!(burst.output.sampled_token_ids[0].len(), 4);
+        assert_eq!(burst.duration, Duration::from_millis(35));
+        assert_eq!(burst.drafts.draft_token_ids, [vec![0; 3]]);
+    }
+
+    #[test]
+    fn a_burst_is_capped_by_the_drafts_scheduled_and_the_output_left() {
+        let mut runner = replaying(9, &[35.0, 45.0, 55.0], &[4, 2, 2]);
+        assert_eq!(register_up_to(&mut runner, "replay-0", 20, 6), 6);
+        runner.execute(
+            &step(
+                vec![new_request("replay-0", 20, 0)],
+                &[],
+                &[("replay-0", 20)],
+            ),
+            1,
+        );
+
+        let short_of_drafts = runner.execute(
+            &with_drafts(
+                step(Vec::new(), &[("replay-0", 20)], &[("replay-0", 3)]),
+                "replay-0",
+                2,
+            ),
+            1,
+        );
+        assert_eq!(short_of_drafts.output.sampled_token_ids[0].len(), 3);
+
+        let undrafted = runner.execute(
+            &step(Vec::new(), &[("replay-0", 23)], &[("replay-0", 1)]),
+            1,
+        );
+        assert_eq!(undrafted.output.sampled_token_ids[0].len(), 1);
+        assert_eq!(undrafted.duration, Duration::from_millis(45));
+
+        let last = runner.execute(
+            &with_drafts(
+                step(Vec::new(), &[("replay-0", 24)], &[("replay-0", 4)]),
+                "replay-0",
+                3,
+            ),
+            1,
+        );
+        assert_eq!(last.output.sampled_token_ids[0].len(), 1);
+        assert_eq!(last.duration, Duration::from_millis(55));
+    }
+
+    #[test]
+    fn a_recorded_first_chunk_waits_one_step_for_its_drafts() {
+        let mut runner = replaying(24, &[80.0, 80.0], &[8, 8]);
+        assert_eq!(runner.spec_tokens(), 7);
+        assert_eq!(register_up_to(&mut runner, "replay-0", 20, 100), 24);
+
+        let prefill = runner.execute(
+            &step(
+                vec![new_request("replay-0", 20, 0)],
+                &[],
+                &[("replay-0", 20)],
+            ),
+            1,
+        );
+        assert_eq!(prefill.output.sampled_token_ids, [Vec::<i32>::new()]);
+        assert_eq!(prefill.drafts.draft_token_ids, [vec![0; 7]]);
+        assert_eq!(prefill.duration, Duration::from_millis(20));
+
+        let first_chunk = runner.execute(
+            &with_drafts(
+                step(Vec::new(), &[("replay-0", 20)], &[("replay-0", 7)]),
+                "replay-0",
+                7,
+            ),
+            1,
+        );
+        assert_eq!(first_chunk.output.sampled_token_ids[0].len(), 8);
+        assert_eq!(first_chunk.duration, Duration::ZERO);
+
+        let block = runner.execute(
+            &with_drafts(
+                step(Vec::new(), &[("replay-0", 27)], &[("replay-0", 8)]),
+                "replay-0",
+                7,
+            ),
+            1,
+        );
+        assert_eq!(block.output.sampled_token_ids[0].len(), 8);
+        assert_eq!(block.duration, Duration::from_millis(80));
+    }
+
+    #[test]
+    fn no_drafts_are_proposed_without_multi_token_steps() {
+        let mut runner = runner(1.0);
+        register(&mut runner, "a", 4);
+        let result = runner.execute(&step(vec![new_request("a", 4, 0)], &[], &[("a", 4)]), 1);
+        assert_eq!(runner.spec_tokens(), 0);
+        assert!(result.drafts.req_ids.is_empty());
     }
 }

@@ -15,6 +15,7 @@
 
 mod convert;
 mod nixl;
+mod recorder;
 mod runner;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -28,6 +29,7 @@ use sim_protocol::mock_engine::DEFAULT_MOCK_MAX_MODEL_LEN;
 use sim_protocol::vllm::{
     self as vllm, EngineCoreFinishReason, EngineCoreOutput, EngineCoreRequest, SchedulerStats,
 };
+use sim_trace::steps::{KvTransferTable, StepTable, read_step_trace_file};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -37,7 +39,9 @@ use vllm_engine_core::hash::RequestBlockHasher;
 use vllm_engine_core::kv_cache::KvCacheEvent;
 use vllm_engine_core::sched::output::SchedulerOutput;
 use vllm_engine_core::sched::request::{Request, RequestStatus};
-use vllm_engine_core::sched::scheduler::{AcceptAllStructuredOutput, ModelRunnerOutput, Scheduler};
+use vllm_engine_core::sched::scheduler::{
+    AcceptAllStructuredOutput, DraftTokenIds, ModelRunnerOutput, Scheduler,
+};
 use vllm_engine_core_connectors::nixl::{NixlKvConnector, NixlKvTransferParams};
 
 use crate::Opt;
@@ -49,27 +53,51 @@ use crate::engine::{
 use crate::engine_core::{self, EngineCore, EngineInput, EngineOutput, UtilityRequestSpec};
 use crate::kvevents::KvEventTx;
 use crate::kvparams::extract_kv_params;
-use crate::latency::LatencyModel;
 use crate::lora::LoraRegistry;
 use crate::rust_core::nixl::NixlWorker;
-use crate::rust_core::runner::{OutputLimits, SimRunner, StepResult};
-use crate::tokens::TokenSource;
+use crate::rust_core::recorder::StepRecorder;
+use crate::rust_core::runner::{OutputLimits, SimRunner, Sources, StepCosts, StepResult};
 
 /// How often a step that could schedule nothing is retried, as in vLLM's engine loop.
 const IDLE_POLL: Duration = Duration::from_millis(1);
 
 /// Reject `play` options the scheduler-backed engine does not implement.
-pub(crate) fn validate(opt: &Opt, latency: &dyn LatencyModel) -> Result<()> {
+pub(crate) fn validate(opt: &Opt) -> Result<()> {
     if opt.output_token_chunk_size != 1 {
-        bail!("--use-rust-core emits one token per step; --output-token-chunk-size must be 1");
+        bail!(
+            "--use-rust-core frames output by its replayed steps; \
+             --output-token-chunk-size must be 1"
+        );
     }
-    if opt.replay_steps.is_some() {
-        bail!("--use-rust-core does not support --replay-steps yet");
-    }
-    if latency.spec_tokens().is_some() {
-        bail!("--use-rust-core does not support multi-token (speculative) latency traces yet");
+    if opt.step_trace_out.is_some() && opt.engine_count > 1 {
+        bail!("--step-trace-out writes one engine's steps; --engine-count must be 1");
     }
     Ok(())
+}
+
+/// The recorded step and KV load times `--step-trace` names, if it is set.
+pub(crate) fn step_costs(opt: &Opt, engine_index: u32) -> Result<Option<StepCosts>> {
+    let Some(uri) = &opt.step_trace else {
+        return Ok(None);
+    };
+    let trace = read_step_trace_file(crate::local_input(uri, "--step-trace")?)?;
+    let steps =
+        StepTable::from_records(&trace.steps).with_context(|| format!("--step-trace {uri}"))?;
+    let kv_loads = KvTransferTable::from_records(&trace.kv_transfers);
+    info!(
+        engine_index,
+        steps = trace.steps.len(),
+        shapes = steps.num_shapes(),
+        kv_transfers = trace.kv_transfers.len(),
+        "pricing steps from a recorded step trace"
+    );
+    Ok(Some(StepCosts {
+        steps,
+        kv_loads,
+        rng: StdRng::seed_from_u64(
+            opt.seed ^ (u64::from(engine_index) + 1).wrapping_mul(0x85eb_ca6b),
+        ),
+    }))
 }
 
 /// Run the engine loop on its own thread until shutdown or `abort`.
@@ -114,6 +142,7 @@ struct InFlightStep {
     end: Instant,
     scheduled: SchedulerOutput,
     result: ModelRunnerOutput,
+    drafts: DraftTokenIds,
 }
 
 struct PendingEmit {
@@ -130,6 +159,7 @@ pub(crate) struct RustCoreEngine {
     /// The scheduler's KV connector, shared to register each request's transfer params.
     nixl: NixlKvConnector,
     runner: SimRunner,
+    recorder: Option<StepRecorder>,
     hasher: Arc<RequestBlockHasher>,
     events: Option<KvEventTx>,
     failure_rng: StdRng,
@@ -148,22 +178,37 @@ pub(crate) struct RustCoreEngine {
 
 impl RustCoreEngine {
     fn new(engine_index: u32, opt: Opt, events: Option<KvEventTx>) -> Result<Self> {
-        let latency = opt.build_latency()?;
-        let token_source = opt.build_token_source()?;
-        Self::from_parts(engine_index, opt, latency, token_source, events)
+        let sources = Sources {
+            latency: opt.build_latency()?,
+            token_source: opt.build_token_source()?,
+            step_source: opt.build_step_source()?,
+            step_costs: step_costs(&opt, engine_index)?,
+        };
+        Self::from_parts(engine_index, opt, sources, events)
     }
 
     fn from_parts(
         engine_index: u32,
         opt: Opt,
-        latency: Box<dyn LatencyModel>,
-        token_source: Box<dyn TokenSource>,
+        sources: Sources,
         events: Option<KvEventTx>,
     ) -> Result<Self> {
-        validate(&opt, latency.as_ref())?;
+        validate(&opt)?;
+        let recorder = opt
+            .step_trace_out
+            .as_deref()
+            .map(|path| StepRecorder::create(path, &opt))
+            .transpose()?;
+        let runner = SimRunner::new(
+            sources,
+            NixlWorker::new(&opt, engine_index),
+            opt.tokens_per_block,
+            opt.max_num_batched_tokens.max(1) as usize,
+            opt.time_scale,
+        );
         let nixl = nixl::scheduler_half(&opt, engine_index)?;
         let scheduler = Scheduler::new(
-            convert::scheduler_config(&opt),
+            convert::scheduler_config(&opt, runner.spec_tokens()),
             convert::kv_cache_config(&opt),
             Some(Box::new(nixl.clone())),
             Box::new(AcceptAllStructuredOutput),
@@ -173,14 +218,8 @@ impl RustCoreEngine {
             engine_index,
             scheduler,
             nixl,
-            runner: SimRunner::new(
-                latency,
-                token_source,
-                NixlWorker::new(&opt, engine_index),
-                opt.tokens_per_block,
-                opt.max_num_batched_tokens.max(1) as usize,
-                opt.time_scale,
-            ),
+            runner,
+            recorder,
             hasher: convert::request_block_hasher(&opt),
             events,
             failure_rng: StdRng::seed_from_u64(
@@ -459,7 +498,16 @@ impl RustCoreEngine {
         }
         let scheduled = self.scheduler.schedule(false);
         let (num_running, _) = self.scheduler.get_request_counts();
-        let StepResult { output, duration } = self.runner.execute(&scheduled, num_running as u64);
+        let result = self.runner.execute(&scheduled, num_running as u64);
+        if let Some(recorder) = &mut self.recorder {
+            recorder.record(anchor, &result);
+        }
+        let StepResult {
+            output,
+            drafts,
+            duration,
+            ..
+        } = result;
         let duration = if scheduled.total_num_scheduled_tokens > 0 {
             duration
         } else if self.scheduler.has_requests() {
@@ -471,14 +519,16 @@ impl RustCoreEngine {
             end: anchor + duration,
             scheduled,
             result: output,
+            drafts,
         });
     }
 
     /// Hand a finished step's results to the scheduler and queue its outputs.
-    fn complete_step(&mut self, step: &InFlightStep) {
+    fn complete_step(&mut self, step: InFlightStep) {
         let update = self
             .scheduler
             .update_from_output(&step.scheduled, &step.result);
+        self.scheduler.update_draft_token_ids(step.drafts);
         self.publish(update.kv_cache_events);
 
         for (client_index, client_outputs) in update.engine_core_outputs {
@@ -508,8 +558,9 @@ impl RustCoreEngine {
     fn step(&mut self) -> Vec<EngineOutput> {
         let now = Instant::now();
         while let Some(step) = self.in_flight.take_if(|step| step.end <= now) {
-            self.complete_step(&step);
-            self.ensure_step(step.end);
+            let end = step.end;
+            self.complete_step(step);
+            self.ensure_step(end);
         }
 
         let mut by_client = ClientBatches::new();
@@ -662,13 +713,19 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use rand::SeedableRng as _;
     use rand::rngs::StdRng;
     use serde_json::json;
     use sim_protocol::vllm::{
         self as vllm, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
         EngineCoreRequest, EngineCoreSamplingParams, SchedulerStats,
     };
+    use sim_trace::steps::{
+        DecodeWork, KvDirection, KvOutcome, KvTransferRecord, KvTransferTable, PrefillChunk,
+        StepRecord, StepShape, StepTable, read_step_trace_file,
+    };
     use tokio::time::Instant;
+    use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
     use vllm_engine_core_client::protocol::utility::UtilityCallId;
 
     use crate::blockpool::KvCacheEvent;
@@ -676,8 +733,12 @@ mod tests {
     use crate::dataplane::PdRole;
     use crate::engine_core::{EngineCore, EngineInput, EngineOutput, UtilityRequestSpec};
     use crate::kvevents::KvEventTx;
-    use crate::latency::{FirstTokenCtx, LatencyModel};
+    use crate::latency::{FirstTokenCtx, LatencyModel, TraceLatency};
+    use crate::replay_steps::{IndexSteps, StepSource};
     use crate::rust_core::RustCoreEngine;
+    use crate::rust_core::runner::{Sources, StepCosts};
+    use crate::tokens::ReplayTokens;
+    use crate::trace::TraceRecord;
     use crate::{KvTransferMode, Opt};
 
     const SLOW: u64 = 10_000;
@@ -692,8 +753,21 @@ mod tests {
     }
 
     fn engine_with_latency(opt: Opt, latency: Box<dyn LatencyModel>) -> RustCoreEngine {
-        let token_source = opt.build_token_source().unwrap();
-        RustCoreEngine::from_parts(0, opt, latency, token_source, None).unwrap()
+        engine_with_sources(opt, latency, None)
+    }
+
+    fn engine_with_sources(
+        opt: Opt,
+        latency: Box<dyn LatencyModel>,
+        step_source: Option<Box<dyn StepSource>>,
+    ) -> RustCoreEngine {
+        let sources = Sources {
+            latency,
+            token_source: opt.build_token_source().unwrap(),
+            step_source,
+            step_costs: None,
+        };
+        RustCoreEngine::from_parts(0, opt, sources, None).unwrap()
     }
 
     fn prompt(seed: u32, len: usize) -> Vec<u32> {
@@ -1153,11 +1227,14 @@ mod tests {
     fn prefix_cache_changes_are_published_as_kv_events() {
         let mut opt = test_opt();
         opt.enable_kv_cache_events = true;
-        let latency = opt.build_latency().unwrap();
-        let token_source = opt.build_token_source().unwrap();
+        let sources = Sources {
+            latency: opt.build_latency().unwrap(),
+            token_source: opt.build_token_source().unwrap(),
+            step_source: None,
+            step_costs: None,
+        };
         let (tx, mut rx) = KvEventTx::channel();
-        let mut engine =
-            RustCoreEngine::from_parts(0, opt, latency, token_source, Some(tx)).unwrap();
+        let mut engine = RustCoreEngine::from_parts(0, opt, sources, Some(tx)).unwrap();
 
         let prompt_token_ids = prompt(1, 40);
         add(&mut engine, request("r1", prompt_token_ids.clone(), 1));
@@ -1491,11 +1568,507 @@ mod tests {
         assert_eq!(engine.num_unfinished_requests(), 0);
     }
 
+    fn recorded(output_tokens: usize, gaps_ms: &[f64], bursts: &[u32]) -> Box<dyn StepSource> {
+        Box::new(IndexSteps::from_records(vec![TraceRecord {
+            prompt_tokens: 8,
+            output_tokens,
+            ttft_ms: 1.0,
+            itl_ms: Some(gaps_ms.to_vec()),
+            itl_tokens: Some(bursts.to_vec()),
+            ..Default::default()
+        }]))
+    }
+
+    fn chunk_sizes(outputs: &[EngineCoreOutput]) -> Vec<usize> {
+        outputs
+            .iter()
+            .map(|output| output.new_token_ids.len())
+            .filter(|&len| len > 0)
+            .collect()
+    }
+
+    #[test]
+    fn recorded_bursts_are_delivered_as_accepted_drafts() {
+        let opt = test_opt();
+        let latency = opt.build_latency().unwrap();
+        let steps = recorded(9, &[0.0; 3], &[3, 1, 4]);
+        let mut engine = engine_with_sources(opt, latency, Some(steps));
+        add(&mut engine, request("replay-0", prompt(1, 8), 50));
+
+        let batches = engine.step();
+        let outputs = outputs(&batches);
+        assert_eq!(chunk_sizes(&outputs), [1, 3, 1, 4]);
+        assert_eq!(
+            outputs.last().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Length)
+        );
+        assert_eq!(engine.num_unfinished_requests(), 0);
+
+        let spec = stats(&batches).spec_decoding_stats.expect("spec stats");
+        assert_eq!(spec.num_spec_tokens, 3);
+        assert_eq!(spec.num_drafts, 3);
+        assert_eq!(spec.num_draft_tokens, 9);
+        assert_eq!(spec.num_accepted_tokens, 5);
+        assert_eq!(spec.num_accepted_tokens_per_pos, [2, 2, 1]);
+    }
+
+    #[test]
+    fn a_recorded_first_block_is_delivered_whole_one_step_after_the_prefill() {
+        let opt = test_opt();
+        let latency = opt.build_latency().unwrap();
+        let steps = recorded(24, &[0.0; 2], &[8, 8]);
+        let mut engine = engine_with_sources(opt, latency, Some(steps));
+        add(&mut engine, request("replay-0", prompt(1, 40), 24));
+
+        let prefill = engine.in_flight.as_ref().expect("the prefill step");
+        assert_eq!(prefill.scheduled.num_scheduled_tokens["replay-0"], 40);
+        assert!(prefill.result.sampled_token_ids[0].is_empty());
+        assert_eq!(prefill.drafts.draft_token_ids[0].len(), 7);
+
+        let batches = engine.step();
+        let outputs = outputs(&batches);
+        assert_eq!(chunk_sizes(&outputs), [8, 8, 8]);
+        assert_eq!(
+            outputs.last().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Length)
+        );
+        let spec = stats(&batches).spec_decoding_stats.expect("spec stats");
+        assert_eq!(spec.num_spec_tokens, 7);
+        assert_eq!(spec.num_drafts, 3);
+        assert_eq!(spec.num_draft_tokens, 21);
+        assert_eq!(spec.num_accepted_tokens, 21);
+    }
+
+    #[test]
+    fn a_recorded_gap_sets_the_step_clock() {
+        let opt = test_opt();
+        let latency = opt.build_latency().unwrap();
+        let steps = recorded(5, &[SLOW as f64], &[4]);
+        let mut engine = engine_with_sources(opt, latency, Some(steps));
+        let before = Instant::now();
+        add(&mut engine, request("replay-0", prompt(1, 8), 5));
+
+        assert_eq!(chunk_sizes(&outputs(&engine.step())), [1]);
+        let burst = engine.in_flight.as_ref().expect("the recorded decode step");
+        assert_eq!(burst.scheduled.num_scheduled_tokens["replay-0"], 4);
+        assert_eq!(
+            burst.scheduled.scheduled_spec_decode_tokens["replay-0"].len(),
+            3
+        );
+        assert_eq!(burst.result.sampled_token_ids[0].len(), 4);
+        assert!(burst.end >= before + Duration::from_millis(SLOW));
+    }
+
+    #[test]
+    fn a_request_without_a_record_stays_on_the_latency_model() {
+        let opt = test_opt();
+        let latency = opt.build_latency().unwrap();
+        let steps = recorded(9, &[0.0; 2], &[4, 4]);
+        let mut engine = engine_with_sources(opt, latency, Some(steps));
+        add(&mut engine, request("replay-7", prompt(1, 8), 5));
+
+        let batches = engine.step();
+        assert_eq!(chunk_sizes(&outputs(&batches)), [1; 5]);
+        let spec = stats(&batches).spec_decoding_stats.expect("spec stats");
+        assert_eq!(spec.num_drafts, 4);
+        assert_eq!(spec.num_draft_tokens, 12);
+        assert_eq!(spec.num_accepted_tokens, 0);
+    }
+
+    #[test]
+    fn concurrent_recorded_requests_keep_their_own_bursts() {
+        let opt = test_opt();
+        let latency = opt.build_latency().unwrap();
+        let records = [(7, vec![2, 4]), (6, vec![3, 2])]
+            .into_iter()
+            .map(|(output_tokens, bursts)| TraceRecord {
+                prompt_tokens: 8,
+                output_tokens,
+                ttft_ms: 1.0,
+                itl_ms: Some(vec![0.0; 2]),
+                itl_tokens: Some(bursts),
+                ..Default::default()
+            })
+            .collect();
+        let steps: Box<dyn StepSource> = Box::new(IndexSteps::from_records(records));
+        let mut engine = engine_with_sources(opt, latency, Some(steps));
+        add(&mut engine, request("replay-0", prompt(1, 8), 50));
+        add(&mut engine, request("replay-1", prompt(2, 8), 50));
+
+        let outputs = outputs(&engine.step());
+        assert_eq!(chunk_sizes(&outputs_of(&outputs, "replay-0")), [1, 2, 4]);
+        assert_eq!(chunk_sizes(&outputs_of(&outputs, "replay-1")), [1, 3, 2]);
+        assert_eq!(engine.num_unfinished_requests(), 0);
+        assert_eq!(engine.scheduler.get_request_counts(), (0, 0));
+    }
+
+    #[test]
+    fn a_stop_token_inside_a_burst_trims_it_and_finishes_the_request() {
+        let opt = test_opt();
+        let record = TraceRecord {
+            prompt_tokens: 8,
+            output_tokens: 9,
+            ttft_ms: 1.0,
+            itl_ms: Some(vec![0.0; 2]),
+            itl_tokens: Some(vec![4, 4]),
+            output_token_ids: Some(vec![5, 6, 0, 7, 8, 9, 10, 11, 12]),
+            ..Default::default()
+        };
+        let sources = Sources {
+            latency: opt.build_latency().unwrap(),
+            token_source: Box::new(ReplayTokens::from_records(
+                std::slice::from_ref(&record),
+                opt.vocab_size,
+            )),
+            step_source: Some(Box::new(IndexSteps::from_records(vec![record]))),
+            step_costs: None,
+        };
+        let mut engine = RustCoreEngine::from_parts(0, opt, sources, None).unwrap();
+        let mut stopping = request("replay-0", prompt(1, 8), 50);
+        stopping.sampling_params.as_mut().unwrap().stop_token_ids = vec![0];
+        add(&mut engine, stopping);
+
+        let outputs = outputs(&engine.step());
+        let tokens: Vec<_> = outputs
+            .iter()
+            .map(|output| output.new_token_ids.clone())
+            .filter(|tokens| !tokens.is_empty())
+            .collect();
+        assert_eq!(tokens, [vec![5], vec![6, 0]]);
+        assert_eq!(
+            outputs.last().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Stop)
+        );
+        assert_eq!(engine.num_unfinished_requests(), 0);
+        assert_eq!(engine.scheduler.get_request_counts(), (0, 0));
+    }
+
+    #[test]
+    fn a_multi_token_latency_trace_paces_and_frames_its_bursts() {
+        let opt = test_opt();
+        let records: Vec<TraceRecord> = (0..4)
+            .map(|_| TraceRecord {
+                prompt_tokens: 4,
+                output_tokens: 49,
+                ttft_ms: 1.0,
+                itl_ms: Some(vec![10.0; 12]),
+                itl_tokens: Some(vec![4; 12]),
+                concurrency: 1,
+                ..Default::default()
+            })
+            .collect();
+        let latency = TraceLatency::from_records(
+            &records,
+            opt.latency_model(),
+            opt.max_num_batched_tokens as usize,
+        )
+        .unwrap();
+        let mut engine = engine_with_latency(opt, Box::new(latency));
+        let start = Instant::now();
+        add(&mut engine, request("r1", prompt(1, 4), 9));
+
+        let mut chunks = Vec::new();
+        let mut spec = SpecDecodingStats::default();
+        while engine.num_unfinished_requests() > 0 {
+            let deadline = engine.earliest_deadline().expect("a deadline while busy");
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            let batches = engine.step();
+            chunks.extend(chunk_sizes(&outputs(&batches)));
+            for batch in &batches {
+                let step = vllm::scheduler_stats(&batch.outputs)
+                    .and_then(|stats| stats.spec_decoding_stats.as_ref());
+                if let Some(step) = step {
+                    assert_eq!(step.num_spec_tokens, 3);
+                    spec.num_drafts += step.num_drafts;
+                    spec.num_draft_tokens += step.num_draft_tokens;
+                    spec.num_accepted_tokens += step.num_accepted_tokens;
+                }
+            }
+        }
+        assert_eq!(chunks, [1, 4, 4]);
+        assert!(start.elapsed() >= Duration::from_millis(20));
+        assert_eq!(spec.num_drafts, 2);
+        assert_eq!(spec.num_draft_tokens, 6);
+        assert_eq!(spec.num_accepted_tokens, 6);
+    }
+
+    fn decode_shape(reqs: u32, context_tokens: u64) -> StepShape {
+        StepShape {
+            decode: DecodeWork {
+                reqs,
+                tokens: reqs,
+                drafts: 0,
+                context_tokens,
+            },
+            prefill: Vec::new(),
+        }
+    }
+
+    fn prefill_shape(tokens: u32, kv_depth: u32) -> StepShape {
+        StepShape {
+            decode: DecodeWork::default(),
+            prefill: vec![PrefillChunk {
+                tokens,
+                kv_depth,
+                last: true,
+            }],
+        }
+    }
+
+    fn recorded_step(shape: StepShape, step_ms: f64) -> StepRecord {
+        StepRecord {
+            step: 0,
+            ts_ms: 0.0,
+            exec_ms: step_ms,
+            step_ms,
+            sched_ms: 0.0,
+            update_ms: 0.0,
+            shape,
+            sampled: 0,
+            accepted: 0,
+        }
+    }
+
+    fn recorded_load(blocks: u32, wall_ms: f64, outcome: KvOutcome) -> KvTransferRecord {
+        KvTransferRecord {
+            direction: KvDirection::Recv,
+            blocks,
+            start_step: 0,
+            end_step: 1,
+            wall_ms,
+            outcome,
+        }
+    }
+
+    fn engine_with_costs(
+        opt: Opt,
+        steps: &[StepRecord],
+        loads: &[KvTransferRecord],
+    ) -> RustCoreEngine {
+        let sources = Sources {
+            latency: opt.build_latency().unwrap(),
+            token_source: opt.build_token_source().unwrap(),
+            step_source: None,
+            step_costs: Some(StepCosts {
+                steps: StepTable::from_records(steps).unwrap(),
+                kv_loads: KvTransferTable::from_records(loads),
+                rng: StdRng::seed_from_u64(1),
+            }),
+        };
+        RustCoreEngine::from_parts(0, opt, sources, None).unwrap()
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("vcr-rust-core-{name}-{}.jsonl", std::process::id()))
+    }
+
+    #[test]
+    fn a_step_trace_prices_each_step_by_its_shape() {
+        let steps = [
+            recorded_step(prefill_shape(40, 0), 300.0),
+            recorded_step(decode_shape(1, 40), SLOW as f64),
+        ];
+        let mut engine = engine_with_costs(test_opt(), &steps, &[]);
+        let before = Instant::now();
+        add(&mut engine, request("r1", prompt(1, 40), 3));
+
+        let prefill = engine.in_flight.as_ref().expect("the prefill step");
+        assert!(prefill.end >= before + Duration::from_millis(300));
+        assert!(prefill.end < before + Duration::from_millis(SLOW));
+
+        std::thread::sleep(Duration::from_millis(320));
+        assert_eq!(num_tokens(&outputs(&engine.step())), 1);
+        let decode = engine.in_flight.as_ref().expect("the first decode step");
+        assert!(decode.end >= before + Duration::from_millis(300 + SLOW));
+    }
+
+    #[test]
+    fn a_step_trace_replaces_the_latency_models_step_times() {
+        let mut opt = test_opt();
+        opt.inter_token_latency = SLOW;
+        opt.prefill_time_per_token = SLOW;
+        opt.prefill_overhead = SLOW;
+        let steps = [
+            recorded_step(prefill_shape(40, 0), 0.0),
+            recorded_step(decode_shape(1, 40), 0.0),
+        ];
+        let mut engine = engine_with_costs(opt, &steps, &[]);
+        add(&mut engine, request("r1", prompt(1, 40), 4));
+
+        let outputs = outputs(&engine.step());
+        assert_eq!(num_tokens(&outputs), 4);
+        assert_eq!(engine.num_unfinished_requests(), 0);
+    }
+
+    #[test]
+    fn a_recorded_run_replays_its_step_times_on_another_engine() {
+        let path = temp_path("step-round-trip");
+        let mut opt = test_opt();
+        opt.inter_token_latency = 30;
+        opt.max_num_batched_tokens = 64;
+        opt.step_trace_out = Some(path.clone());
+        let mut source = engine(opt);
+        add(&mut source, request("r1", prompt(1, 100), 6));
+        assert_eq!(num_tokens(&outputs(&run_to_idle(&mut source))), 6);
+        drop(source);
+
+        let trace = read_step_trace_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(trace.meta.source.as_deref(), Some("vllm-vcr play"));
+        let shapes: Vec<&StepShape> = trace.steps.iter().map(|step| &step.shape).collect();
+        assert_eq!(
+            shapes[0].prefill,
+            [PrefillChunk {
+                tokens: 64,
+                kv_depth: 0,
+                last: false
+            }]
+        );
+        assert_eq!(
+            shapes[1].prefill,
+            [PrefillChunk {
+                tokens: 36,
+                kv_depth: 64,
+                last: true
+            }]
+        );
+        let decodes: Vec<_> = shapes[2..].iter().map(|shape| shape.decode).collect();
+        assert_eq!(
+            decodes,
+            (0..5)
+                .map(|step| decode_shape(1, 100 + step).decode)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            trace.steps.iter().map(|step| step.step).collect::<Vec<_>>(),
+            (1..=7).collect::<Vec<_>>()
+        );
+        assert_eq!(trace.steps.iter().map(|step| step.sampled).sum::<u32>(), 6);
+        assert!(trace.steps[2..].iter().all(|step| step.step_ms == 30.0));
+        assert!(trace.steps[..2].iter().all(|step| step.step_ms == 0.0));
+
+        let mut opt = test_opt();
+        opt.max_num_batched_tokens = 64;
+        let mut replay = engine_with_costs(opt, &trace.steps, &trace.kv_transfers);
+        let started = std::time::Instant::now();
+        add(&mut replay, request("other", prompt(2, 100), 6));
+        assert_eq!(num_tokens(&outputs(&run_to_idle(&mut replay))), 6);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "replayed in {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "replayed in {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_remote_load_takes_its_recorded_time() {
+        let params = prefill(prompt(1, 40));
+        let mut opt = test_opt();
+        opt.pd_role = PdRole::Decode;
+        let steps = [recorded_step(decode_shape(1, 40), 0.0)];
+        let loads = [recorded_load(3, 150.0, KvOutcome::Ok)];
+        let mut engine = engine_with_costs(opt, &steps, &loads);
+        let started = std::time::Instant::now();
+        add(&mut engine, kv_request("d-1", prompt(1, 40), 1, params));
+
+        let outputs = outputs(&run_to_idle(&mut engine));
+        assert_eq!(num_tokens(&outputs), 1);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        let prefill = outputs[0].prefill_stats.clone().unwrap();
+        assert!(prefill.num_external_cached_tokens > 0);
+    }
+
+    #[test]
+    fn a_recorded_load_failure_is_replayed_recomputed_and_recorded_again() {
+        let path = temp_path("kv-failure");
+        let params = prefill(prompt(1, 40));
+        let mut opt = test_opt();
+        opt.pd_role = PdRole::Decode;
+        opt.step_trace_out = Some(path.clone());
+        let steps = [recorded_step(decode_shape(1, 40), 0.0)];
+        let loads = [recorded_load(3, 120.0, KvOutcome::Failed)];
+        let mut engine = engine_with_costs(opt, &steps, &loads);
+        let started = std::time::Instant::now();
+        add(&mut engine, kv_request("d-1", prompt(1, 40), 2, params));
+
+        let outputs = outputs(&run_to_idle(&mut engine));
+        assert_eq!(num_tokens(&outputs), 2);
+        assert!(started.elapsed() >= Duration::from_millis(120));
+        let prefill = outputs[0].prefill_stats.clone().unwrap();
+        assert_eq!(prefill.num_external_cached_tokens, 0);
+        assert_eq!(prefill.num_computed_tokens, 40);
+        drop(engine);
+
+        let trace = read_step_trace_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(trace.kv_transfers.len(), 1);
+        assert_eq!(trace.kv_transfers[0].outcome, KvOutcome::Failed);
+        assert_eq!(trace.kv_transfers[0].blocks, 3);
+        assert!(trace.kv_transfers[0].wall_ms >= 120.0);
+    }
+
+    #[test]
+    fn remote_loads_are_recorded_with_their_size_time_and_outcome() {
+        let path = temp_path("kv-record");
+        let mut opt = test_opt();
+        opt.pd_role = PdRole::Decode;
+        opt.kv_cache_transfer_latency = 80;
+        opt.step_trace_out = Some(path.clone());
+        let mut engine = engine(opt);
+        add(
+            &mut engine,
+            kv_request("ok", prompt(1, 40), 1, prefill(prompt(1, 40))),
+        );
+        run_to_idle(&mut engine);
+        let mut unreadable = prefill(prompt(2, 40));
+        unreadable["remote_block_ids"] = json!([[7]]);
+        add(&mut engine, kv_request("bad", prompt(2, 40), 1, unreadable));
+        run_to_idle(&mut engine);
+        drop(engine);
+
+        let trace = read_step_trace_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let loads = &trace.kv_transfers;
+        assert_eq!(loads.len(), 1, "{loads:?}");
+        assert_eq!(loads[0].direction, KvDirection::Recv);
+        assert_eq!(loads[0].outcome, KvOutcome::Ok);
+        assert_eq!(loads[0].blocks, 3);
+        assert!(loads[0].wall_ms >= 80.0, "{loads:?}");
+        assert!(loads[0].end_step >= loads[0].start_step);
+    }
+
+    #[test]
+    fn step_trace_flags_need_the_rust_core_and_one_engine() {
+        let mut opt = Opt::parse_from(["play"]);
+        opt.step_trace_out = Some(temp_path("unused"));
+        assert!(opt.validate_engine().is_err());
+
+        let mut opt = test_opt();
+        opt.step_trace_out = Some(temp_path("unused"));
+        assert!(opt.validate_engine().is_ok());
+        opt.engine_count = 2;
+        assert!(opt.validate_engine().is_err());
+    }
+
+    #[test]
+    fn an_unusable_step_trace_fails_at_startup() {
+        let path = temp_path("empty-step-trace");
+        std::fs::write(&path, "{\"meta\": {}}\n").unwrap();
+        let mut opt = test_opt();
+        opt.step_trace = Some(path.to_str().unwrap().parse().unwrap());
+        let error = opt.validate_engine().unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(format!("{error:#}").contains("no executed steps"));
+    }
+
     #[test]
     fn push_mode_is_refused_without_the_rust_core() {
         let opt = Opt::parse_from(["play", "--kv-transfer-mode", "push"]);
-        let latency = opt.build_latency().unwrap();
-        assert!(opt.validate_engine(latency.as_ref()).is_err());
+        assert!(opt.validate_engine().is_err());
     }
 
     #[test]
@@ -1517,15 +2090,9 @@ mod tests {
 
     #[test]
     fn unsupported_options_are_rejected_at_startup() {
-        let cases: [fn(&mut Opt); 1] = [|opt| opt.output_token_chunk_size = 2];
-        for unsupported in cases {
-            let mut opt = test_opt();
-            unsupported(&mut opt);
-            let latency = opt.build_latency().unwrap();
-            assert!(opt.validate_engine(latency.as_ref()).is_err());
-        }
-        let opt = test_opt();
-        let latency = opt.build_latency().unwrap();
-        assert!(opt.validate_engine(latency.as_ref()).is_ok());
+        let mut opt = test_opt();
+        opt.output_token_chunk_size = 2;
+        assert!(opt.validate_engine().is_err());
+        assert!(test_opt().validate_engine().is_ok());
     }
 }
