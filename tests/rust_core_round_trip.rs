@@ -472,15 +472,34 @@ async fn recorded_step_times_survive_a_record_replay_round_trip() {
     }
 }
 
-fn median(values: &mut [f64]) -> f64 {
+fn quantile(values: &mut [f64], q: f64) -> f64 {
     values.sort_by(f64::total_cmp);
-    values[values.len() / 2]
+    values[((values.len() as f64 * q) as usize).min(values.len() - 1)]
+}
+
+/// Gaps of `records` that closed on a step with `running` requests and no
+/// prefill work, by the tap's per-gap batch context.
+fn decode_only_gaps(records: &[TraceRecord], running: usize) -> Vec<f64> {
+    let mut gaps = Vec::new();
+    for record in records {
+        let (Some(itl_ms), Some(context)) = (&record.itl_ms, &record.itl_ctx) else {
+            continue;
+        };
+        for (i, gap) in itl_ms.iter().enumerate() {
+            if context.num_running[i] as usize == running && context.prefill_tokens[i] == 0 {
+                gaps.push(*gap);
+            }
+        }
+    }
+    gaps
 }
 
 /// Replays an engine-step trace captured from vLLM (`VCR_STEP_TRACE`, e.g. the
-/// `engine-steps.jsonl` that `just capture-run` fetches) and compares the step
-/// gaps the tap sees with the step times recorded at the same decode
-/// concurrency. Run it through `just replay-step-capture <trace>`.
+/// `engine-steps.jsonl` that `just capture-run` fetches) and compares the
+/// decode-only step gaps the tap sees with the decode-only step times recorded
+/// at the same concurrency. Run it through `just replay-step-capture <trace>`. With
+/// `VCR_REPLAY_OUT` set to a directory, the tap traces of the replays are kept
+/// there as `replay-c<concurrency>.jsonl`.
 #[tokio::test]
 #[ignore = "needs VCR_STEP_TRACE, an engine-step trace captured from vLLM"]
 async fn a_captured_step_trace_replays_its_step_times() {
@@ -506,26 +525,38 @@ async fn a_captured_step_trace_replays_its_step_times() {
             .sum();
         let prompt_len = context as usize / (decodes.len() * concurrency);
 
-        let waves = vec![vec![Ask::new(prompt_len, 48); concurrency]];
+        let waves = vec![vec![Ask::new(prompt_len, 48); concurrency]; 4];
         let replayed = generation(
             &format!("capture-replay-{concurrency}"),
             &["--step-trace", &step_trace],
             &waves,
         )
         .await;
-        let mut got: Vec<f64> = replayed
-            .records
-            .iter()
-            .flat_map(|record| record.itl_ms.clone().unwrap_or_default())
-            .collect();
-        assert_eq!(got.len(), concurrency * 47);
-
-        let (want, got) = (median(&mut want), median(&mut got));
+        let mut got = decode_only_gaps(&replayed.records, concurrency);
         assert!(
-            (0.9 * want..=1.1 * want).contains(&got),
-            "{concurrency} concurrent: replayed median step gap {got:.2}ms, captured {want:.2}ms"
+            got.len() >= concurrency * 4 * 20,
+            "{concurrency} concurrent: only {} decode-only gaps in the replay",
+            got.len()
         );
-        println!("{concurrency} concurrent: replayed {got:.2}ms, captured {want:.2}ms");
+
+        let (want_p50, got_p50) = (quantile(&mut want, 0.5), quantile(&mut got, 0.5));
+        assert!(
+            (0.9 * want_p50..=1.1 * want_p50).contains(&got_p50),
+            "{concurrency} concurrent: replayed median step gap {got_p50:.2}ms, \
+             captured {want_p50:.2}ms"
+        );
+        println!(
+            "{concurrency} concurrent: replayed p50 {got_p50:.2}ms p90 {:.2}ms over {} gaps, \
+             captured p50 {want_p50:.2}ms p90 {:.2}ms over {} steps",
+            quantile(&mut got, 0.9),
+            got.len(),
+            quantile(&mut want, 0.9),
+            want.len()
+        );
+        if let Ok(keep) = std::env::var("VCR_REPLAY_OUT") {
+            let kept = std::path::Path::new(&keep).join(format!("replay-c{concurrency}.jsonl"));
+            std::fs::copy(&replayed.trace_path, kept).expect("keeping the replay trace");
+        }
         let _ = std::fs::remove_file(&replayed.trace_path);
     }
 }
