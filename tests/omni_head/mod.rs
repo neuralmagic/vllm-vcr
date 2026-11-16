@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vllm_vcr::{Opt, run};
 use zeromq::prelude::{Socket as _, SocketRecv as _, SocketSend as _};
-use zeromq::{RouterSocket, ZmqMessage};
+use zeromq::{PullSocket, PushSocket, RouterSocket, ZmqMessage};
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -171,6 +171,22 @@ impl Head {
         identity
     }
 
+    /// Bind the data sockets a head opens for a diffusion stage, once the
+    /// stage is READY: a PUSH for requests and a PULL for responses.
+    pub async fn bind_diffusion(&self) -> (PushSocket, PullSocket) {
+        let mut requests = PushSocket::new();
+        requests
+            .bind(&self.input_address)
+            .await
+            .expect("bind input");
+        let mut responses = PullSocket::new();
+        responses
+            .bind(&self.output_address)
+            .await
+            .expect("bind output");
+        (requests, responses)
+    }
+
     pub async fn replica_event(&mut self) -> serde_json::Value {
         let frames = within("replica event", self.coordinator.recv())
             .await
@@ -267,4 +283,73 @@ pub fn audio_samples(output: &[Value], vllm_fields: usize) -> Option<u64> {
     };
     assert_eq!(data.len() as u64, samples * 4);
     Some(samples)
+}
+
+pub fn hex(fixture: &str) -> Vec<u8> {
+    let fixture = fixture.trim();
+    (0..fixture.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&fixture[i..i + 2], 16).expect("hex"))
+        .collect()
+}
+
+/// A diffusion `add_request` for one image.
+pub fn generate(request_id: &str, width: u32, height: u32, steps: u32) -> Vec<u8> {
+    encode(&map(vec![
+        ("type", Value::from("add_request")),
+        ("request_id", Value::from(request_id)),
+        ("prompt", map(vec![("prompt", Value::from("a red fox"))])),
+        (
+            "sampling_params",
+            map(vec![
+                ("num_outputs_per_prompt", Value::from(1)),
+                ("width", Value::from(width)),
+                ("height", Value::from(height)),
+                ("num_inference_steps", Value::from(steps)),
+            ]),
+        ),
+    ]))
+}
+
+/// One HTTP/1.1 exchange with the control API, retried until the server is
+/// listening.
+pub async fn control(
+    address: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (u16, serde_json::Value) {
+    use std::io::{Read as _, Write as _};
+
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: control\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let address = address.to_string();
+    let exchange = tokio::task::spawn_blocking(move || {
+        let mut stream = loop {
+            match std::net::TcpStream::connect(&address) {
+                Ok(stream) => break stream,
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    });
+    let response = within("control API exchange", exchange)
+        .await
+        .expect("control exchange join");
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in {response:?}"));
+    let body = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+    (
+        status,
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
+    )
 }

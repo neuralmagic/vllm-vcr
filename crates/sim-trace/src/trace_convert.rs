@@ -21,7 +21,7 @@ use std::io::{BufRead, Write};
 use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
-use crate::trace::{ItlSummary, TraceMeta, TraceRecord, read_trace, write_trace};
+use crate::trace::{ItlSummary, TraceKind, TraceMeta, TraceRecord, read_trace, write_trace};
 
 // guidellm JSON schema (minimal subset we actually use)
 
@@ -140,6 +140,7 @@ pub fn convert_guidellm(
         .or_else(|| report.args.as_ref().and_then(|a| a.target.clone()));
 
     let meta = TraceMeta {
+        kind: TraceKind::Llm,
         model: opts.model.clone().or(report_model),
         gpu: opts.gpu.clone(),
         tp: opts.tp,

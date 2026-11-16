@@ -144,25 +144,76 @@ time = overhead + step_time × steps × images × (width × height ÷ 1024²)
 An edit request is timed the same way as a generation of its output size. The input
 images are received and counted, not modeled.
 
-The stage returns flat gray RGB images of the requested size and count. The head
-PNG-encodes them without compression, so response size matches a real image of the
-same dimensions.
+The stage returns RGB images of the requested size and count, each noise in its top
+half and flat gray below. The head PNG-encodes them without compression, so response
+size matches a real image of the same dimensions. The noise is there for the head's
+encoder, whose time depends on content: at 1024x1024 it takes 8 ms on a flat image,
+64 ms on noise, 45 ms on a FLUX.2-klein output, and 36 ms on the mock's image. The
+same request always returns the same bytes.
 
 A request for more than 64 megapixels in total is answered with a 400. An aborted
 request frees its execution slot and sends nothing, as a real stage does.
+
+### Trace replay
+
+`--latency-trace` takes a [recorded diffusion trace](#recording-a-diffusion-stage) and
+replaces the two latency knobs. It is exclusive with `--omni-diffusion-step-time` and
+`--omni-diffusion-overhead`.
+
+```bash
+vllm-vcr play --omni-master-address tcp://127.0.0.1:21212 --omni-stage-id 0 \
+  --omni-stage-kind diffusion --latency-trace flux.jsonl
+```
+
+A request is matched to the trace by its shape: size, step count, image count, and
+number of input images, each as the head sent it (a field the client left unset
+matches only requests that left it unset).
+
+- **A recorded shape** replays that shape's recorded times in the order they were
+  recorded, wrapping around. A slow first request of a shape (a cold compile) is
+  replayed where it was recorded. A request that set no size returns images of the
+  size the recorded request returned.
+- **Any other shape** is timed by the latency model above, with `overhead` and
+  `step_time` fitted by least squares to the median time of each recorded shape. If
+  the trace holds one step count, or the fit would be negative, the fit is a line
+  through the origin. If no recorded request has a known size and step count, every
+  unrecorded shape takes the median recorded time. The fit does not know edits from
+  generations.
+
+A recorded request's latency at the tap is replayed in three parts, split by the
+stage's own metrics:
+
+| Part | From the trace | In the mock |
+| --- | --- | --- |
+| Queue wait | `scheduler_queue_wait_ms` | Not replayed. The mock queues requests itself. |
+| Slot | `diffusion_engine_exec_time_ms` less the wait | Holds one of `--omni-diffusion-concurrency` execution slots. |
+| Tail | latency less `diffusion_engine_exec_time_ms` | Runs after the slot is released, before the result is sent. |
+
+The tail is post-processing and serialization, which a real stage does while its next
+request is already denoising. A trace without the stage's exec time replays the whole
+time in the slot, as a fitted time does.
+
+Set `--omni-diffusion-concurrency` to what the real stage runs at once; the trace does
+not record it. Recorded times carry whatever contention the stage was under, so a
+trace recorded at one load replays best at a similar one.
+
+Only finished requests carry timing. Recorded errors and aborts are in the trace and
+are not replayed.
 
 ### Control API
 
 `--control-address` serves the [runtime control API](./control-api.md#diffusion-stages)
 on a diffusion stage too: read and patch the latency knobs and concurrency, and read
-request counters with exact running and waiting counts.
+request counters with exact running and waiting counts. Under `--latency-trace` the
+latency fields report the fitted model and a patch to them is refused with `409`.
 
 ## Recording a stage
 
-`vllm-vcr record` can sit between the head and a real LLM stage and capture that
-stage's requests the way it captures a plain engine's: per-token timing, token ids
-with `--record-tokens`, and the trace metadata, plus `omni_stage_id`. The trace then
-drives a mock of the same stage through `--latency-trace` and `--replay-tokens`.
+`vllm-vcr record` can sit between the head and a real stage of either kind. An LLM
+stage is captured the way a plain engine is: per-token timing, token ids with
+`--record-tokens`, and the trace metadata, plus `omni_stage_id`. The trace then
+drives a mock of the same stage through `--latency-trace` and `--replay-tokens`. A
+diffusion stage is captured into [its own trace](#recording-a-diffusion-stage).
 
 <div class="vcr-flow vcr-flow-capture" role="img" aria-label="The omni head talks to the recording tap, which talks to the real stage; the tap writes a trace.">
   <div class="vcr-node">
@@ -180,7 +231,7 @@ drives a mock of the same stage through `--latency-trace` and `--replay-tokens`.
   <div class="vcr-node">
     <span class="vcr-node-kicker">real, GPU</span>
     <strong>headless stage</strong>
-    <span>thinker or talker</span>
+    <span>thinker, talker, or diffusion</span>
   </div>
   <div class="vcr-connector"><span>JSONL</span></div>
   <div class="vcr-node">
@@ -213,6 +264,9 @@ One tap records one stage. To record two stages, run two taps on different ports
 (`--omni-master-listen`, `--omni-coordinator-listen`, `--engine-handshake`,
 `--input-address`, `--output-address`).
 
+The tap added no measurable latency: the same 24 image requests averaged 366.0 ms
+through it and 365.8 ms without it.
+
 To replay, give the mock stage the trace and the real stage's scheduler limits. The
 limits are in the trace's `ready_response_hex`; the thinker below runs one sequence
 at a time.
@@ -240,6 +294,119 @@ Totals are within about 2%. The mock returned the recorded text and the same num
 of chunks. The talker records the same way: 112 codec tokens per request at an 11 ms
 inter-token gap, ending on `stop`.
 
+### Recording a diffusion stage
+
+`--omni-stage-kind diffusion` records a diffusion stage. Registration and status are
+relayed the same way. The data path is the diffusion one: the tap connects a PULL and
+a PUSH to the head and binds a PUSH and a PULL for the stage, and relays every frame
+unchanged in both directions, including the ones it cannot decode.
+
+```bash
+vllm-vcr record --omni-master-address tcp://127.0.0.1:21212 \
+  --omni-stage-kind diffusion \
+  --trace-out flux.jsonl --model black-forest-labs/FLUX.2-klein-4B --gpu H200
+
+vllm serve black-forest-labs/FLUX.2-klein-4B --omni --headless --stage-id 0 \
+  --omni-master-address 127.0.0.1 --omni-master-port 21213
+```
+
+The head sees the stage's HELLO when the stage sends it and READY when the stage has
+loaded its model, so the head's startup deadline is the one it would apply without the
+tap. `--record-tokens`, `--step-stats-out`, `--tp`, `--max-num-seqs`, and
+`--block-size` do not apply.
+
+#### The diffusion trace
+
+A diffusion request has no tokens, so the trace has its own record type. The meta line
+carries `"kind": "diffusion"`. A reader checks it: token replay, `--latency-trace` on an
+LLM stage, and `inspect perfetto`, `calibrate`, and `calibrate-e2e` refuse a diffusion
+trace, and a diffusion stage refuses a token trace. `inspect summarize` reads both.
+
+```json
+{"meta": {"kind": "diffusion", "model": "black-forest-labs/FLUX.2-klein-4B", "gpu": "H200", "source": "tap", "omni_stage_id": 0}}
+{"arrival_ms": 82840.1, "size": {"width": 768, "height": 512}, "steps": 8, "images": 1, "input_images": 0,
+ "concurrency": 4, "latency_ms": 899.2, "outcome": "finished", "output_size": {"width": 768, "height": 512},
+ "stage_metrics": {"diffusion_engine_exec_time_ms": 858.1, "scheduler_queue_wait_ms": 523.0, "postprocess_time_ms": 39.2}}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `arrival_ms` | When the request reached the tap, in milliseconds since the capture started. |
+| `size`, `steps`, `images` | `width` and `height`, `num_inference_steps`, and `num_outputs_per_prompt` as the head sent them. `size` and `steps` are absent when the client left them to the stage. |
+| `input_images` | Images sent with the request: 0 for a generation, 1 or more for an edit. |
+| `concurrency` | Requests in flight through the tap at arrival, this one included. |
+| `latency_ms` | Arrival to the stage's answer at the tap. For an aborted request, arrival to the abort. |
+| `outcome` | `finished`, `error` (with `status`, the stage's `status_code`), or `aborted` (the head sent `abort` first). |
+| `output_size` | Size of the images returned. |
+| `stage_metrics` | Every numeric entry of the stage's own `metrics` for the request. |
+
+A record is written when a request reaches an outcome. Requests still in flight when
+the tap stops, or when the stage reports itself dead, are not recorded.
+
+```bash
+vllm-vcr inspect summarize flux.jsonl
+```
+
+```text
+kind:  diffusion
+model: black-forest-labs/FLUX.2-klein-4B
+gpu:   H200
+src:   tap
+fit:   overhead 100.6 ms + 70.64 ms per step at 1024x1024
+
+       size    steps  images  inputs  finished  errors  aborted        latency_ms (p50/p90/max)  service_p50
+    512x512        4       1       0         9       0        0      134.9/    919.9/    919.9        134.8
+    512x512        4       1       1         9       0        0      207.6/    975.4/    975.4        207.4
+    512x512        4       2       0         9       0        0      237.5/  16373.2/  16373.2        237.4
+    512x512        8       1       0         9       0        0      216.8/   1499.3/   1499.3        216.7
+    768x512        8       1       0         9       0        0      280.0/    902.5/    902.5        279.9
+  1024x1024        4       1       0         9       0        0      389.3/   1127.7/   1127.7        389.2
+  1024x1024        4       1       1         9       0        0      463.2/   1476.3/   1476.3        463.1
+  1024x1024        8       1       0         9       0        0      642.6/   1462.0/   1462.0        642.5
+```
+
+`fit` is the model unrecorded shapes are timed by. `service_p50` is the median
+latency less the stage's queue wait.
+
+### Measured diffusion fidelity
+
+FLUX.2-klein-4B on one H200, vLLM-Omni v0.32.0. The stage was recorded under 72 image
+requests (`deploy/omni/loadgen_images.py`: eight shapes, generations and edits, 512x512
+to 1024x1024, 4 and 8 steps, one and two images). The real stage and a mock replaying
+that trace with `--omni-diffusion-concurrency 1` were then each attached to the same
+head and sent the same requests. Times are client-side means over 24 requests.
+
+| Workload | | Real stage | Mock replaying the trace |
+| --- | --- | --- | --- |
+| Concurrency 1 | Mean | 366 ms | 368 ms |
+| | 512x512, 4 steps | 158 ms | 157 ms |
+| | 1024x1024, 4 steps | 462 ms | 464 ms |
+| | 1024x1024, 8 steps | 721 ms | 712 ms |
+| | Edit, 1024x1024, 4 steps | 539 ms | 543 ms |
+| Concurrency 4 | Mean | 1177 ms | 1186 ms |
+| | Median | 1202 ms | 1210 ms |
+
+Means are within 1%. The head's own per-stage timing (`OmniTiming`) was the same for
+both, to its 10 ms resolution.
+
+What the mock's images contain matters to this number. With flat gray images the mock
+was 6% fast at concurrency 1, and with all-noise images 7% slow, because of the head's
+PNG encoder. Half noise puts it where a real image is.
+
+Request shapes the trace did not contain, timed by the fit (median of three, after one
+warm-up request on the real stage):
+
+| Shape | Real stage | Mock |
+| --- | --- | --- |
+| 256x256, 4 steps | 112 ms | 127 ms |
+| 1024x512, 4 steps | 247 ms | 279 ms |
+| 768x768, 6 steps | 346 ms | 383 ms |
+| 512x512, 16 steps | 394 ms | 404 ms |
+| 1536x1024, 4 steps | 705 ms | 647 ms |
+
+The fit is within about 13% of the real stage. It is high for small images and low at
+1536x1024, which is larger than anything recorded.
+
 ## Flags
 
 | Flag | Meaning |
@@ -253,6 +420,7 @@ inter-token gap, ending on `stop`.
 | `--output-tokens` | LLM stages. Synthetic EOS point: a request allowed more tokens finishes here with `stop`. |
 | `--control-address` | Either kind. Serves the runtime control API for the stage. |
 | `--omni-diffusion-*` | Diffusion stages. See the latency model. |
+| `--latency-trace` | Either kind. A token trace on an LLM stage, a diffusion trace on a diffusion stage. |
 
 ## Versions
 
@@ -303,6 +471,27 @@ just omni-stop-records                                            # finalizes th
 just omni-fetch /work/stage0.jsonl /tmp/thinker.jsonl
 ```
 
+A diffusion stage records the same way, with an image workload:
+
+```bash
+just omni-head black-forest-labs/FLUX.2-klein-4B
+just omni-record 0 --omni-stage-kind diffusion --model black-forest-labs/FLUX.2-klein-4B --gpu H200
+just omni-real-stage 0 black-forest-labs/FLUX.2-klein-4B 21213
+
+kubectl -n inference-sim exec -i omni-rig -c head -- \
+  python3 - --model black-forest-labs/FLUX.2-klein-4B --requests 24 < deploy/omni/loadgen_images.py
+
+just omni-stop-records
+just omni-fetch /work/stage0.jsonl /tmp/flux.jsonl
+
+just omni-stop-stages                                             # swap in the mock
+just omni-stage 0 --omni-stage-kind diffusion --latency-trace /work/stage0.jsonl
+```
+
+The first request of each shape and image count compiles on a real stage (16 seconds
+for the first two-image request above). Send the workload once to warm up before the
+passes you compare.
+
 Two things to know when the real stages share one GPU:
 
 - Start them one at a time and let each finish loading. Loading together races on
@@ -328,14 +517,16 @@ id.
   through connectors (shared memory, NIXL, Mooncake). A mock stage neither sends nor
   waits for them, so a downstream stage's timing is independent of the upstream one.
   In an `async_chunk` pipeline a mock code2wav can finish before the mock talker.
-- **Content is not modeled.** Audio is silence and images are flat gray. Duration,
-  size, and count are.
-- **Diffusion has no trace replay.** The trace schema is token-based. A diffusion
-  stage is knob-driven only.
+- **Content is not modeled.** Audio is silence and images are half noise. Duration,
+  size, and count are. The share of noise is set so the head's encode time matches a
+  FLUX.2-klein image; another model's images may encode faster or slower.
+- **Diffusion replay is timing only.** Recorded errors and aborts are not replayed,
+  and the mock stage's concurrency is a flag, not something the trace carries.
 - **Video and multi-stage image pipelines are untested.** A diffusion stage answers
-  one result per request, which is what the image endpoints use. AR-plus-DiT pipelines
-  (HunyuanImage-3, BAGEL) hand data between stages through connectors.
-- **`record` taps LLM stages only.** A diffusion stage has no trace format to record into.
+  one result per request, which is what the image endpoints use. The diffusion tap
+  relays a stage's lifecycle markers and streamed chunks and records the request at
+  its finished result. AR-plus-DiT pipelines (HunyuanImage-3, BAGEL) hand data
+  between stages through connectors.
 
 ## Where the code is
 
@@ -345,8 +536,12 @@ id.
 | `crates/sim-protocol/src/omni/llm.rs` | Request tail decoder, audio output encoder. |
 | `crates/sim-protocol/src/omni/diffusion.rs` | Diffusion stage wire format. |
 | `src/omni/mod.rs` | `--omni-*` options, stage types, attach and heartbeats. |
-| `src/omni/diffusion.rs` | The mock diffusion stage and its latency model. |
-| `crates/sim-tap/src/omni.rs` | The tap's registration and status relay. |
+| `crates/sim-trace/src/diffusion.rs` | The diffusion trace record, its reader and summary, the latency model, and the replay built from a trace. |
+| `src/omni/diffusion.rs` | The mock diffusion stage: queue, knob and trace timing, control API. |
+| `crates/sim-tap/src/omni.rs` | The tap's registration and status relay, for either stage kind. |
+| `crates/sim-tap/src/diffusion.rs` | The diffusion tap: its data path and what it records. |
 | `tests/omni_e2e.rs` | Both stage kinds against a scripted head over real sockets. |
-| `tests/omni_tap_e2e.rs` | Scripted head, the tap, and a `play` stage in one chain. |
-| `deploy/omni/` | The rig, a load generator, and the script that dumps ground-truth frames from the head's encoder. |
+| `tests/omni_tap_e2e.rs` | Scripted head, the tap, and a `play` LLM stage in one chain. |
+| `tests/omni_diffusion_tap_e2e.rs` | The same chain for a diffusion stage, byte-exact relay, and replay of the recorded trace. |
+| `crates/sim-trace/tests/diffusion_trace.rs` | A trace recorded from a real FLUX.2-klein stage. |
+| `deploy/omni/` | The rig, text and image load generators, and the script that dumps ground-truth frames from vLLM-Omni's own encoder. |

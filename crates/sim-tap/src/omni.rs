@@ -1,4 +1,4 @@
-//! Tapping a vLLM-Omni LLM stage.
+//! Attaching a vLLM-Omni stage through the tap, for either stage kind.
 //!
 //! An omni stage does two things a plain vLLM engine does not: it registers
 //! with the head's `OmniMasterServer` before the handshake, and it reports to

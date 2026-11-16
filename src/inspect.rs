@@ -12,7 +12,9 @@ use sim_s3::TraceUri;
 use vllm_vcr::calibrate::{self, PromptReplay, SessionPacing, SimDriver};
 use vllm_vcr::perfetto::{Overlays, PerfettoOptions, write_perfetto};
 use vllm_vcr::step_stats::{read_step_stats, step_spans, step_stats_counters};
-use vllm_vcr::trace::{TraceWriter, open_trace_reader, read_trace_file};
+use vllm_vcr::trace::{
+    TraceKind, TraceWriter, open_trace_reader, read_trace_file, read_trace_meta,
+};
 use vllm_vcr::trace_convert::{
     ConvertOptions, convert_guidellm, summarize_trace, write_conversion, write_summary,
 };
@@ -67,7 +69,8 @@ pub(crate) enum InspectCommand {
         #[arg(long)]
         tp: Option<u32>,
     },
-    /// Print summary statistics from an existing trace file.
+    /// Print summary statistics from an existing trace file. A diffusion trace is
+    /// summarized per request shape; the other commands read token traces only.
     Summarize {
         /// Path or `s3://bucket/key` URI to the JSONL trace file.
         input: TraceUri,
@@ -302,12 +305,18 @@ pub(crate) fn run(command: InspectCommand) -> Result<ExitCode> {
         }
         InspectCommand::Summarize { input } => {
             let input = materialize_input(&input)?;
-            let reader = open_trace_reader(&input)?;
-            let (meta, stats) = summarize_trace(reader)?;
-
             let stdout = io::stdout();
             let mut writer = BufWriter::new(stdout.lock());
-            write_summary(&mut writer, &meta, &stats)?;
+            match read_trace_meta(&input)?.kind {
+                TraceKind::Llm => {
+                    let (meta, stats) = summarize_trace(open_trace_reader(&input)?)?;
+                    write_summary(&mut writer, &meta, &stats)?;
+                }
+                TraceKind::Diffusion => {
+                    let (meta, records) = sim_trace::diffusion::read_trace_file(&input)?;
+                    sim_trace::diffusion::write_summary(&mut writer, &meta, &records)?;
+                }
+            }
         }
         InspectCommand::Perfetto {
             input,

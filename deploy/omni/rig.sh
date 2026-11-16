@@ -88,7 +88,8 @@ SH
 
   # Record stage traffic: the tap registers with the head and listens for the
   # real stage on port 2121<3+2*stage> (21213 for stage 0, 21215 for stage 1).
-  # Extra args go to `vllm-vcr record`. The trace is /work/stage<id>.jsonl.
+  # Extra args go to `vllm-vcr record`; a diffusion stage needs
+  # `--omni-stage-kind diffusion`. The trace is /work/stage<id>.jsonl.
   record)
     in_sim sh -s -- "$MASTER_PORT" "$@" <<'SH'
 port=$1; stage=$2; shift 2

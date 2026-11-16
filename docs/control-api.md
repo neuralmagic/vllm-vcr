@@ -169,6 +169,7 @@ control call is answered between two messages from the head.
 
 ```json
 {
+  "timing": "knobs",
   "step_time": 40,
   "overhead": 300,
   "default_steps": 50,
@@ -183,6 +184,12 @@ Fields mirror the `--omni-diffusion-*` flags; `step_time` and `overhead` are
 milliseconds. `default_steps`, `default_width`, `default_height`, and `concurrency`
 must be at least 1, or the patch is rejected with `400`.
 
+`timing` is read-only: `knobs`, or `trace` on a stage started with
+[`--latency-trace`](./omni.md#trace-replay). Under a trace, `step_time` and `overhead`
+report the model fitted to the trace, which times request shapes the trace does not
+contain, and a patch that sets either is rejected with `409` and applies none of its
+fields. The other fields patch as usual.
+
 A patch applies to requests that have not started executing. A running request keeps
 the time it was started with. Raising `concurrency` starts waiting requests
 immediately.
@@ -195,5 +202,5 @@ Stats have the same shape:
 | `requests_completed` | requests answered with images |
 | `requests_failed` | requests rejected with a `400` (no image, or over the pixel limit) |
 | `requests_aborted` | requests the head aborted while running or waiting |
-| `running` | gauge: requests executing right now |
+| `running` | gauge: requests executing right now, including ones past their execution slot whose result is not sent yet |
 | `waiting` | gauge: requests queued for an execution slot right now |

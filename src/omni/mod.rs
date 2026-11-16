@@ -7,6 +7,7 @@
 //! omni's request and output tails ([`crate::io::Codec`]); a
 //! [`DiffusionStage`] is its own loop.
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -14,14 +15,14 @@ use clap::Args;
 use sim_protocol::omni::attach::{
     CoordinatorClient, ReplicaEventType, ReplicaStatus, StageRegistration, register_stage,
 };
-use sim_protocol::omni::diffusion::ImageSize;
 use sim_protocol::omni::llm::AudioOutput;
+use sim_trace::diffusion::{ImageSize, StepModel};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::engine_core::UnfinishedGauge;
-use crate::omni::diffusion::{DiffusionConfig, DiffusionStage};
+use crate::omni::diffusion::{DiffusionConfig, DiffusionStage, Timing};
 
 pub(crate) mod diffusion;
 
@@ -73,7 +74,8 @@ pub struct OmniOpt {
     pub replica_address: Option<String>,
 
     /// Runtime the stage belongs to. A diffusion stage serves image generation and
-    /// editing and uses the `--omni-diffusion-*` latency knobs instead of the token ones.
+    /// editing. It is timed by the `--omni-diffusion-*` knobs instead of the token ones,
+    /// or by a diffusion trace given as `--latency-trace`.
     #[arg(
         long = "omni-stage-kind",
         value_enum,
@@ -98,11 +100,13 @@ pub struct OmniOpt {
     pub audio_sample_rate: Option<u32>,
 
     /// Milliseconds one denoising step takes for one 1024x1024 image. Scales linearly
-    /// with pixel count and with the number of images in the request.
+    /// with pixel count and with the number of images in the request. Mutually
+    /// exclusive with `--latency-trace`.
     #[arg(long = "omni-diffusion-step-time", default_value_t = 0)]
     pub diffusion_step_time: u64,
 
-    /// Fixed milliseconds per diffusion request (text encoding, VAE decode).
+    /// Fixed milliseconds per diffusion request (text encoding, VAE decode). Mutually
+    /// exclusive with `--latency-trace`.
     #[arg(long = "omni-diffusion-overhead", default_value_t = 0)]
     pub diffusion_overhead: u64,
 
@@ -133,7 +137,10 @@ pub struct OmniOpt {
 
 impl OmniOpt {
     /// The stage this process serves, when `--omni-master-address` is set.
-    pub(crate) fn stage(&self) -> Result<Option<OmniStage>> {
+    /// `latency_trace` is the local `--latency-trace` file; a diffusion stage
+    /// takes its timing from it, an LLM stage builds its latency model from it
+    /// elsewhere.
+    pub(crate) fn stage(&self, latency_trace: Option<&Path>) -> Result<Option<OmniStage>> {
         let (Some(master_address), Some(stage_id)) = (self.master_address.clone(), self.stage_id)
         else {
             return Ok(None);
@@ -158,8 +165,13 @@ impl OmniOpt {
                 OmniStage::Diffusion(DiffusionStage {
                     stage,
                     config: DiffusionConfig {
-                        step_time: Duration::from_millis(self.diffusion_step_time),
-                        overhead: Duration::from_millis(self.diffusion_overhead),
+                        timing: Timing::new(
+                            StepModel {
+                                overhead: Duration::from_millis(self.diffusion_overhead),
+                                step_time: Duration::from_millis(self.diffusion_step_time),
+                            },
+                            latency_trace,
+                        )?,
                         default_steps: self.diffusion_default_steps,
                         default_size: self.diffusion_default_size,
                         concurrency: self.diffusion_concurrency,
@@ -312,8 +324,9 @@ impl Heartbeats {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use sim_protocol::omni::diffusion::ImageSize;
+    use sim_trace::diffusion::ImageSize;
 
+    use crate::omni::diffusion::Timing;
     use crate::omni::{LlmStage, OmniOpt, OmniStage, parse_image_size};
 
     #[derive(Debug, Parser)]
@@ -340,7 +353,7 @@ mod tests {
     #[test]
     fn no_omni_flags_means_no_stage() {
         let opt = parse(&[]).expect("parse");
-        assert!(opt.stage().expect("stage").is_none());
+        assert!(opt.stage(None).expect("stage").is_none());
     }
 
     #[test]
@@ -357,7 +370,7 @@ mod tests {
 
     #[test]
     fn llm_stage_is_the_default_role() {
-        let stage = attached(&[]).expect("parse").stage().expect("stage");
+        let stage = attached(&[]).expect("parse").stage(None).expect("stage");
         assert!(matches!(
             stage,
             Some(OmniStage::Llm(LlmStage { audio: None, .. }))
@@ -375,7 +388,7 @@ mod tests {
         .expect("parse");
         let Some(OmniStage::Llm(LlmStage {
             audio: Some(audio), ..
-        })) = opt.stage().expect("stage")
+        })) = opt.stage(None).expect("stage")
         else {
             panic!("expected an llm stage with audio");
         };
@@ -406,12 +419,15 @@ mod tests {
             "2",
         ])
         .expect("parse");
-        let Some(OmniStage::Diffusion(stage)) = opt.stage().expect("stage") else {
+        let Some(OmniStage::Diffusion(stage)) = opt.stage(None).expect("stage") else {
             panic!("expected a diffusion stage");
         };
         let config = stage.config;
-        assert_eq!(config.step_time.as_millis(), 40);
-        assert_eq!(config.overhead.as_millis(), 300);
+        let Timing::Knobs(model) = config.timing else {
+            panic!("expected knob timing");
+        };
+        assert_eq!(model.step_time.as_millis(), 40);
+        assert_eq!(model.overhead.as_millis(), 300);
         assert_eq!(config.default_steps, 28);
         assert_eq!(
             config.default_size,
@@ -432,7 +448,7 @@ mod tests {
             "480",
         ])
         .expect("parse");
-        assert!(opt.stage().is_err());
+        assert!(opt.stage(None).is_err());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-"""Dump diffusion-stage request frames from vLLM-Omni's own encoder.
+"""Dump diffusion-stage request and response frames from vLLM-Omni's own encoder.
 
 The output is the ground truth for
 crates/sim-protocol/tests/fixtures/omni_v<version>_diffusion_<name>.hex. Run it in
@@ -13,6 +13,8 @@ from PIL import Image
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.distributed.omni_connectors.utils.serialization import OmniMsgpackEncoder
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics.utils import diffusion_scheduler_waiting_metrics
+from vllm_omni.outputs import OmniRequestOutput
 
 encoder = OmniMsgpackEncoder()
 
@@ -71,6 +73,51 @@ frames = {
         ),
     ),
     "abort": encoder.encode({"type": "abort", "request_ids": ["img_gen-a", "img_gen-b"]}),
+    # A finished request, with the metrics DiffusionEngine.step_streaming attaches.
+    "result": encoder.encode(
+        {
+            "type": "result",
+            "output": OmniRequestOutput.from_diffusion(
+                request_id="img_gen-0123456789abcdef-01234567",
+                images=[image, image],
+                prompt={"prompt": "a red fox"},
+                metrics={
+                    "preprocess_time_ms": 0.25,
+                    "diffusion_engine_exec_time_ms": 1500.5,
+                    "output_ready_wait_time_ms": 0.0,
+                    "postprocess_time_ms": 12.75,
+                    **diffusion_scheduler_waiting_metrics(3),
+                    "scheduler_queue_wait_ms": 420.0,
+                    "vae_decode_time_ms": 30.5,
+                    "forward_time_ms": 1040.0,
+                },
+            ),
+        }
+    ),
+    # The lifecycle marker a stage sends when a request leaves its queue.
+    "result_started": encoder.encode(
+        {
+            "type": "result",
+            "output": OmniRequestOutput.from_diffusion(
+                request_id="img_gen-0123456789abcdef-01234567",
+                images=[],
+                finished=False,
+                custom_output={"_diffusion_request_lifecycle": "started"},
+            ),
+        }
+    ),
+    "error": encoder.encode(
+        {
+            "type": "error",
+            "request_id": "img_gen-fedcba9876543210-76543210",
+            "error": "height and width must be divisible by 16",
+            "status_code": 400,
+            "error_type": "BadRequestError",
+            "metrics": diffusion_scheduler_waiting_metrics(1),
+        }
+    ),
+    # Sent alone when a request is aborted: it names no request.
+    "abort_metrics": encoder.encode({"type": "metrics", "metrics": diffusion_scheduler_waiting_metrics(2)}),
 }
 
 for name, data in frames.items():

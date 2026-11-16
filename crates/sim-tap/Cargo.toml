@@ -24,3 +24,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 zeromq = { workspace = true }
+
+[dev-dependencies]
+rmpv = { workspace = true }

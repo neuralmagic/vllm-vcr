@@ -12,7 +12,7 @@ and UCX.
 | Content replay | `record --record-tokens` plus `play --replay-tokens` can serve recorded token ids and finish reasons. | `tests/engine_core_e2e.rs`, `tests/closed_loop_prefix_replay.rs` |
 | P/D control plane | The simulator produces and consumes vLLM NixlConnector `kv_transfer_params` per request. | `scripts/pd_control.sh` |
 | NIXL data plane | Prefill registers a paged KV pool and serves metadata; decode fetches metadata and posts paged NIXL reads. | `tests/nixl_loopback.rs` on Linux + libnixl |
-| vLLM-Omni stages | `play` attaches to a real omni head as an LLM stage (text, audio) or a diffusion stage (image generation and edit). `record` taps a real LLM stage for replay. See [vLLM-Omni stages](./omni.md). | `tests/omni_e2e.rs`, `tests/omni_tap_e2e.rs`, `deploy/omni` rig |
+| vLLM-Omni stages | `play` attaches to a real omni head as an LLM stage (text, audio) or a diffusion stage (image generation and edit). `record` taps a real stage of either kind for replay. See [vLLM-Omni stages](./omni.md). | `tests/omni_e2e.rs`, `tests/omni_tap_e2e.rs`, `tests/omni_diffusion_tap_e2e.rs`, `deploy/omni` rig |
 | Multi-version support | The build matrix pins one `vllm-engine-core-client` rev per supported line and uses conformance goldens when available. | CI matrix + `tests/conformance.rs` |
 
 If NIXL initialization fails at runtime, the engine logs a warning and falls back to

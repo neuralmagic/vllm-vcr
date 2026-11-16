@@ -1,8 +1,9 @@
 //! A mock vLLM-Omni diffusion stage.
 //!
-//! Answers the head's generate requests with flat gray images after a modeled
-//! delay: a fixed overhead plus a per-step time that scales with pixel count
-//! and image count. `concurrency` requests execute at once and the rest queue
+//! Answers the head's generate requests with synthetic images after a modeled
+//! delay. The delay comes from [`Timing`]: the knob model, a fixed overhead
+//! plus a per-step time that scales with pixel count and image count, or a
+//! recorded trace. `concurrency` requests execute at once and the rest queue
 //! in arrival order.
 //!
 //! [`Server`] is the stage's whole state and is only touched by the loop in
@@ -10,15 +11,20 @@
 //! channel of their own, so a config patch lands between two requests.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use sim_protocol::omni::diffusion::{
-    self as wire, DiffusionSockets, GenerateRequest, GeneratedImages, ImageSize, StageRequest,
+    self as wire, DiffusionSockets, GenerateRequest, GeneratedImages, StageRequest,
+};
+use sim_trace::diffusion::{
+    DiffusionReplay, ImageSize, Service, StepModel, read_trace_file, step_units,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use zeromq::prelude::{SocketRecv as _, SocketSend as _};
@@ -32,20 +38,54 @@ use crate::engine_core::UnfinishedGauge;
 use crate::omni::Stage;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Pixel count `step_time` is quoted for.
-const REFERENCE_PIXELS: u64 = 1024 * 1024;
 /// Pixels one request may return across all of its images.
 const MAX_REQUEST_PIXELS: u64 = 64 * 1024 * 1024;
 const BAD_REQUEST: u16 = 400;
 const INTERNAL_ERROR: u16 = 500;
 
-/// Latency model and capacity of a mock diffusion stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where a mock diffusion stage's execution times come from.
+#[derive(Debug, Clone)]
+pub(crate) enum Timing {
+    /// The `--omni-diffusion-step-time` and `--omni-diffusion-overhead` knobs.
+    Knobs(StepModel),
+    /// A recorded trace (`--latency-trace`): a request of a recorded shape
+    /// replays that shape's recorded times, any other is timed by the model
+    /// fitted to the trace.
+    Trace(DiffusionReplay),
+}
+
+impl Timing {
+    /// Build the timing for a stage started with `knobs` and, optionally, a
+    /// recorded trace. The two are exclusive.
+    pub(crate) fn new(knobs: StepModel, latency_trace: Option<&Path>) -> Result<Self> {
+        let Some(path) = latency_trace else {
+            return Ok(Timing::Knobs(knobs));
+        };
+        if !knobs.step_time.is_zero() || !knobs.overhead.is_zero() {
+            bail!(
+                "--latency-trace is mutually exclusive with --omni-diffusion-step-time and \
+                 --omni-diffusion-overhead"
+            );
+        }
+        let (_meta, records) = read_trace_file(path)?;
+        let replay = DiffusionReplay::from_records(&records)
+            .with_context(|| format!("building diffusion timing from {}", path.display()))?;
+        Ok(Timing::Trace(replay))
+    }
+
+    /// The model that times a request with no recorded time of its own.
+    fn step_model(&self) -> StepModel {
+        match self {
+            Timing::Knobs(model) => *model,
+            Timing::Trace(replay) => replay.fitted(),
+        }
+    }
+}
+
+/// Timing and capacity of a mock diffusion stage.
+#[derive(Debug, Clone)]
 pub(crate) struct DiffusionConfig {
-    /// One denoising step for one image of [`REFERENCE_PIXELS`].
-    pub step_time: Duration,
-    /// Fixed cost per request.
-    pub overhead: Duration,
+    pub timing: Timing,
     pub default_steps: u32,
     pub default_size: ImageSize,
     /// Requests executed at once.
@@ -65,14 +105,27 @@ struct Job {
     size: ImageSize,
     count: u32,
     steps: u32,
+    /// The service time a trace recorded for a request of this shape.
+    recorded: Option<Service>,
 }
 
 impl DiffusionConfig {
-    fn job(&self, request: &GenerateRequest) -> Result<Job, String> {
+    /// Resolve a request against the trace and the stage defaults. A request
+    /// that sets no size takes the size a recorded request of its shape
+    /// returned, before the stage default.
+    fn job(&mut self, request: &GenerateRequest) -> Result<Job, String> {
+        let recorded = match &mut self.timing {
+            Timing::Knobs(_) => None,
+            Timing::Trace(replay) => replay.next_recorded(&request.shape()),
+        };
         let job = Job {
-            size: request.size.unwrap_or(self.default_size),
+            size: request
+                .size
+                .or(recorded.and_then(|recorded| recorded.output_size))
+                .unwrap_or(self.default_size),
             count: request.num_outputs,
             steps: request.num_inference_steps.unwrap_or(self.default_steps),
+            recorded: recorded.map(|recorded| recorded.service),
         };
         if job.count == 0 || job.size.pixels() == 0 {
             return Err("request asks for no image".to_string());
@@ -86,17 +139,39 @@ impl DiffusionConfig {
         Ok(job)
     }
 
-    fn exec_time(&self, job: Job) -> Duration {
-        let scale = job.size.pixels() as f64 / REFERENCE_PIXELS as f64;
-        let steps = f64::from(job.steps) * f64::from(job.count) * scale;
-        self.overhead + self.step_time.mul_f64(steps)
+    /// How long a job holds an execution slot, and how long after that its
+    /// result is sent. Only a recorded time has a tail: the modeled time is
+    /// spent in the slot.
+    fn service(&self, job: Job) -> Service {
+        job.recorded.unwrap_or_else(|| Service {
+            slot: self
+                .timing
+                .step_model()
+                .exec_time(step_units(job.size, job.steps, job.count)),
+            tail: Duration::ZERO,
+        })
     }
+}
+
+fn whole_ms(duration: Duration) -> u64 {
+    (duration.as_secs_f64() * 1000.0).round() as u64
+}
+
+/// Which [`Timing`] a stage runs on, as `GET /config` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingSource {
+    Knobs,
+    Trace,
 }
 
 /// The stage knobs that can change at runtime, as `GET /config` reports them.
 /// Milliseconds for the latency fields, matching the `--omni-diffusion-*` flags.
+/// On a stage timed by a trace, `step_time` and `overhead` are the model
+/// fitted to the trace and cannot be patched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionKnobs {
+    pub timing: TimingSource,
     pub step_time: u64,
     pub overhead: u64,
     pub default_steps: u32,
@@ -141,11 +216,16 @@ type StageControlCall = ControlCall<DiffusionKnobs, DiffusionKnobsPatch>;
 struct Waiting {
     request_id: String,
     job: Job,
+    arrived: Instant,
 }
 
-struct Running {
+/// A request past the queue: holding an execution slot, or finishing after
+/// it released one.
+struct Started {
     job: Job,
-    exec_time: Duration,
+    queue_wait: Duration,
+    service: Service,
+    /// Reports the request id when the current phase has elapsed.
     timer: AbortHandle,
 }
 
@@ -162,8 +242,11 @@ struct Server {
     config: DiffusionConfig,
     log_requests: bool,
     waiting: VecDeque<Waiting>,
-    running: HashMap<String, Running>,
-    /// Receives a request id when its modeled execution has elapsed.
+    /// Requests holding an execution slot.
+    running: HashMap<String, Started>,
+    /// Requests that released their slot and whose result is not sent yet.
+    finishing: HashMap<String, Started>,
+    /// Receives a request id when the phase it is in has elapsed.
     elapsed_tx: mpsc::UnboundedSender<String>,
     received: u64,
     completed: u64,
@@ -182,6 +265,7 @@ impl Server {
             log_requests,
             waiting: VecDeque::new(),
             running: HashMap::new(),
+            finishing: HashMap::new(),
             elapsed_tx,
             received: 0,
             completed: 0,
@@ -191,36 +275,50 @@ impl Server {
     }
 
     fn unfinished(&self) -> usize {
-        self.waiting.len() + self.running.len()
+        self.waiting.len() + self.running.len() + self.finishing.len()
+    }
+
+    /// Report `request_id` on the elapsed channel after `delay`.
+    fn timer(&self, request_id: &str, delay: Duration) -> AbortHandle {
+        let elapsed_tx = self.elapsed_tx.clone();
+        let request_id = request_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            elapsed_tx.send(request_id).ok();
+        })
+        .abort_handle()
     }
 
     /// Move waiting requests into free execution slots, in arrival order.
     fn start_ready(&mut self) {
         while self.running.len() < self.config.concurrency as usize {
-            let Some(Waiting { request_id, job }) = self.waiting.pop_front() else {
+            let Some(Waiting {
+                request_id,
+                job,
+                arrived,
+            }) = self.waiting.pop_front()
+            else {
                 return;
             };
-            let exec_time = self.config.exec_time(job);
-            let elapsed_tx = self.elapsed_tx.clone();
-            let elapsed_id = request_id.clone();
-            let timer = tokio::spawn(async move {
-                tokio::time::sleep(exec_time).await;
-                elapsed_tx.send(elapsed_id).ok();
-            })
-            .abort_handle();
+            let queue_wait = arrived.elapsed();
+            let service = self.config.service(job);
+            let timer = self.timer(&request_id, service.slot);
             if self.log_requests {
                 info!(
                     request_id,
-                    exec_ms = exec_time.as_millis() as u64,
+                    exec_ms = service.slot.as_millis() as u64,
+                    tail_ms = service.tail.as_millis() as u64,
+                    recorded = job.recorded.is_some(),
                     waiting = self.waiting.len(),
                     "diffusion request executing"
                 );
             }
             self.running.insert(
                 request_id,
-                Running {
+                Started {
                     job,
-                    exec_time,
+                    queue_wait,
+                    service,
                     timer,
                 },
             );
@@ -228,8 +326,12 @@ impl Server {
     }
 
     fn drop_request(&mut self, request_id: &str) -> bool {
-        if let Some(running) = self.running.remove(request_id) {
-            running.timer.abort();
+        let started = self
+            .running
+            .remove(request_id)
+            .or_else(|| self.finishing.remove(request_id));
+        if let Some(started) = started {
+            started.timer.abort();
             return true;
         }
         let queued = self.waiting.len();
@@ -260,6 +362,7 @@ impl Server {
                         self.waiting.push_back(Waiting {
                             request_id: request.request_id,
                             job,
+                            arrived: Instant::now(),
                         });
                     }
                     Err(reason) => {
@@ -299,32 +402,52 @@ impl Server {
         Ok(reaction)
     }
 
-    /// The result frame for a request whose execution has elapsed. `None` when
-    /// the request was aborted in the meantime.
+    /// Move a request on when the phase it is in has elapsed. A request that
+    /// held a slot releases it and, if it has a tail, finishes after it. The
+    /// return is the result frame of a request that is done; `None` when the
+    /// request has a tail to wait out, or was aborted in the meantime.
     fn on_elapsed(&mut self, request_id: &str) -> Result<Option<Vec<u8>>> {
-        let Some(Running { job, exec_time, .. }) = self.running.remove(request_id) else {
-            return Ok(None);
+        let done = match self.running.remove(request_id) {
+            Some(mut started) => {
+                self.start_ready();
+                if started.service.tail.is_zero() {
+                    started
+                } else {
+                    started.timer = self.timer(request_id, started.service.tail);
+                    self.finishing.insert(request_id.to_string(), started);
+                    return Ok(None);
+                }
+            }
+            None => match self.finishing.remove(request_id) {
+                Some(started) => started,
+                None => return Ok(None),
+            },
         };
         self.completed += 1;
         if self.log_requests {
             info!(request_id, "diffusion request finished");
         }
-        self.start_ready();
         wire::encode_result(&GeneratedImages {
             request_id,
-            size: job.size,
-            count: job.count,
-            num_inference_steps: job.steps,
-            exec_time,
+            size: done.job.size,
+            count: done.job.count,
+            num_inference_steps: done.job.steps,
+            queue_wait: done.queue_wait,
+            exec_time: done.service.slot,
         })
         .or_else(|error| wire::encode_error(request_id, &format!("{error:#}"), INTERNAL_ERROR))
         .map(Some)
     }
 
     fn knobs(&self) -> DiffusionKnobs {
+        let model = self.config.timing.step_model();
         DiffusionKnobs {
-            step_time: self.config.step_time.as_millis() as u64,
-            overhead: self.config.overhead.as_millis() as u64,
+            timing: match self.config.timing {
+                Timing::Knobs(_) => TimingSource::Knobs,
+                Timing::Trace(_) => TimingSource::Trace,
+            },
+            step_time: whole_ms(model.step_time),
+            overhead: whole_ms(model.overhead),
             default_steps: self.config.default_steps,
             default_width: self.config.default_size.width,
             default_height: self.config.default_size.height,
@@ -333,13 +456,23 @@ impl Server {
         }
     }
 
-    fn apply(&mut self, patch: DiffusionKnobsPatch) {
+    fn apply(&mut self, patch: DiffusionKnobsPatch) -> Result<(), ControlError> {
         let config = &mut self.config;
-        if let Some(step_time) = patch.step_time {
-            config.step_time = Duration::from_millis(step_time);
-        }
-        if let Some(overhead) = patch.overhead {
-            config.overhead = Duration::from_millis(overhead);
+        match &mut config.timing {
+            Timing::Knobs(model) => {
+                if let Some(step_time) = patch.step_time {
+                    model.step_time = Duration::from_millis(step_time);
+                }
+                if let Some(overhead) = patch.overhead {
+                    model.overhead = Duration::from_millis(overhead);
+                }
+            }
+            Timing::Trace(_) if patch.step_time.is_some() || patch.overhead.is_some() => {
+                return Err(ControlError::conflict(
+                    "step_time and overhead cannot change at runtime under --latency-trace",
+                ));
+            }
+            Timing::Trace(_) => {}
         }
         if let Some(default_steps) = patch.default_steps {
             config.default_steps = default_steps;
@@ -358,6 +491,7 @@ impl Server {
         }
         info!(config = ?self.config, "diffusion config patched via control API");
         self.start_ready();
+        Ok(())
     }
 
     fn stats(&self) -> Stats {
@@ -366,33 +500,32 @@ impl Server {
             requests_completed: self.completed,
             requests_failed: self.failed,
             requests_aborted: self.aborted,
-            running: self.running.len() as u64,
+            running: (self.running.len() + self.finishing.len()) as u64,
             waiting: self.waiting.len() as u64,
         }
     }
 
     fn on_control(&mut self, call: StageControlCall) {
         let reply = match call.request {
-            ControlRequest::GetConfig => ControlReply::Config(self.knobs()),
-            ControlRequest::PatchConfig(patch) => {
-                self.apply(*patch);
-                ControlReply::Config(self.knobs())
-            }
-            ControlRequest::GetStats => ControlReply::Stats(self.stats()),
+            ControlRequest::GetConfig => Ok(ControlReply::Config(self.knobs())),
+            ControlRequest::PatchConfig(patch) => self
+                .apply(*patch)
+                .map(|()| ControlReply::Config(self.knobs())),
+            ControlRequest::GetStats => Ok(ControlReply::Stats(self.stats())),
             ControlRequest::ResetStats => {
                 self.received = 0;
                 self.completed = 0;
                 self.failed = 0;
                 self.aborted = 0;
-                ControlReply::Stats(self.stats())
+                Ok(ControlReply::Stats(self.stats()))
             }
         };
-        call.reply.send(Ok(reply)).ok();
+        call.reply.send(reply).ok();
     }
 
     fn abort_all(&mut self) {
-        for (_, running) in self.running.drain() {
-            running.timer.abort();
+        for (_, started) in self.running.drain().chain(self.finishing.drain()) {
+            started.timer.abort();
         }
         self.waiting.clear();
     }
@@ -460,7 +593,7 @@ impl DiffusionStage {
         };
 
         let (elapsed_tx, mut elapsed_rx) = mpsc::unbounded_channel::<String>();
-        let mut server = Server::new(self.config, log_requests, elapsed_tx);
+        let mut server = Server::new(self.config.clone(), log_requests, elapsed_tx);
 
         let outcome = loop {
             unfinished.set(server.unfinished());
@@ -527,15 +660,23 @@ impl DiffusionStage {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use rmpv::Value;
-    use sim_protocol::omni::diffusion::{GenerateRequest, ImageSize, StageRequest};
+    use sim_protocol::omni::diffusion::{GenerateRequest, StageRequest};
+    use sim_trace::diffusion::{
+        DiffusionOutcome, DiffusionRecord, DiffusionReplay, DiffusionShape, EXEC_TIME_METRIC,
+        ImageSize, StepModel, append_record, write_meta,
+    };
+    use sim_trace::trace::{TraceKind, TraceMeta};
     use tokio::sync::{mpsc, oneshot};
 
-    use crate::control::{ControlCall, ControlReply, ControlRequest, Patch, Stats};
+    use crate::control::{ControlCall, ControlError, ControlReply, ControlRequest, Patch, Stats};
     use crate::omni::diffusion::{
         DiffusionConfig, DiffusionKnobs, DiffusionKnobsPatch, Job, MAX_REQUEST_PIXELS, Server,
+        Timing, TimingSource,
     };
 
     const SQUARE_1024: ImageSize = ImageSize {
@@ -543,13 +684,80 @@ mod tests {
         height: 1024,
     };
 
+    const SQUARE_512: ImageSize = ImageSize {
+        width: 512,
+        height: 512,
+    };
+
+    fn knobs(step_time: Duration, overhead: Duration) -> Timing {
+        Timing::Knobs(StepModel {
+            overhead,
+            step_time,
+        })
+    }
+
     fn config() -> DiffusionConfig {
         DiffusionConfig {
-            step_time: Duration::from_millis(40),
-            overhead: Duration::from_millis(300),
+            timing: knobs(Duration::from_millis(40), Duration::from_millis(300)),
             default_steps: 50,
             default_size: SQUARE_1024,
             concurrency: 1,
+        }
+    }
+
+    fn recorded(
+        arrival_ms: f64,
+        size: Option<ImageSize>,
+        steps: Option<u32>,
+        latency_ms: f64,
+    ) -> DiffusionRecord {
+        DiffusionRecord {
+            arrival_ms,
+            shape: DiffusionShape {
+                size,
+                steps,
+                images: 1,
+                input_images: 0,
+            },
+            concurrency: 1,
+            latency_ms,
+            outcome: DiffusionOutcome::Finished,
+            output_size: size,
+            stage_metrics: BTreeMap::new(),
+        }
+    }
+
+    /// A trace of 512x512 and 1024x1024 requests at 4 and 8 steps whose
+    /// least-squares fit is exactly `80 ms + 25 ms per step`, plus one
+    /// prompt-only request that came back 768x512.
+    fn trace_records() -> Vec<DiffusionRecord> {
+        let mut records: Vec<DiffusionRecord> = [
+            (SQUARE_512, 4, 103.0),
+            (SQUARE_512, 8, 130.0),
+            (SQUARE_1024, 4, 180.0),
+            (SQUARE_1024, 8, 280.0),
+            (SQUARE_512, 4, 107.0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (size, steps, latency_ms))| {
+            recorded(index as f64, Some(size), Some(steps), latency_ms)
+        })
+        .collect();
+        records.push(DiffusionRecord {
+            output_size: Some(ImageSize {
+                width: 768,
+                height: 512,
+            }),
+            ..recorded(10.0, None, None, 900.0)
+        });
+        records
+    }
+
+    fn trace_config() -> DiffusionConfig {
+        DiffusionConfig {
+            timing: Timing::Trace(DiffusionReplay::from_records(&trace_records()).expect("replay")),
+            ..config()
         }
     }
 
@@ -574,7 +782,8 @@ mod tests {
             Ok(Job {
                 size: SQUARE_1024,
                 count: 1,
-                steps: 50
+                steps: 50,
+                recorded: None,
             })
         );
     }
@@ -590,7 +799,8 @@ mod tests {
             Ok(Job {
                 size,
                 count: 3,
-                steps: 4
+                steps: 4,
+                recorded: None,
             })
         );
     }
@@ -615,9 +825,10 @@ mod tests {
             size: SQUARE_1024,
             count: 1,
             steps: 50,
+            recorded: None,
         };
         assert_eq!(
-            config().exec_time(job),
+            config().service(job).slot,
             Duration::from_millis(300 + 50 * 40)
         );
     }
@@ -625,15 +836,13 @@ mod tests {
     #[test]
     fn exec_time_scales_with_pixels_and_image_count() {
         let quarter = Job {
-            size: ImageSize {
-                width: 512,
-                height: 512,
-            },
+            size: SQUARE_512,
             count: 1,
             steps: 20,
+            recorded: None,
         };
         assert_eq!(
-            config().exec_time(quarter),
+            config().service(quarter).slot,
             Duration::from_millis(300 + 20 * 40 / 4)
         );
 
@@ -642,7 +851,7 @@ mod tests {
             ..quarter
         };
         assert_eq!(
-            config().exec_time(four_images),
+            config().service(four_images).slot,
             Duration::from_millis(300 + 20 * 40)
         );
     }
@@ -650,16 +859,147 @@ mod tests {
     #[test]
     fn unset_knobs_make_requests_instant() {
         let instant = DiffusionConfig {
-            step_time: Duration::ZERO,
-            overhead: Duration::ZERO,
+            timing: knobs(Duration::ZERO, Duration::ZERO),
             ..config()
         };
         let job = Job {
             size: SQUARE_1024,
             count: 2,
             steps: 50,
+            recorded: None,
         };
-        assert_eq!(instant.exec_time(job), Duration::ZERO);
+        assert_eq!(instant.service(job).total(), Duration::ZERO);
+    }
+
+    fn exec_ms(config: &mut DiffusionConfig, request: &GenerateRequest) -> u64 {
+        let job = config.job(request).expect("job");
+        let service = config.service(job);
+        assert_eq!(service.tail, Duration::ZERO);
+        (service.slot.as_secs_f64() * 1000.0).round() as u64
+    }
+
+    #[test]
+    fn trace_replays_a_recorded_shapes_times_in_order() {
+        let mut config = trace_config();
+        let small = request(Some(SQUARE_512), 1, Some(4));
+        let times: Vec<u64> = (0..3).map(|_| exec_ms(&mut config, &small)).collect();
+        assert_eq!(times, [103, 107, 103]);
+        assert_eq!(
+            exec_ms(&mut config, &request(Some(SQUARE_1024), 1, Some(8))),
+            280
+        );
+    }
+
+    #[test]
+    fn trace_times_an_unseen_shape_with_the_fitted_model() {
+        let mut config = trace_config();
+        let unseen = request(Some(SQUARE_1024), 1, Some(20));
+        assert_eq!(config.job(&unseen).expect("job").recorded, None);
+        assert_eq!(exec_ms(&mut config, &unseen), 80 + 25 * 20);
+
+        let two_images = request(Some(SQUARE_512), 2, Some(4));
+        assert_eq!(exec_ms(&mut config, &two_images), 80 + 25 * 2);
+    }
+
+    #[test]
+    fn trace_gives_a_sizeless_request_the_size_the_recorded_one_returned() {
+        let mut config = trace_config();
+        let job = config.job(&request(None, 1, None)).expect("job");
+        assert_eq!(
+            job.size,
+            ImageSize {
+                width: 768,
+                height: 512
+            }
+        );
+        assert_eq!(
+            job.recorded.map(|service| service.total()),
+            Some(Duration::from_millis(900))
+        );
+
+        let unseen = config.job(&request(None, 3, None)).expect("job");
+        assert_eq!(
+            unseen.size, SQUARE_1024,
+            "an unseen shape takes the default"
+        );
+    }
+
+    struct TraceFile(PathBuf);
+
+    impl TraceFile {
+        fn write(name: &str, contents: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "vllm-vcr-diffusion-{name}-{}.jsonl",
+                std::process::id()
+            ));
+            std::fs::write(&path, contents).expect("write trace");
+            Self(path)
+        }
+    }
+
+    impl Drop for TraceFile {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).ok();
+        }
+    }
+
+    fn trace_file(name: &str, records: &[DiffusionRecord]) -> TraceFile {
+        let mut contents = Vec::new();
+        let meta = TraceMeta {
+            kind: TraceKind::Diffusion,
+            ..TraceMeta::default()
+        };
+        write_meta(&mut contents, &meta).expect("meta");
+        for record in records {
+            append_record(&mut contents, record).expect("record");
+        }
+        TraceFile::write(name, &contents)
+    }
+
+    #[test]
+    fn timing_reads_a_trace_and_refuses_knobs_alongside_it() {
+        let file = trace_file("knobs", &trace_records());
+        let unset = StepModel {
+            overhead: Duration::ZERO,
+            step_time: Duration::ZERO,
+        };
+        assert!(matches!(
+            Timing::new(unset, None).expect("knobs"),
+            Timing::Knobs(_)
+        ));
+        let Timing::Trace(replay) = Timing::new(unset, Some(&file.0)).expect("trace") else {
+            panic!("expected trace timing");
+        };
+        assert_eq!(replay.shapes(), 5);
+
+        let set = StepModel {
+            overhead: Duration::ZERO,
+            step_time: Duration::from_millis(40),
+        };
+        let error = Timing::new(set, Some(&file.0)).expect_err("knobs with a trace");
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn timing_refuses_a_token_trace_and_a_trace_with_nothing_finished() {
+        let unset = StepModel {
+            overhead: Duration::ZERO,
+            step_time: Duration::ZERO,
+        };
+        let token_trace = TraceFile::write(
+            "tokens",
+            b"{\"meta\":{\"model\":\"m\"}}\n{\"prompt_tokens\":1,\"output_tokens\":1,\"ttft_ms\":1.0}\n",
+        );
+        let error = Timing::new(unset, Some(&token_trace.0)).expect_err("token trace");
+        assert!(format!("{error:#}").contains("not a diffusion trace"));
+
+        let aborted = DiffusionRecord {
+            outcome: DiffusionOutcome::Aborted,
+            ..recorded(0.0, Some(SQUARE_512), Some(4), 5.0)
+        };
+        let file = trace_file("aborted", &[aborted]);
+        let error = Timing::new(unset, Some(&file.0)).expect_err("nothing finished");
+        assert!(format!("{error:#}").contains("no finished request"));
     }
 
     /// A server whose requests never elapse on their own: tests drive
@@ -667,7 +1007,7 @@ mod tests {
     fn server(concurrency: u32) -> (Server, mpsc::UnboundedReceiver<String>) {
         let (elapsed_tx, elapsed_rx) = mpsc::unbounded_channel();
         let config = DiffusionConfig {
-            step_time: Duration::from_secs(3600),
+            timing: knobs(Duration::from_secs(3600), Duration::from_millis(300)),
             concurrency,
             ..config()
         };
@@ -691,6 +1031,21 @@ mod tests {
             .and_then(|(_, value)| value.as_str())
             .expect("type")
             .to_string()
+    }
+
+    fn metric(frame: &[u8], name: &str) -> f64 {
+        let message: Value = rmpv::decode::read_value(&mut &frame[..]).expect("decode");
+        let find = |map: &Value, key: &str| {
+            map.as_map()
+                .expect("map")
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("no {key}"))
+        };
+        find(&find(&find(&message, "output"), "metrics"), name)
+            .as_f64()
+            .expect("numeric metric")
     }
 
     fn counts(server: &Server) -> (u64, u64) {
@@ -793,8 +1148,7 @@ mod tests {
     async fn elapsed_timer_reports_the_request_id() {
         let (elapsed_tx, mut elapsed_rx) = mpsc::unbounded_channel();
         let instant = DiffusionConfig {
-            step_time: Duration::ZERO,
-            overhead: Duration::ZERO,
+            timing: knobs(Duration::ZERO, Duration::ZERO),
             ..config()
         };
         let mut server = Server::new(instant, false, elapsed_tx);
@@ -807,13 +1161,178 @@ mod tests {
         assert_eq!(elapsed, "a");
     }
 
+    fn try_control(
+        server: &mut Server,
+        request: ControlRequest<DiffusionKnobsPatch>,
+    ) -> Result<ControlReply<DiffusionKnobs>, ControlError> {
+        let (reply, mut answer) = oneshot::channel();
+        server.on_control(ControlCall { request, reply });
+        answer.try_recv().expect("answered")
+    }
+
     fn control(
         server: &mut Server,
         request: ControlRequest<DiffusionKnobsPatch>,
     ) -> ControlReply<DiffusionKnobs> {
-        let (reply, mut answer) = oneshot::channel();
-        server.on_control(ControlCall { request, reply });
-        answer.try_recv().expect("answered").expect("ok")
+        try_control(server, request).expect("ok")
+    }
+
+    fn trace_server() -> Server {
+        let (elapsed_tx, _elapsed_rx) = mpsc::unbounded_channel();
+        Server::new(trace_config(), false, elapsed_tx)
+    }
+
+    #[tokio::test]
+    async fn config_under_a_trace_reports_the_fitted_model() {
+        let mut server = trace_server();
+        let ControlReply::Config(knobs) = control(&mut server, ControlRequest::GetConfig) else {
+            panic!("expected a config");
+        };
+        assert_eq!(knobs.timing, TimingSource::Trace);
+        assert_eq!((knobs.overhead, knobs.step_time), (80, 25));
+    }
+
+    #[tokio::test]
+    async fn latency_patch_under_a_trace_is_a_conflict_and_changes_nothing() {
+        let mut server = trace_server();
+        for patch in [
+            DiffusionKnobsPatch {
+                step_time: Some(7),
+                concurrency: Some(4),
+                ..DiffusionKnobsPatch::default()
+            },
+            DiffusionKnobsPatch {
+                overhead: Some(7),
+                ..DiffusionKnobsPatch::default()
+            },
+        ] {
+            let error = try_control(&mut server, ControlRequest::PatchConfig(Box::new(patch)))
+                .expect_err("latency patch");
+            assert_eq!(error.status, 409);
+            assert!(error.error.contains("--latency-trace"));
+        }
+        let ControlReply::Config(knobs) = control(&mut server, ControlRequest::GetConfig) else {
+            panic!("expected a config");
+        };
+        assert_eq!(
+            knobs.concurrency, 1,
+            "a rejected patch applies none of its fields"
+        );
+        assert_eq!((knobs.overhead, knobs.step_time), (80, 25));
+    }
+
+    #[tokio::test]
+    async fn capacity_patch_under_a_trace_applies() {
+        let mut server = trace_server();
+        let patch = DiffusionKnobsPatch {
+            concurrency: Some(3),
+            default_steps: Some(8),
+            log_requests: Some(true),
+            ..DiffusionKnobsPatch::default()
+        };
+        let ControlReply::Config(knobs) =
+            control(&mut server, ControlRequest::PatchConfig(Box::new(patch)))
+        else {
+            panic!("expected a config");
+        };
+        assert_eq!(knobs.timing, TimingSource::Trace);
+        assert_eq!((knobs.concurrency, knobs.default_steps), (3, 8));
+        assert!(knobs.log_requests);
+    }
+
+    /// A stage replaying requests that held a slot for an hour and then took
+    /// another hour to post-process.
+    fn tailed_server() -> Server {
+        let mut tailed = recorded(0.0, Some(SQUARE_512), Some(4), 7_200_000.0);
+        tailed.stage_metrics = BTreeMap::from([(EXEC_TIME_METRIC.to_string(), 3_600_000.0)]);
+        let (elapsed_tx, _elapsed_rx) = mpsc::unbounded_channel();
+        let config = DiffusionConfig {
+            timing: Timing::Trace(DiffusionReplay::from_records(&[tailed]).expect("replay")),
+            ..config()
+        };
+        Server::new(config, false, elapsed_tx)
+    }
+
+    fn tailed(request_id: &str) -> StageRequest {
+        StageRequest::Generate(GenerateRequest {
+            request_id: request_id.to_string(),
+            ..request(Some(SQUARE_512), 1, Some(4))
+        })
+    }
+
+    #[tokio::test]
+    async fn recorded_tail_frees_the_slot_before_the_result_is_sent() {
+        let mut server = tailed_server();
+        server.on_request(tailed("a")).expect("request");
+        server.on_request(tailed("b")).expect("request");
+        assert_eq!(counts(&server), (1, 1));
+
+        assert_eq!(
+            server.on_elapsed("a").expect("slot elapsed"),
+            None,
+            "a has its tail to wait out"
+        );
+        assert!(server.running.contains_key("b"), "a released its slot");
+        assert!(server.finishing.contains_key("a"));
+        assert_eq!(
+            counts(&server),
+            (2, 0),
+            "a finishing request counts as running"
+        );
+        assert_eq!(server.unfinished(), 2);
+        assert_eq!(server.stats().requests_completed, 0);
+
+        let frame = server
+            .on_elapsed("a")
+            .expect("tail elapsed")
+            .expect("result");
+        assert_eq!(message_type(&frame), "result");
+        assert_eq!(
+            metric(&frame, "diffusion_engine_exec_time_ms").round(),
+            3_600_000.0,
+            "the tail is not part of the stage's exec time"
+        );
+        assert_eq!(counts(&server), (1, 0));
+        assert_eq!(server.stats().requests_completed, 1);
+    }
+
+    #[tokio::test]
+    async fn abort_during_the_tail_drops_the_result() {
+        let mut server = tailed_server();
+        server.on_request(tailed("a")).expect("request");
+        server.on_elapsed("a").expect("slot elapsed");
+
+        server
+            .on_request(StageRequest::Abort(vec!["a".to_string()]))
+            .expect("abort");
+
+        assert_eq!(server.stats().requests_aborted, 1);
+        assert_eq!(counts(&server), (0, 0));
+        assert_eq!(server.on_elapsed("a").expect("elapsed"), None);
+    }
+
+    #[tokio::test]
+    async fn result_reports_the_time_a_request_waited_for_a_slot() {
+        let (mut server, _elapsed) = server(1);
+        server.on_request(generate("a")).expect("request");
+        server.on_request(generate("b")).expect("request");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let first = server.on_elapsed("a").expect("elapsed").expect("result");
+        let first_wait = metric(&first, "scheduler_queue_wait_ms");
+        assert!(
+            first_wait < 30.0,
+            "a started at once, waited {first_wait} ms"
+        );
+
+        let second = server.on_elapsed("b").expect("elapsed").expect("result");
+        let second_wait = metric(&second, "scheduler_queue_wait_ms");
+        assert!(second_wait >= 60.0, "b waited for a, got {second_wait} ms");
+        let exec = metric(&second, "diffusion_engine_exec_time_ms");
+        assert!(
+            (exec - (second_wait + 3_600_000.0 + 300.0)).abs() < 1e-3,
+            "exec time runs from admission, so it includes the wait: {exec} ms"
+        );
     }
 
     #[tokio::test]
@@ -822,6 +1341,7 @@ mod tests {
         let ControlReply::Config(knobs) = control(&mut server, ControlRequest::GetConfig) else {
             panic!("expected a config");
         };
+        assert_eq!(knobs.timing, TimingSource::Knobs);
         assert_eq!(knobs.step_time, 3_600_000);
         assert_eq!(knobs.overhead, 300);
         assert_eq!(knobs.default_steps, 50);

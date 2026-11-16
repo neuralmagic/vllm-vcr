@@ -24,8 +24,10 @@
 //! decodes copies for timing observation only.
 //!
 //! With `--omni-master-address` the frontend is a vLLM-Omni head and the engine
-//! one of its LLM stages; the tap also relays the stage's registration and
-//! status events (see `sim_tap::omni`).
+//! one of its stages; the tap also relays the stage's registration and status
+//! events (see `sim_tap::omni`). `--omni-stage-kind diffusion` records a
+//! diffusion stage, whose data path and trace records are its own (see
+//! `sim_tap::diffusion`).
 //!
 //! ## Limitations (prototype)
 //!
@@ -36,13 +38,15 @@
 //!   per chunk, with token counts in the record's `itl_tokens`.
 //! - Aborted requests are silently discarded (no trace record emitted).
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use sim_s3::TraceUri;
 
+use sim_tap::diffusion::{DiffusionTapConfig, DiffusionTapMeta, run_diffusion_tap};
 use sim_tap::omni::OmniTap;
 use sim_tap::tap::{TapConfig, TapMetaConfig, TokenRecording, run_tap};
 use sim_trace::trace::TraceWriter;
+use vllm_vcr::omni::StageKind;
 
 #[derive(Debug, Args)]
 pub struct RecordArgs {
@@ -145,12 +149,25 @@ pub struct RecordArgs {
     step_stats_out: Option<TraceUri>,
 
     /// vLLM-Omni head `OmniMasterServer` endpoint (`tcp://host:port`). Records one
-    /// omni LLM stage instead of a plain engine: the real stage registers with the
+    /// omni stage instead of a plain engine: the real stage registers with the
     /// tap (`--omni-master-listen`), the tap registers with the head on its behalf,
     /// and the head hands out the frontend handshake address, so
     /// `--frontend-handshake` is unused.
     #[arg(long, help_heading = "vLLM-Omni stage")]
     omni_master_address: Option<String>,
+
+    /// Runtime of the stage being recorded. A diffusion stage is written as a
+    /// diffusion trace: one record per image request, with no tokens, so
+    /// `--record-tokens`, `--step-stats-out`, `--tp`, `--max-num-seqs`, and
+    /// `--block-size` do not apply.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = StageKind::Llm,
+        requires = "omni_master_address",
+        help_heading = "vLLM-Omni stage"
+    )]
+    omni_stage_kind: StageKind,
 
     /// Address the tap binds as the master the real stage registers with:
     /// `vllm serve --omni --headless --stage-id N --omni-master-address 127.0.0.1
@@ -186,6 +203,47 @@ pub fn run(args: RecordArgs) -> Result<()> {
 async fn run_record(args: RecordArgs) -> Result<()> {
     let scratch_dir = std::env::temp_dir();
     let trace_local = args.trace_out.write_path(&scratch_dir);
+    let omni = args.omni_master_address.map(|head_master| OmniTap {
+        head_master,
+        master_listen: args.omni_master_listen,
+        coordinator_listen: args.omni_coordinator_listen,
+    });
+
+    if args.omni_stage_kind == StageKind::Diffusion {
+        let Some(omni) = omni else {
+            bail!("--omni-stage-kind diffusion needs --omni-master-address");
+        };
+        if args.record_tokens == TokenRecording::On
+            || args.step_stats_out.is_some()
+            || args.tp.is_some()
+            || args.max_num_seqs.is_some()
+        {
+            bail!(
+                "--record-tokens, --step-stats-out, --tp, and --max-num-seqs do not apply to a \
+                 diffusion stage"
+            );
+        }
+        let config = DiffusionTapConfig {
+            omni,
+            engine_handshake: args.engine_handshake,
+            input_address: args.input_address,
+            output_address: args.output_address,
+        };
+        let meta = DiffusionTapMeta {
+            model: args.model,
+            gpu: args.gpu,
+            config_hash: args.config_hash,
+            vllm_tag: args.vllm_version,
+            engine_config: args.engine_config,
+        };
+        let mut writer = TraceWriter::create(&trace_local)?;
+        let result =
+            run_diffusion_tap(config, meta, &mut writer, vllm_vcr::shutdown_signal()).await;
+        writer.finish()?;
+        args.trace_out.upload(&trace_local).await?;
+        return result;
+    }
+
     let step_local = args
         .step_stats_out
         .as_ref()
@@ -213,11 +271,7 @@ async fn run_record(args: RecordArgs) -> Result<()> {
         output_address: args.output_address,
         block_size: args.block_size,
         record_tokens: args.record_tokens,
-        omni: args.omni_master_address.map(|head_master| OmniTap {
-            head_master,
-            master_listen: args.omni_master_listen,
-            coordinator_listen: args.omni_coordinator_listen,
-        }),
+        omni,
     };
 
     let mut step_writer = step_local.as_deref().map(TraceWriter::create).transpose()?;

@@ -4305,6 +4305,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "rmpv",
  "serde",
  "serde_json",
  "sim-compat",

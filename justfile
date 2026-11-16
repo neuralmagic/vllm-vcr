@@ -118,7 +118,7 @@ omni-stage stage *args:
 omni-real-stage stage model port="21212" *args:
     bash deploy/omni/rig.sh real-stage {{stage}} {{model}} {{port}} {{args}}
 
-# Tap one stage: the real stage must then register on the port this prints. Extra args go to `vllm-vcr record`.
+# Tap one stage: the real stage must then register on the port this prints. Extra args go to `vllm-vcr record` (`--omni-stage-kind diffusion` for a diffusion stage).
 omni-record stage *args:
     bash deploy/omni/rig.sh record {{stage}} {{args}}
 

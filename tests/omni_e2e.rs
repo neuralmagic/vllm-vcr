@@ -26,8 +26,8 @@ use zeromq::prelude::{Socket as _, SocketRecv as _, SocketSend as _};
 use zeromq::{PullSocket, PushSocket, RouterSocket, ZmqMessage};
 
 use crate::omni_head::{
-    Head, Stage, audio_samples, decode, encode, field, map, request_with_tail, unbound_endpoint,
-    within,
+    Head, Stage, audio_samples, control, decode, encode, field, generate, hex, map,
+    request_with_tail, unbound_endpoint, within,
 };
 
 mod omni_head;
@@ -135,14 +135,6 @@ async fn llm_stage_attaches_and_returns_audio_for_a_request_with_an_omni_tail() 
     stage.finished().await;
 }
 
-fn hex(fixture: &str) -> Vec<u8> {
-    let fixture = fixture.trim();
-    (0..fixture.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&fixture[i..i + 2], 16).expect("hex"))
-        .collect()
-}
-
 /// Frames vLLM-Omni v0.32.0's own encoder produced (deploy/omni/encode_groundtruth.py).
 const T2I_REQUEST: &str =
     include_str!("../crates/sim-protocol/tests/fixtures/omni_v0.32.0_diffusion_t2i.hex");
@@ -169,16 +161,7 @@ impl DiffusionRig {
         assert!(!field(&registration, "stage_config").is_nil());
         head.handshake().await;
 
-        let mut requests = PushSocket::new();
-        requests
-            .bind(&head.input_address)
-            .await
-            .expect("bind input");
-        let mut responses = PullSocket::new();
-        responses
-            .bind(&head.output_address)
-            .await
-            .expect("bind output");
+        let (requests, responses) = head.bind_diffusion().await;
         head.expect_replica_up(0).await;
         Self {
             head,
@@ -262,23 +245,6 @@ async fn diffusion_stage_uses_its_defaults_for_a_prompt_only_request() {
     );
 }
 
-fn generate(request_id: &str, width: u32, height: u32, steps: u32) -> Vec<u8> {
-    encode(&map(vec![
-        ("type", Value::from("add_request")),
-        ("request_id", Value::from(request_id)),
-        ("prompt", map(vec![("prompt", Value::from("a red fox"))])),
-        (
-            "sampling_params",
-            map(vec![
-                ("num_outputs_per_prompt", Value::from(1)),
-                ("width", Value::from(width)),
-                ("height", Value::from(height)),
-                ("num_inference_steps", Value::from(steps)),
-            ]),
-        ),
-    ]))
-}
-
 /// With one execution slot, a request queued behind a long one only runs once
 /// the long one is aborted, and the aborted request never answers.
 #[tokio::test]
@@ -341,44 +307,6 @@ async fn diffusion_stage_answers_rpc_and_stops_on_the_shutdown_message() {
     rig.stage.finished().await;
 }
 
-/// One HTTP/1.1 exchange with the control API, retried until the server is
-/// listening.
-async fn control(address: &str, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
-    use std::io::{Read as _, Write as _};
-
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: control\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    let address = address.to_string();
-    let exchange = tokio::task::spawn_blocking(move || {
-        let mut stream = loop {
-            match std::net::TcpStream::connect(&address) {
-                Ok(stream) => break stream,
-                Err(_) => std::thread::sleep(Duration::from_millis(20)),
-            }
-        };
-        stream.write_all(request.as_bytes()).expect("write request");
-        let mut response = String::new();
-        stream.read_to_string(&mut response).expect("read response");
-        response
-    });
-    let response = within("control API exchange", exchange)
-        .await
-        .expect("control exchange join");
-    let status = response
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse().ok())
-        .unwrap_or_else(|| panic!("no status line in {response:?}"));
-    let body = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
-    (
-        status,
-        serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
-    )
-}
-
 async fn stats_when(address: &str, received: u64) -> serde_json::Value {
     loop {
         let (status, stats) = control(address, "GET", "/stats", "").await;
@@ -403,6 +331,7 @@ async fn diffusion_control_api_patches_the_queue_and_reports_stats() {
 
     let (status, config) = control(&control_address, "GET", "/config", "").await;
     assert_eq!(status, 200);
+    assert_eq!(config["timing"], "knobs");
     assert_eq!(config["step_time"], 60_000);
     assert_eq!(config["concurrency"], 1);
 

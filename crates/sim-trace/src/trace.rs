@@ -21,9 +21,40 @@ use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 
+/// What a trace's records describe. Each kind has its own record type, so a
+/// reader checks the kind before parsing records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceKind {
+    /// Token generation by an engine core: [`TraceRecord`]. The kind of every
+    /// trace written before the field existed.
+    #[default]
+    Llm,
+    /// Image generation by a vLLM-Omni diffusion stage:
+    /// [`DiffusionRecord`](crate::diffusion::DiffusionRecord).
+    Diffusion,
+}
+
+impl TraceKind {
+    fn is_llm(&self) -> bool {
+        *self == TraceKind::Llm
+    }
+}
+
+impl std::fmt::Display for TraceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TraceKind::Llm => "llm",
+            TraceKind::Diffusion => "diffusion",
+        })
+    }
+}
+
 /// Metadata header optionally present as the first line of a trace file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TraceMeta {
+    #[serde(default, skip_serializing_if = "TraceKind::is_llm")]
+    pub kind: TraceKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,17 +294,23 @@ fn read_meta(reader: impl BufRead) -> Result<TraceMeta> {
         if trimmed.is_empty() {
             continue;
         }
-        let value: serde_json::Value = serde_json::from_str(trimmed)
-            .with_context(|| format!("line {}: invalid JSON", idx + 1))?;
-        if value.get("meta").is_some() {
-            let wrapper: MetaWrapper = serde_json::from_value(value)
-                .with_context(|| format!("line {}: invalid meta object", idx + 1))?;
-            return Ok(wrapper.meta);
-        }
-        // First non-blank line is a record: no header.
-        return Ok(TraceMeta::default());
+        // A first non-blank line that is a record means there is no header.
+        return Ok(parse_meta_line(trimmed, idx + 1)?.unwrap_or_default());
     }
     Ok(TraceMeta::default())
+}
+
+/// Parse a trace line as the meta header. `None` when the line is valid JSON
+/// without a `"meta"` key, which makes it a record.
+pub(crate) fn parse_meta_line(line: &str, line_num: usize) -> Result<Option<TraceMeta>> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).with_context(|| format!("line {line_num}: invalid JSON"))?;
+    if value.get("meta").is_none() {
+        return Ok(None);
+    }
+    let wrapper: MetaWrapper = serde_json::from_value(value)
+        .with_context(|| format!("line {line_num}: invalid meta object"))?;
+    Ok(Some(wrapper.meta))
 }
 
 /// A trace file writer: plain JSONL, or gzip when the path ends in `.gz`.
@@ -334,6 +371,9 @@ impl Write for TraceWriter {
 /// Parse a trace from any `BufRead`. The first line is checked for a `"meta"` key; if
 /// present it is parsed as `TraceMeta`, otherwise the whole file is treated as records
 /// with a default meta. Blank lines are skipped. Errors include line numbers.
+///
+/// A trace whose meta names another [`TraceKind`] is an error: its records are
+/// not [`TraceRecord`]s.
 pub fn read_trace(reader: impl BufRead) -> Result<(TraceMeta, Vec<TraceRecord>)> {
     let mut meta = TraceMeta::default();
     let mut records = Vec::new();
@@ -372,6 +412,14 @@ pub fn read_trace(reader: impl BufRead) -> Result<(TraceMeta, Vec<TraceRecord>)>
         let wrapper: MetaWrapper = serde_json::from_value(first_value)
             .with_context(|| format!("line {first_num}: invalid meta object"))?;
         meta = wrapper.meta;
+        if meta.kind != TraceKind::Llm {
+            bail!(
+                "this is a {} trace, which has no token records: replay it with \
+                 `play --omni-stage-kind diffusion --latency-trace` or read it with \
+                 `inspect summarize`",
+                meta.kind
+            );
+        }
     } else {
         // First line is a record.
         let record: TraceRecord = serde_json::from_value(first_value)
@@ -409,11 +457,11 @@ pub fn read_trace(reader: impl BufRead) -> Result<(TraceMeta, Vec<TraceRecord>)>
 /// absent and `MultiGzDecoder` reports the missing trailer as `UnexpectedEof`.
 /// Every complete record precedes it, so this is a clean end-of-stream, not a
 /// parse failure.
-fn is_unfinalized_gz_eof(err: &std::io::Error) -> bool {
+pub(crate) fn is_unfinalized_gz_eof(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::UnexpectedEof
 }
 
-fn warn_unfinalized_trace(line_num: usize, records_read: usize) {
+pub(crate) fn warn_unfinalized_trace(line_num: usize, records_read: usize) {
     tracing::warn!(
         line = line_num,
         records = records_read,
@@ -489,15 +537,21 @@ pub fn replay_subset(records: Vec<TraceRecord>) -> Vec<TraceRecord> {
     subset
 }
 
+/// Write the `{"meta": ...}` line.
+pub fn write_meta(writer: &mut impl Write, meta: &TraceMeta) -> Result<()> {
+    let wrapper = MetaWrapper { meta: meta.clone() };
+    serde_json::to_writer(&mut *writer, &wrapper)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
 /// Write a trace meta line followed by records to a writer.
 pub fn write_trace(
     writer: &mut impl Write,
     meta: &TraceMeta,
     records: &[TraceRecord],
 ) -> Result<()> {
-    let wrapper = MetaWrapper { meta: meta.clone() };
-    serde_json::to_writer(&mut *writer, &wrapper)?;
-    writeln!(writer)?;
+    write_meta(writer, meta)?;
     for record in records {
         serde_json::to_writer(&mut *writer, record)?;
         writeln!(writer)?;
@@ -516,10 +570,11 @@ pub fn append_record(writer: &mut impl Write, record: &TraceRecord) -> Result<()
 mod tests {
     use std::io;
 
-    use super::*;
+    use crate::trace::*;
 
     fn sample_meta() -> TraceMeta {
         TraceMeta {
+            kind: TraceKind::Llm,
             model: Some("llama-7b".to_string()),
             gpu: Some("A100".to_string()),
             tp: Some(2),
@@ -1011,5 +1066,46 @@ mod tests {
         assert_eq!(hashes.len(), 2, "10 tokens = 2 full blocks of 4 + tail");
         assert!(prompt_block_hashes(&tokens[..3], 4).is_none());
         assert!(prompt_block_hashes(&tokens, 0).is_none());
+    }
+
+    #[test]
+    fn meta_kind_defaults_to_llm_and_is_omitted_when_default() {
+        let mut out = Vec::new();
+        write_meta(&mut out, &sample_meta()).unwrap();
+        let line = String::from_utf8(out).unwrap();
+        assert!(!line.contains("kind"), "an llm trace's meta is unchanged");
+
+        let meta = read_meta(io::BufReader::new(line.as_bytes())).unwrap();
+        assert_eq!(meta.kind, TraceKind::Llm);
+
+        let diffusion = TraceMeta {
+            kind: TraceKind::Diffusion,
+            ..sample_meta()
+        };
+        let mut out = Vec::new();
+        write_meta(&mut out, &diffusion).unwrap();
+        let line = String::from_utf8(out).unwrap();
+        assert!(line.contains(r#""kind":"diffusion""#));
+        assert_eq!(
+            read_meta(io::BufReader::new(line.as_bytes())).unwrap().kind,
+            TraceKind::Diffusion
+        );
+    }
+
+    #[test]
+    fn read_trace_refuses_a_diffusion_trace() {
+        let trace = concat!(
+            r#"{"meta":{"kind":"diffusion","model":"m"}}"#,
+            "\n",
+            r#"{"arrival_ms":0.0,"images":1,"concurrency":1,"latency_ms":5.0,"outcome":"finished"}"#,
+            "\n",
+        );
+        let error = read_trace(io::BufReader::new(trace.as_bytes())).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("diffusion trace"), "got: {message}");
+        assert!(
+            message.contains("--omni-stage-kind diffusion"),
+            "got: {message}"
+        );
     }
 }

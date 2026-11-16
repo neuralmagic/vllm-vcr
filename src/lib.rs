@@ -987,12 +987,20 @@ pub async fn run_with_log_filter(
     shutdown: CancellationToken,
     log_filter: Option<LogFilter>,
 ) -> Result<()> {
-    let omni_stage = match opt.omni.stage()? {
+    materialize_remote_inputs(&mut opt).await?;
+    let latency_trace = opt
+        .latency_trace
+        .as_ref()
+        .map(|uri| local_input(uri, "--latency-trace"))
+        .transpose()?;
+
+    let omni_stage = match opt.omni.stage(latency_trace)? {
         Some(_) if opt.engine_count != 1 => {
             bail!("an omni stage replica is one engine; --engine-count must be 1")
         }
         Some(omni::OmniStage::Diffusion(stage)) => {
-            info!(omni = ?opt.omni, "starting mock diffusion stage");
+            opt.verify_config_hash()?;
+            info!(omni = ?opt.omni, config = ?stage.config, "starting mock diffusion stage");
             return stage
                 .run(
                     opt.log_requests,
@@ -1005,8 +1013,6 @@ pub async fn run_with_log_filter(
         Some(omni::OmniStage::Llm(stage)) => Some(stage),
         None => None,
     };
-
-    materialize_remote_inputs(&mut opt).await?;
 
     // Validate the latency configuration (knob/trace conflict, trace parse) before any
     // transport setup, so a bad config fails immediately instead of after the 30s

@@ -56,7 +56,7 @@ use zeromq::{PullSocket, RouterSocket, ZmqMessage};
 use sim_protocol::kvparams::{extract_kv_params, kv_flag};
 use sim_protocol::wire::{request_type_from_frame, trace_finish_reason};
 use sim_trace::config_hash::ConfigFingerprint;
-use sim_trace::trace::{ItlContext, TraceMeta, TraceRecord, append_record};
+use sim_trace::trace::{ItlContext, TraceMeta, TraceRecord, append_record, write_meta};
 
 use sim_protocol::step_stats::{StepStatsRecord, append_step_stats};
 
@@ -226,7 +226,7 @@ impl RequestState {
     }
 }
 
-fn ms_between(from: Instant, to: Instant) -> f64 {
+pub(crate) fn ms_between(from: Instant, to: Instant) -> f64 {
     to.duration_since(from).as_secs_f64() * 1000.0
 }
 
@@ -289,6 +289,81 @@ fn into_two_frames<T>(frames: Vec<T>, what: &str) -> Result<[T; 2]> {
         .map_err(|frames| anyhow!("expected 2 frames for {what}, got {}", frames.len()))
 }
 
+/// The frontend's side of a real engine's startup handshake, after INIT and
+/// before READY. An engine sends HELLO as it starts and READY once its model
+/// is loaded, which can be minutes apart.
+pub(crate) struct EngineHandshake {
+    socket: RouterSocket,
+    /// The engine's HELLO.
+    pub hello: ReadyMessage,
+}
+
+impl EngineHandshake {
+    /// Bind the handshake socket, wait for the engine's HELLO, and reply with
+    /// INIT pointing to the tap-bound input/output sockets.
+    pub(crate) async fn accept(
+        handshake_address: &str,
+        input_address: &str,
+        output_address: &str,
+    ) -> Result<Self> {
+        let mut socket = RouterSocket::new();
+        socket
+            .bind(handshake_address)
+            .await
+            .with_context(|| format!("binding tap handshake socket at {handshake_address}"))?;
+
+        info!(
+            engine_handshake = %handshake_address,
+            "waiting for real engine HELLO"
+        );
+
+        let hello_msg = socket.recv().await.context("receiving engine HELLO")?;
+        let [engine_identity, hello_payload] =
+            into_two_frames(hello_msg.into_vec(), "engine HELLO")?;
+        let hello: ReadyMessage =
+            decode_msgpack(&hello_payload).map_err(|e| anyhow!("decoding HELLO: {e}"))?;
+
+        debug!(?hello, "received engine HELLO");
+
+        // Send INIT with our bound input/output addresses.
+        let init_message = HandshakeInitMessage {
+            addresses: HandshakeAddresses {
+                inputs: vec![input_address.to_string()],
+                outputs: vec![output_address.to_string()],
+                coordinator_input: None,
+                coordinator_output: None,
+                frontend_stats_publish_address: None,
+            },
+            parallel_config: Default::default(),
+        };
+        let init_payload =
+            encode_msgpack(&init_message).map_err(|e| anyhow!("encoding INIT: {e}"))?;
+        // ROUTER messages are [identity, payload].
+        let init_zmq = ZmqMessage::try_from(vec![engine_identity, init_payload.into()])
+            .map_err(|e| anyhow!("building INIT message: {e}"))?;
+
+        socket
+            .send(init_zmq)
+            .await
+            .context("sending INIT to engine")?;
+        debug!("sent INIT to engine");
+
+        Ok(Self { socket, hello })
+    }
+
+    /// Wait for READY. The decode is validation only; an incompatible protocol
+    /// version should fail loudly instead of recording a trace against a broken
+    /// pair.
+    pub(crate) async fn ready(mut self) -> Result<()> {
+        let ready_msg = self.socket.recv().await.context("receiving engine READY")?;
+        let [_, ready_payload] = into_two_frames(ready_msg.into_vec(), "engine READY")?;
+        let ready: ReadyMessage =
+            decode_msgpack(&ready_payload).map_err(|e| anyhow!("decoding READY: {e}"))?;
+        debug!(ready_payload = ?ready, "received engine READY");
+        Ok(())
+    }
+}
+
 /// Run the upstream handshake: bind the handshake socket, wait for the engine's
 /// HELLO, reply with INIT pointing to the tap-bound input/output sockets, wait
 /// for READY, then wait for the engine to register on the input socket.
@@ -306,66 +381,14 @@ async fn upstream_handshake(config: &TapConfig) -> Result<UpstreamEngine> {
         .await
         .with_context(|| format!("binding tap output socket at {}", config.output_address))?;
 
-    // Bind handshake socket and wait for the engine's HELLO.
-    let mut handshake_socket = RouterSocket::new();
-    handshake_socket
-        .bind(&config.engine_handshake)
-        .await
-        .with_context(|| {
-            format!(
-                "binding tap handshake socket at {}",
-                config.engine_handshake
-            )
-        })?;
-
-    info!(
-        engine_handshake = %config.engine_handshake,
-        "waiting for real engine HELLO"
-    );
-
-    let hello_msg = handshake_socket
-        .recv()
-        .await
-        .context("receiving engine HELLO")?;
-    let [engine_identity, hello_payload] = into_two_frames(hello_msg.into_vec(), "engine HELLO")?;
-    let ready_message: ReadyMessage =
-        decode_msgpack(&hello_payload).map_err(|e| anyhow!("decoding HELLO: {e}"))?;
-
-    debug!(?ready_message, "received engine HELLO");
-
-    // Send INIT with our bound input/output addresses.
-    let init_message = HandshakeInitMessage {
-        addresses: HandshakeAddresses {
-            inputs: vec![config.input_address.clone()],
-            outputs: vec![config.output_address.clone()],
-            coordinator_input: None,
-            coordinator_output: None,
-            frontend_stats_publish_address: None,
-        },
-        parallel_config: Default::default(),
-    };
-    let init_payload = encode_msgpack(&init_message).map_err(|e| anyhow!("encoding INIT: {e}"))?;
-    // ROUTER messages are [identity, payload].
-    let init_zmq = ZmqMessage::try_from(vec![engine_identity, init_payload.into()])
-        .map_err(|e| anyhow!("building INIT message: {e}"))?;
-
-    handshake_socket
-        .send(init_zmq)
-        .await
-        .context("sending INIT to engine")?;
-    debug!("sent INIT to engine");
-
-    // Wait for READY. The decode is validation only; an incompatible protocol
-    // version should fail loudly instead of recording a trace against a broken
-    // pair.
-    let ready_msg = handshake_socket
-        .recv()
-        .await
-        .context("receiving engine READY")?;
-    let [_, ready_payload] = into_two_frames(ready_msg.into_vec(), "engine READY")?;
-    let ready: ReadyMessage =
-        decode_msgpack(&ready_payload).map_err(|e| anyhow!("decoding READY: {e}"))?;
-    debug!(ready_payload = ?ready, "received engine READY");
+    let handshake = EngineHandshake::accept(
+        &config.engine_handshake,
+        &config.input_address,
+        &config.output_address,
+    )
+    .await?;
+    let ready_message = handshake.hello.clone();
+    handshake.ready().await?;
 
     // Wait for the engine to register on the input socket (sends its identity +
     // ready response). The decoded copy is observation-only; the raw bytes are
@@ -508,7 +531,7 @@ pub async fn run_tap<W: Write, S: Write>(
             .extra
             .insert("omni_stage_id".to_string(), attachment.stage_id.into());
     }
-    write_meta_line(writer, &trace_meta)?;
+    write_meta(writer, &trace_meta)?;
 
     info!(
         engine_vllm_version = %engine_vllm_version,
@@ -938,6 +961,25 @@ pub struct TapMetaConfig {
     pub engine_config: String,
 }
 
+/// The `config_hash` a capture is stamped with: the explicit override when
+/// set, otherwise the canonical fingerprint over the deployment inputs.
+pub(crate) fn config_hash(
+    explicit: Option<&str>,
+    gpu: Option<&str>,
+    vllm_tag: &str,
+    engine_config: &str,
+) -> String {
+    match explicit {
+        Some(explicit) => explicit.to_string(),
+        None => ConfigFingerprint {
+            gpu: gpu.unwrap_or_default().to_string(),
+            vllm_tag: vllm_tag.to_string(),
+            engine_config: engine_config.to_string(),
+        }
+        .hash(),
+    }
+}
+
 /// Build the trace meta from the caller's inputs plus what the handshake
 /// observed. `config_hash` is the explicit override when set, otherwise the
 /// canonical fingerprint over the deployment inputs.
@@ -946,20 +988,12 @@ fn build_meta(
     engine_vllm_version: &str,
     ready_response_payload: &[u8],
 ) -> TraceMeta {
-    let config_hash = meta.config_hash.clone().or_else(|| {
-        let vllm_tag = meta
-            .vllm_tag
-            .clone()
-            .unwrap_or_else(|| engine_vllm_version.to_string());
-        Some(
-            ConfigFingerprint {
-                gpu: meta.gpu.clone().unwrap_or_default(),
-                vllm_tag,
-                engine_config: meta.engine_config.clone(),
-            }
-            .hash(),
-        )
-    });
+    let config_hash = Some(config_hash(
+        meta.config_hash.as_deref(),
+        meta.gpu.as_deref(),
+        meta.vllm_tag.as_deref().unwrap_or(engine_vllm_version),
+        &meta.engine_config,
+    ));
 
     TraceMeta {
         source: Some("tap".to_string()),
@@ -979,14 +1013,6 @@ fn build_meta(
     }
 }
 
-/// Serialize the `{"meta": ...}` line to the writer.
-fn write_meta_line<W: Write>(writer: &mut W, meta: &TraceMeta) -> Result<()> {
-    let wrapper = serde_json::json!({ "meta": meta });
-    serde_json::to_writer(&mut *writer, &wrapper)?;
-    writeln!(writer)?;
-    Ok(())
-}
-
 /// Lowercase-hex encode bytes (no extra dependency for a one-shot payload).
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -1001,7 +1027,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use std::time::Duration;
 
-    use super::*;
+    use crate::tap::*;
 
     #[test]
     fn guard_passes_on_same_line_across_suffix_differences() {

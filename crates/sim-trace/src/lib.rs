@@ -9,6 +9,7 @@
 
 pub mod config_hash;
 pub mod dataset_convert;
+pub mod diffusion;
 pub mod latency;
 pub mod perfetto;
 pub mod trace;
