@@ -1,9 +1,7 @@
 //! End-to-end tests for vLLM-Omni stages over real ZMQ transport.
 //!
-//! Each test runs the full `vllm_vcr::run` task against a scripted omni head:
-//! real sockets, and the head's side of the wire written out here by hand. The
-//! head mirrors what a v0.32.0 head does, including the part plain vLLM does
-//! not: the data sockets are bound only after the stage reports READY.
+//! Each test runs the full `vllm_vcr::run` task against the scripted omni head
+//! in `omni_head`.
 //!
 //! The contract under test:
 //!   - A stage registers with the master, handshakes on the address it is
@@ -13,9 +11,10 @@
 //!     audio stage, returns `multimodal_output` on its outputs.
 //!   - A diffusion stage serves generate requests, honors abort, and stops on
 //!     the head's shutdown message.
+//!   - A diffusion stage serves the control API: a config patch applies to
+//!     requests that have not started, and stats report the queue.
 //!   - Either stage reports down when it stops.
 
-use std::future::Future;
 use std::time::Duration;
 
 use rmpv::Value;
@@ -23,269 +22,21 @@ use sim_protocol::vllm::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreRequest, EngineCoreSamplingParams,
     Envelope, decode_msgpack, encode_msgpack, request_outputs,
 };
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use vllm_vcr::{Opt, run};
 use zeromq::prelude::{Socket as _, SocketRecv as _, SocketSend as _};
 use zeromq::{PullSocket, PushSocket, RouterSocket, ZmqMessage};
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+use crate::omni_head::{
+    Head, Stage, audio_samples, decode, encode, field, map, request_with_tail, unbound_endpoint,
+    within,
+};
 
-async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(TIMEOUT, future)
-        .await
-        .unwrap_or_else(|_| panic!("timed out: {what}"))
-}
-
-fn map(entries: Vec<(&str, Value)>) -> Value {
-    Value::Map(
-        entries
-            .into_iter()
-            .map(|(key, value)| (Value::from(key), value))
-            .collect(),
-    )
-}
-
-fn field<'a>(map: &'a Value, key: &str) -> &'a Value {
-    map.as_map()
-        .unwrap_or_else(|| panic!("not a map: {map}"))
-        .iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .map(|(_, v)| v)
-        .unwrap_or_else(|| panic!("missing key {key} in {map}"))
-}
-
-fn encode(value: &Value) -> Vec<u8> {
-    let mut out = Vec::new();
-    rmpv::encode::write_value(&mut out, value).expect("encode");
-    out
-}
-
-fn decode(bytes: &[u8]) -> Value {
-    rmpv::decode::read_value(&mut &bytes[..]).expect("decode")
-}
-
-/// A local TCP endpoint nothing is bound to yet.
-fn unbound_endpoint() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-    let port = listener.local_addr().expect("local addr").port();
-    format!("tcp://127.0.0.1:{port}")
-}
-
-async fn bound_router() -> (RouterSocket, String) {
-    let mut socket = RouterSocket::new();
-    let endpoint = socket.bind("tcp://127.0.0.1:0").await.expect("bind");
-    (socket, endpoint.to_string())
-}
-
-/// The head's control plane: master, handshake, and coordinator sockets, plus
-/// the data addresses it will bind once the stage is READY.
-struct Head {
-    master: RouterSocket,
-    master_address: String,
-    handshake: RouterSocket,
-    handshake_address: String,
-    coordinator: RouterSocket,
-    coordinator_address: String,
-    input_address: String,
-    output_address: String,
-}
-
-impl Head {
-    async fn start() -> Self {
-        let (master, master_address) = bound_router().await;
-        let (handshake, handshake_address) = bound_router().await;
-        let (coordinator, coordinator_address) = bound_router().await;
-        Self {
-            master,
-            master_address,
-            handshake,
-            handshake_address,
-            coordinator,
-            coordinator_address,
-            input_address: unbound_endpoint(),
-            output_address: unbound_endpoint(),
-        }
-    }
-
-    /// Answer one stage registration and return what the stage sent.
-    async fn accept_registration(&mut self) -> Value {
-        let frames = within("registration", self.master.recv())
-            .await
-            .expect("registration")
-            .into_vec();
-        let mut reply = ZmqMessage::from(frames[0].to_vec());
-        reply.push_back(
-            encode(&map(vec![
-                (
-                    "handshake_address",
-                    Value::from(self.handshake_address.as_str()),
-                ),
-                ("input_address", Value::from(self.input_address.as_str())),
-                ("output_address", Value::from(self.output_address.as_str())),
-                ("replica_id", Value::from(0)),
-                (
-                    "coordinator_router_address",
-                    Value::from(self.coordinator_address.as_str()),
-                ),
-            ]))
-            .into(),
-        );
-        self.master.send(reply).await.expect("registration reply");
-        decode(frames.last().expect("registration payload"))
-    }
-
-    /// HELLO, INIT, READY. Returns the stage's handshake identity.
-    async fn handshake(&mut self) -> Vec<u8> {
-        let hello = within("HELLO", self.handshake.recv())
-            .await
-            .expect("HELLO")
-            .into_vec();
-        let identity = hello[0].to_vec();
-        let message = decode(&hello[1]);
-        assert_eq!(field(&message, "status").as_str(), Some("HELLO"));
-        assert_eq!(field(&message, "local"), &Value::from(false));
-        assert_eq!(field(&message, "headless"), &Value::from(true));
-
-        let mut init = ZmqMessage::from(identity.clone());
-        init.push_back(
-            encode(&map(vec![
-                (
-                    "addresses",
-                    map(vec![
-                        (
-                            "inputs",
-                            Value::Array(vec![Value::from(self.input_address.as_str())]),
-                        ),
-                        (
-                            "outputs",
-                            Value::Array(vec![Value::from(self.output_address.as_str())]),
-                        ),
-                        ("coordinator_input", Value::Nil),
-                        ("coordinator_output", Value::Nil),
-                        ("frontend_stats_publish_address", Value::Nil),
-                    ]),
-                ),
-                ("parallel_config", Value::Map(Vec::new())),
-            ]))
-            .into(),
-        );
-        self.handshake.send(init).await.expect("INIT");
-
-        let ready = within("READY", self.handshake.recv())
-            .await
-            .expect("READY")
-            .into_vec();
-        assert_eq!(
-            field(&decode(&ready[1]), "status").as_str(),
-            Some("READY"),
-            "the stage must report READY before its data sockets can connect"
-        );
-        identity
-    }
-
-    async fn replica_event(&mut self) -> serde_json::Value {
-        let frames = within("replica event", self.coordinator.recv())
-            .await
-            .expect("replica event")
-            .into_vec();
-        serde_json::from_slice(frames.last().expect("event payload")).expect("event json")
-    }
-
-    /// The stage's first report, sent once it is attached.
-    async fn expect_replica_up(&mut self, stage_id: u32) {
-        assert_eq!(
-            self.replica_event().await,
-            serde_json::json!({
-                "input_addr": self.input_address,
-                "output_addr": self.output_address,
-                "stage_id": stage_id,
-                "event_type": "update",
-                "status": "up",
-                "queue_length": 0,
-            })
-        );
-    }
-
-    async fn expect_replica_down(&mut self) {
-        loop {
-            let event = self.replica_event().await;
-            if event["event_type"] == "heartbeat" {
-                continue;
-            }
-            assert_eq!(event["event_type"], "update");
-            assert_eq!(event["status"], "down");
-            return;
-        }
-    }
-}
-
-struct Stage {
-    task: Option<JoinHandle<anyhow::Result<()>>>,
-    shutdown: CancellationToken,
-}
-
-impl Stage {
-    fn spawn(head: &Head, stage_id: &str, flags: &[&str]) -> Self {
-        let mut args = vec![
-            "play",
-            "--omni-master-address",
-            head.master_address.as_str(),
-            "--omni-stage-id",
-            stage_id,
-        ];
-        args.extend_from_slice(flags);
-        let opt = Opt::parse_from(&args);
-        let shutdown = CancellationToken::new();
-        let task = Some(tokio::spawn(run(opt, shutdown.clone())));
-        Self { task, shutdown }
-    }
-
-    async fn finished(mut self) {
-        let task = self.task.take().expect("stage task");
-        within("stage exit", task)
-            .await
-            .expect("stage task join")
-            .expect("stage result");
-    }
-}
-
-impl Drop for Stage {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-    }
-}
-
-fn request_with_tail(request: &EngineCoreRequest, tail: &[Value]) -> Vec<u8> {
-    let Value::Array(mut fields) = decode(&encode_msgpack(request).expect("encode request")) else {
-        panic!("request is not an array");
-    };
-    fields.extend_from_slice(tail);
-    encode(&Value::Array(fields))
-}
-
-/// The samples in an output's `multimodal_output.audio`, when it has one.
-fn audio_samples(output: &[Value], vllm_fields: usize) -> Option<u64> {
-    let multimodal = output.get(vllm_fields)?;
-    let tensor = field(multimodal, "audio")
-        .as_array()
-        .expect("tensor triple");
-    assert_eq!(tensor[0].as_str(), Some("float32"));
-    let shape = tensor[1].as_array().expect("shape");
-    assert_eq!(shape.len(), 1);
-    let samples = shape[0].as_u64().expect("samples");
-    let Value::Ext(_, data) = &tensor[2] else {
-        panic!("tensor data is not an ext");
-    };
-    assert_eq!(data.len() as u64, samples * 4);
-    Some(samples)
-}
+mod omni_head;
 
 #[tokio::test]
 async fn llm_stage_attaches_and_returns_audio_for_a_request_with_an_omni_tail() {
     let mut head = Head::start().await;
     let stage = Stage::spawn(
-        &head,
+        &head.master_address,
         "2",
         &[
             "--output-tokens",
@@ -411,7 +162,7 @@ impl DiffusionRig {
         let mut head = Head::start().await;
         let mut all_flags = vec!["--omni-stage-kind", "diffusion"];
         all_flags.extend_from_slice(flags);
-        let stage = Stage::spawn(&head, "0", &all_flags);
+        let stage = Stage::spawn(&head.master_address, "0", &all_flags);
 
         let registration = head.accept_registration().await;
         assert_eq!(field(&registration, "stage_id"), &Value::from(0));
@@ -588,4 +339,112 @@ async fn diffusion_stage_answers_rpc_and_stops_on_the_shutdown_message() {
         .await;
     rig.head.expect_replica_down().await;
     rig.stage.finished().await;
+}
+
+/// One HTTP/1.1 exchange with the control API, retried until the server is
+/// listening.
+async fn control(address: &str, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
+    use std::io::{Read as _, Write as _};
+
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: control\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let address = address.to_string();
+    let exchange = tokio::task::spawn_blocking(move || {
+        let mut stream = loop {
+            match std::net::TcpStream::connect(&address) {
+                Ok(stream) => break stream,
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    });
+    let response = within("control API exchange", exchange)
+        .await
+        .expect("control exchange join");
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in {response:?}"));
+    let body = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+    (
+        status,
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+async fn stats_when(address: &str, received: u64) -> serde_json::Value {
+    loop {
+        let (status, stats) = control(address, "GET", "/stats", "").await;
+        assert_eq!(status, 200);
+        if stats["requests_received"] == received {
+            return stats;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn diffusion_control_api_patches_the_queue_and_reports_stats() {
+    let control_address = unbound_endpoint().replace("tcp://", "");
+    let mut rig = DiffusionRig::attach(&[
+        "--omni-diffusion-step-time",
+        "60000",
+        "--control-address",
+        &control_address,
+    ])
+    .await;
+
+    let (status, config) = control(&control_address, "GET", "/config", "").await;
+    assert_eq!(status, 200);
+    assert_eq!(config["step_time"], 60_000);
+    assert_eq!(config["concurrency"], 1);
+
+    rig.send(generate("img_gen-slow", 1024, 1024, 50)).await;
+    rig.send(generate("img_gen-queued", 8, 8, 1)).await;
+    let stats = within("both requests received", stats_when(&control_address, 2)).await;
+    assert_eq!(stats["running"], 1);
+    assert_eq!(stats["waiting"], 1);
+
+    let (status, config) = control(
+        &control_address,
+        "PATCH",
+        "/config",
+        r#"{"concurrency": 2, "step_time": 0}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(config["concurrency"], 2);
+    assert_eq!(config["step_time"], 0);
+
+    let response = rig.response().await;
+    assert_eq!(
+        field(field(&response, "output"), "request_id").as_str(),
+        Some("img_gen-queued"),
+        "the queued request starts under the patched config; the running one keeps its pace"
+    );
+    let (_, stats) = control(&control_address, "GET", "/stats", "").await;
+    assert_eq!(stats["requests_completed"], 1);
+    assert_eq!(stats["running"], 1);
+    assert_eq!(stats["waiting"], 0);
+
+    let (status, error) = control(
+        &control_address,
+        "PATCH",
+        "/config",
+        r#"{"concurrency": 0}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("concurrency"))
+    );
 }

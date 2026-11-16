@@ -23,6 +23,10 @@
 //! frontend to the engine (upstream). All frames pass through verbatim; the tap
 //! decodes copies for timing observation only.
 //!
+//! With `--omni-master-address` the frontend is a vLLM-Omni head and the engine
+//! one of its LLM stages; the tap also relays the stage's registration and
+//! status events (see `sim_tap::omni`).
+//!
 //! ## Limitations (prototype)
 //!
 //! - Single engine, single client (client_index 0).
@@ -36,6 +40,7 @@ use anyhow::{Context as _, Result};
 use clap::Args;
 use sim_s3::TraceUri;
 
+use sim_tap::omni::OmniTap;
 use sim_tap::tap::{TapConfig, TapMetaConfig, TokenRecording, run_tap};
 use sim_trace::trace::TraceWriter;
 
@@ -138,6 +143,33 @@ pub struct RecordArgs {
     /// stays empty. `s3://` targets upload after finalize, like --trace-out.
     #[arg(long)]
     step_stats_out: Option<TraceUri>,
+
+    /// vLLM-Omni head `OmniMasterServer` endpoint (`tcp://host:port`). Records one
+    /// omni LLM stage instead of a plain engine: the real stage registers with the
+    /// tap (`--omni-master-listen`), the tap registers with the head on its behalf,
+    /// and the head hands out the frontend handshake address, so
+    /// `--frontend-handshake` is unused.
+    #[arg(long, help_heading = "vLLM-Omni stage")]
+    omni_master_address: Option<String>,
+
+    /// Address the tap binds as the master the real stage registers with:
+    /// `vllm serve --omni --headless --stage-id N --omni-master-address 127.0.0.1
+    /// --omni-master-port 21213`.
+    #[arg(
+        long,
+        default_value = "tcp://127.0.0.1:21213",
+        help_heading = "vLLM-Omni stage"
+    )]
+    omni_master_listen: String,
+
+    /// Address the tap binds as the coordinator the real stage reports to. The tap
+    /// forwards the stage's status events to the head.
+    #[arg(
+        long,
+        default_value = "tcp://127.0.0.1:21214",
+        help_heading = "vLLM-Omni stage"
+    )]
+    omni_coordinator_listen: String,
 }
 
 /// Run the recording tap on a multi-thread runtime until a shutdown signal
@@ -181,6 +213,11 @@ async fn run_record(args: RecordArgs) -> Result<()> {
         output_address: args.output_address,
         block_size: args.block_size,
         record_tokens: args.record_tokens,
+        omni: args.omni_master_address.map(|head_master| OmniTap {
+            head_master,
+            master_listen: args.omni_master_listen,
+            coordinator_listen: args.omni_coordinator_listen,
+        }),
     };
 
     let mut step_writer = step_local.as_deref().map(TraceWriter::create).transpose()?;

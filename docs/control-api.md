@@ -160,3 +160,40 @@ curl -s -X PUT localhost:8001/log -H 'content-type: application/json' \
 
 The filter string is a `tracing` `EnvFilter` directive, the same syntax as
 `RUST_LOG`.
+
+## Diffusion stages
+
+A [vLLM-Omni diffusion stage](./omni.md#diffusion-stages) serves the same routes with
+its own config. The stage owns its queue the way the engine loop owns the engine: a
+control call is answered between two messages from the head.
+
+```json
+{
+  "step_time": 40,
+  "overhead": 300,
+  "default_steps": 50,
+  "default_width": 1024,
+  "default_height": 1024,
+  "concurrency": 1,
+  "log_requests": false
+}
+```
+
+Fields mirror the `--omni-diffusion-*` flags; `step_time` and `overhead` are
+milliseconds. `default_steps`, `default_width`, `default_height`, and `concurrency`
+must be at least 1, or the patch is rejected with `400`.
+
+A patch applies to requests that have not started executing. A running request keeps
+the time it was started with. Raising `concurrency` starts waiting requests
+immediately.
+
+Stats have the same shape:
+
+| Field | Counts |
+|---|---|
+| `requests_received` | every generate request the head sent |
+| `requests_completed` | requests answered with images |
+| `requests_failed` | requests rejected with a `400` (no image, or over the pixel limit) |
+| `requests_aborted` | requests the head aborted while running or waiting |
+| `running` | gauge: requests executing right now |
+| `waiting` | gauge: requests queued for an execution slot right now |

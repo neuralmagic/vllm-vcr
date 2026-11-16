@@ -239,7 +239,8 @@ struct ActiveRequest {
     /// The original prompt token ids, retained so the `TokenSource` can condition on them.
     prompt_token_ids: Vec<u32>,
     max_tokens: usize,
-    /// `max_tokens` is the `--output-tokens` EOS point, below what the request allowed.
+    /// `max_tokens` is a modeled EOS point (sampled from the trace, or `--output-tokens`)
+    /// below what the request allowed.
     eos_stop: bool,
     generated: usize,
     rng: StdRng,
@@ -395,6 +396,7 @@ impl ActiveRequest {
         // (--replay-steps / --replay-tokens) pins each request to its own recorded
         // length downstream, so the marginal sampler must not pre-empt it.
         let verbatim = opt.replay_steps.is_some() || opt.replay_tokens.is_some();
+        let requested_max_tokens = max_tokens;
         let max_tokens = if verbatim || !model_eos {
             max_tokens
         } else {
@@ -411,8 +413,8 @@ impl ActiveRequest {
             .output_tokens
             .filter(|_| !verbatim)
             .map(|tokens| (tokens as usize).max(min_tokens));
-        let eos_stop = eos_at.is_some_and(|tokens| tokens < max_tokens);
         let max_tokens = eos_at.map_or(max_tokens, |tokens| tokens.min(max_tokens));
+        let eos_stop = max_tokens < requested_max_tokens;
 
         let pacing = DecodePacing::for_prompt(prompt_len, churn);
 
@@ -1615,8 +1617,8 @@ impl SimEngine {
                 request.emitted += emit.tokens.len();
                 let finished = request.emitted >= request.max_tokens;
                 // A replayed request ends with its recorded finish reason and a
-                // request cut at the `--output-tokens` EOS point with Stop; the
-                // sim's own stop condition is otherwise max_tokens (Length).
+                // request cut at a modeled EOS point with Stop; a request that
+                // runs to its own max_tokens ends with Length.
                 let finish_reason = finished.then(|| {
                     self.token_source
                         .finish_reason(&request.request_id)
@@ -2224,7 +2226,11 @@ mod tests {
         let outputs = drain(&mut engine, &mut rx);
         let tokens: usize = outputs.iter().map(|o| o.new_token_ids.len()).sum();
         assert_eq!(tokens, 5, "output must be capped to the sampled EOS length");
-        assert!(outputs.last().unwrap().finished());
+        assert_eq!(
+            outputs.last().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Stop),
+            "a request cut at the sampled EOS length stopped on EOS"
+        );
     }
 
     #[test]
@@ -2238,6 +2244,11 @@ mod tests {
         let outputs = drain(&mut engine, &mut rx);
         let tokens: usize = outputs.iter().map(|o| o.new_token_ids.len()).sum();
         assert_eq!(tokens, 3, "request max_tokens stays the hard ceiling");
+        assert_eq!(
+            outputs.last().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Length),
+            "a request that hit its own max_tokens ran out of length"
+        );
     }
 
     #[test]
@@ -2260,6 +2271,10 @@ mod tests {
             tokens, 5,
             "open-ended request must cap at the sampled EOS length"
         );
+        assert_eq!(
+            outputs.last().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Stop)
+        );
     }
 
     #[test]
@@ -2275,6 +2290,10 @@ mod tests {
         assert_eq!(
             tokens, 40,
             "a bounded request must honor max_tokens exactly"
+        );
+        assert_eq!(
+            outputs.last().unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Length)
         );
     }
 

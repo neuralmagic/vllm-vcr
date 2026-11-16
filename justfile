@@ -114,7 +114,24 @@ omni-head model *args:
 omni-stage stage *args:
     bash deploy/omni/rig.sh stage {{stage}} {{args}}
 
-# Stop every play stage (the head detaches them).
+# Run a real GPU stage, registering with the head (port 21212) or a tap; extra args go to `vllm serve`.
+omni-real-stage stage model port="21212" *args:
+    bash deploy/omni/rig.sh real-stage {{stage}} {{model}} {{port}} {{args}}
+
+# Tap one stage: the real stage must then register on the port this prints. Extra args go to `vllm-vcr record`.
+omni-record stage *args:
+    bash deploy/omni/rig.sh record {{stage}} {{args}}
+
+# Stop the taps, finalizing their traces.
+omni-stop-records:
+    bash deploy/omni/rig.sh stop-records
+
+# Copy a file out of the sim container, e.g. `just omni-fetch /work/stage0.jsonl /tmp/thinker.jsonl`.
+omni-fetch path out:
+    bash deploy/omni/rig.sh fetch {{path}} > {{out}}
+    @wc -l {{out}}
+
+# Stop every stage, mock and real (the head detaches them).
 omni-stop-stages:
     bash deploy/omni/rig.sh stop-stages
 
@@ -122,7 +139,7 @@ omni-stop-stages:
 omni-status:
     bash deploy/omni/rig.sh status
 
-# Tail the head log (`head`) or a stage log (stage id).
+# Tail the head log (`head`), a mock stage log (stage id), a real stage (`real0`), or a tap (`record0`).
 omni-logs target lines="40":
     bash deploy/omni/rig.sh logs {{target}} {{lines}}
 

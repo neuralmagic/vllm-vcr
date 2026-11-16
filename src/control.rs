@@ -5,6 +5,7 @@
 //! stays single-owner and a patch lands between two steps, never in the middle
 //! of one.
 
+use std::future::Future;
 use std::net::SocketAddr;
 
 use anyhow::{Context as _, Result};
@@ -13,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -21,24 +23,43 @@ use tracing::info;
 use crate::engine_core::EngineInput;
 use crate::{FailureType, LogFilter};
 
-/// A control call handed to one engine loop. The engine answers on `reply`.
-pub(crate) struct ControlCall {
-    pub request: ControlRequest,
-    pub reply: oneshot::Sender<Result<ControlReply, ControlError>>,
+/// A control call handed to one loop, which answers on `reply`. `C` is the
+/// loop's config as `GET /config` reports it and `P` its `PATCH /config` body;
+/// the defaults are the engine's.
+pub(crate) struct ControlCall<C = Config, P = ConfigPatch> {
+    pub request: ControlRequest<P>,
+    pub reply: oneshot::Sender<Result<ControlReply<C>, ControlError>>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum ControlRequest {
+pub(crate) enum ControlRequest<P = ConfigPatch> {
     GetConfig,
-    PatchConfig(Box<ConfigPatch>),
+    PatchConfig(Box<P>),
     GetStats,
     ResetStats,
 }
 
 #[derive(Debug)]
-pub(crate) enum ControlReply {
-    Config(Config),
+pub(crate) enum ControlReply<C = Config> {
+    Config(C),
     Stats(Stats),
+}
+
+/// A `PATCH /config` body that can reject its own values.
+pub(crate) trait Patch {
+    fn validate(&self) -> Result<(), ControlError>;
+}
+
+/// What the control API drives: the loops that answer its calls.
+pub(crate) trait Targets: Clone + Send + Sync + 'static {
+    type Config: Serialize + Send + 'static;
+    type Patch: Patch + DeserializeOwned + Clone + Send + 'static;
+
+    /// Send the same request to every loop, in order, collecting the replies.
+    fn broadcast(
+        &self,
+        request: ControlRequest<Self::Patch>,
+    ) -> impl Future<Output = Result<Vec<ControlReply<Self::Config>>, ControlError>> + Send;
 }
 
 /// A rejected control call. Carries the HTTP status the server answers with.
@@ -124,8 +145,10 @@ impl ConfigPatch {
             || self.time_factor_under_load.is_some()
             || self.max_num_seqs.is_some()
     }
+}
 
-    pub fn validate(&self) -> Result<(), ControlError> {
+impl Patch for ConfigPatch {
+    fn validate(&self) -> Result<(), ControlError> {
         if let Some(rate) = self.failure_injection_rate
             && !(0.0..=1.0).contains(&rate)
         {
@@ -151,7 +174,7 @@ impl ConfigPatch {
     }
 }
 
-/// Request counters for one engine. `GET /stats` sums them across engines.
+/// Request counters for one loop. `GET /stats` sums them across loops.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stats {
     /// Requests received from the frontend, whatever became of them.
@@ -184,11 +207,20 @@ impl Stats {
 #[derive(Clone)]
 pub(crate) struct Engines(pub Vec<mpsc::UnboundedSender<EngineInput>>);
 
-/// Shared handler state: the engines plus, when the process installed a
+/// The sender into one loop that takes control calls on a channel of their own.
+pub(crate) struct ControlChannel<C, P>(pub mpsc::UnboundedSender<ControlCall<C, P>>);
+
+impl<C, P> Clone for ControlChannel<C, P> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+/// Shared handler state: the targets plus, when the process installed a
 /// reloadable subscriber, the handle that swaps the log filter.
 #[derive(Clone)]
-struct AppState {
-    engines: Engines,
+struct AppState<T> {
+    targets: T,
     log: Option<LogFilter>,
 }
 
@@ -199,31 +231,54 @@ pub struct LogLevel {
     pub filter: String,
 }
 
-impl Engines {
-    async fn call(
-        &self,
-        engine: &mpsc::UnboundedSender<EngineInput>,
-        request: ControlRequest,
-    ) -> Result<ControlReply, ControlError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        engine
-            .send(EngineInput::Control(ControlCall {
-                request,
-                reply: reply_tx,
-            }))
-            .map_err(|_| ControlError::internal("engine loop is gone"))?;
-        reply_rx
-            .await
-            .map_err(|_| ControlError::internal("engine dropped the control reply"))?
-    }
+async fn answer<C>(
+    reply: oneshot::Receiver<Result<ControlReply<C>, ControlError>>,
+) -> Result<ControlReply<C>, ControlError> {
+    reply
+        .await
+        .map_err(|_| ControlError::internal("loop dropped the control reply"))?
+}
 
-    /// Send the same request to every engine, in order, collecting the replies.
+impl Targets for Engines {
+    type Config = Config;
+    type Patch = ConfigPatch;
+
     async fn broadcast(&self, request: ControlRequest) -> Result<Vec<ControlReply>, ControlError> {
         let mut replies = Vec::with_capacity(self.0.len());
         for engine in &self.0 {
-            replies.push(self.call(engine, request.clone()).await?);
+            let (reply_tx, reply_rx) = oneshot::channel();
+            engine
+                .send(EngineInput::Control(ControlCall {
+                    request: request.clone(),
+                    reply: reply_tx,
+                }))
+                .map_err(|_| ControlError::internal("engine loop is gone"))?;
+            replies.push(answer(reply_rx).await?);
         }
         Ok(replies)
+    }
+}
+
+impl<C, P> Targets for ControlChannel<C, P>
+where
+    C: Serialize + Send + 'static,
+    P: Patch + DeserializeOwned + Clone + Send + 'static,
+{
+    type Config = C;
+    type Patch = P;
+
+    async fn broadcast(
+        &self,
+        request: ControlRequest<P>,
+    ) -> Result<Vec<ControlReply<C>>, ControlError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.0
+            .send(ControlCall {
+                request,
+                reply: reply_tx,
+            })
+            .map_err(|_| ControlError::internal("stage loop is gone"))?;
+        Ok(vec![answer(reply_rx).await?])
     }
 }
 
@@ -234,33 +289,37 @@ impl IntoResponse for ControlError {
     }
 }
 
-fn first_config(replies: Vec<ControlReply>) -> Result<Json<Config>, ControlError> {
+fn first_config<C>(replies: Vec<ControlReply<C>>) -> Result<Json<C>, ControlError> {
     match replies.into_iter().next() {
         Some(ControlReply::Config(config)) => Ok(Json(config)),
-        _ => Err(ControlError::internal("engine returned no config")),
+        _ => Err(ControlError::internal("loop returned no config")),
     }
 }
 
-async fn get_config(State(state): State<AppState>) -> Result<Json<Config>, ControlError> {
-    first_config(state.engines.broadcast(ControlRequest::GetConfig).await?)
+async fn get_config<T: Targets>(
+    State(state): State<AppState<T>>,
+) -> Result<Json<T::Config>, ControlError> {
+    first_config(state.targets.broadcast(ControlRequest::GetConfig).await?)
 }
 
-async fn patch_config(
-    State(state): State<AppState>,
-    Json(patch): Json<ConfigPatch>,
-) -> Result<Json<Config>, ControlError> {
+async fn patch_config<T: Targets>(
+    State(state): State<AppState<T>>,
+    Json(patch): Json<T::Patch>,
+) -> Result<Json<T::Config>, ControlError> {
     patch.validate()?;
     first_config(
         state
-            .engines
+            .targets
             .broadcast(ControlRequest::PatchConfig(Box::new(patch)))
             .await?,
     )
 }
 
-async fn get_stats(State(state): State<AppState>) -> Result<Json<Stats>, ControlError> {
+async fn get_stats<T: Targets>(
+    State(state): State<AppState<T>>,
+) -> Result<Json<Stats>, ControlError> {
     let mut total = Stats::default();
-    for reply in state.engines.broadcast(ControlRequest::GetStats).await? {
+    for reply in state.targets.broadcast(ControlRequest::GetStats).await? {
         if let ControlReply::Stats(stats) = reply {
             total.add(stats);
         }
@@ -268,27 +327,31 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<Stats>, Control
     Ok(Json(total))
 }
 
-async fn reset_stats(State(state): State<AppState>) -> Result<StatusCode, ControlError> {
-    state.engines.broadcast(ControlRequest::ResetStats).await?;
+async fn reset_stats<T: Targets>(
+    State(state): State<AppState<T>>,
+) -> Result<StatusCode, ControlError> {
+    state.targets.broadcast(ControlRequest::ResetStats).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn log_filter(state: &AppState) -> Result<&LogFilter, ControlError> {
+fn log_filter<T>(state: &AppState<T>) -> Result<&LogFilter, ControlError> {
     state.log.as_ref().ok_or_else(|| ControlError {
         status: StatusCode::NOT_IMPLEMENTED.as_u16(),
         error: "this process has no reloadable log filter".to_string(),
     })
 }
 
-async fn get_log(State(state): State<AppState>) -> Result<Json<LogLevel>, ControlError> {
+async fn get_log<T: Targets>(
+    State(state): State<AppState<T>>,
+) -> Result<Json<LogLevel>, ControlError> {
     let filter = log_filter(&state)?
         .current()
         .map_err(ControlError::internal)?;
     Ok(Json(LogLevel { filter }))
 }
 
-async fn put_log(
-    State(state): State<AppState>,
+async fn put_log<T: Targets>(
+    State(state): State<AppState<T>>,
     Json(level): Json<LogLevel>,
 ) -> Result<Json<LogLevel>, ControlError> {
     let handle = log_filter(&state)?;
@@ -300,19 +363,19 @@ async fn put_log(
     Ok(Json(LogLevel { filter }))
 }
 
-pub(crate) fn router(engines: Engines, log: Option<LogFilter>) -> Router {
+pub(crate) fn router<T: Targets>(targets: T, log: Option<LogFilter>) -> Router {
     Router::new()
-        .route("/config", get(get_config).patch(patch_config))
-        .route("/stats", get(get_stats))
-        .route("/stats/reset", post(reset_stats))
-        .route("/log", get(get_log).put(put_log))
-        .with_state(AppState { engines, log })
+        .route("/config", get(get_config::<T>).patch(patch_config::<T>))
+        .route("/stats", get(get_stats::<T>))
+        .route("/stats/reset", post(reset_stats::<T>))
+        .route("/log", get(get_log::<T>).put(put_log::<T>))
+        .with_state(AppState { targets, log })
 }
 
 /// Bind `addr` and serve the control API until `shutdown` fires.
-pub(crate) async fn serve(
+pub(crate) async fn serve<T: Targets>(
     addr: String,
-    engines: Engines,
+    targets: T,
     log: Option<LogFilter>,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -321,7 +384,7 @@ pub(crate) async fn serve(
         .with_context(|| format!("binding control address {addr}"))?;
     let local: SocketAddr = listener.local_addr()?;
     info!(%local, "control API listening");
-    axum::serve(listener, router(engines, log))
+    axum::serve(listener, router(targets, log))
         .with_graceful_shutdown(shutdown.cancelled_owned())
         .await
         .context("control API server")

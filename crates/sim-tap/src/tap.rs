@@ -36,7 +36,9 @@ use std::io::Write;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use bytes::Bytes;
+use sim_protocol::frontend_connect::ReadyOrder;
 use sim_protocol::mock_engine::MockEngineSockets;
+use sim_protocol::omni::llm::OmniRequestDecoder;
 use sim_protocol::vllm::engine_id_from_index;
 use sim_protocol::vllm::{
     EngineCoreFinishReason, EngineCoreRequest, EngineCoreRequestType, decode_engine_core_outputs,
@@ -57,6 +59,8 @@ use sim_trace::config_hash::ConfigFingerprint;
 use sim_trace::trace::{ItlContext, TraceMeta, TraceRecord, append_record};
 
 use sim_protocol::step_stats::{StepStatsRecord, append_step_stats};
+
+use crate::omni::{self, OmniTap, TapAddresses};
 
 /// Batch context attached to a single ITL gap (one gap per output chunk).
 struct GapSample {
@@ -256,6 +260,10 @@ pub struct TapConfig {
     /// Record each request's output token ids into the trace
     /// (`TraceRecord::output_token_ids`).
     pub record_tokens: TokenRecording,
+    /// Set when the engine is a vLLM-Omni stage and the frontend an omni head.
+    /// The head then hands out the frontend handshake address, and
+    /// `frontend_handshake` is unused.
+    pub omni: Option<OmniTap>,
 }
 
 /// Sockets and handshake payloads captured while connecting the real engine.
@@ -427,6 +435,7 @@ async fn downstream_connect(
     frontend_handshake: &str,
     ready_message: &ReadyMessage,
     ready_response_payload: &[u8],
+    ready_order: ReadyOrder,
 ) -> Result<MockEngineSockets> {
     sim_protocol::frontend_connect::connect_to_frontend_raw(
         frontend_handshake,
@@ -435,7 +444,7 @@ async fn downstream_connect(
         ready_message.headless.unwrap_or(true),
         ready_response_payload,
         std::time::Duration::from_secs(5),
-        sim_protocol::frontend_connect::ReadyOrder::AfterDataSockets,
+        ready_order,
     )
     .await
     .map_err(|e| anyhow!("connecting to frontend: {e}"))
@@ -456,6 +465,25 @@ pub async fn run_tap<W: Write, S: Write>(
     mut step_writer: Option<S>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let attachment = match &config.omni {
+        Some(omni) => Some(
+            omni::accept_stage(
+                omni,
+                &TapAddresses {
+                    handshake: &config.engine_handshake,
+                    input: &config.input_address,
+                    output: &config.output_address,
+                },
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let omni_requests = attachment
+        .as_ref()
+        .map(|_| OmniRequestDecoder::new())
+        .transpose()?;
+
     // Step 1: Bind upstream side and wait for the real engine's HELLO first.
     let UpstreamEngine {
         input: mut upstream_input,
@@ -474,7 +502,12 @@ pub async fn run_tap<W: Write, S: Write>(
     // The meta line carries handshake-derived fields (engine version, raw
     // ready-response bytes), so it is written here, after the handshake and
     // before any records.
-    let trace_meta = build_meta(&meta, &engine_vllm_version, &ready_response_payload);
+    let mut trace_meta = build_meta(&meta, &engine_vllm_version, &ready_response_payload);
+    if let Some(attachment) = &attachment {
+        trace_meta
+            .extra
+            .insert("omni_stage_id".to_string(), attachment.stage_id.into());
+    }
     write_meta_line(writer, &trace_meta)?;
 
     info!(
@@ -483,12 +516,35 @@ pub async fn run_tap<W: Write, S: Write>(
     );
 
     // Step 2: Connect downstream to the real frontend.
-    let MockEngineSockets { data_sockets, .. } = downstream_connect(
-        &config.frontend_handshake,
+    let (frontend_handshake, ready_order) = match &attachment {
+        Some(attachment) => (
+            attachment.head.handshake_address.as_str(),
+            ReadyOrder::BeforeDataSockets,
+        ),
+        None => (
+            config.frontend_handshake.as_str(),
+            ReadyOrder::AfterDataSockets,
+        ),
+    };
+    let MockEngineSockets {
+        init, data_sockets, ..
+    } = downstream_connect(
+        frontend_handshake,
         &ready_message,
         &ready_response_payload,
+        ready_order,
     )
     .await?;
+    let status_relay = match (
+        attachment,
+        init.addresses.inputs.first(),
+        init.addresses.outputs.first(),
+    ) {
+        (Some(attachment), Some(input), Some(output)) => {
+            attachment.relay_status(input.clone(), output.clone())
+        }
+        _ => None,
+    };
 
     // Single client, single engine: take the first data socket pair.
     let sockets = data_sockets
@@ -592,7 +648,7 @@ pub async fn run_tap<W: Write, S: Write>(
                 // DIAG: decode the request to see if it carries mm_features (and how
                 // many prompt tokens).
                 if frames.len() >= 2 && request_type_from_frame(frames[0].as_ref()) == Some(EngineCoreRequestType::Add) {
-                    match decode_msgpack::<EngineCoreRequest>(frames[1].as_ref()) {
+                    match decode_add(frames[1].as_ref(), omni_requests.as_ref()) {
                         Ok(req) => info!(
                             request_id = %req.request_id,
                             mm_features = req.mm_features.is_some(),
@@ -616,7 +672,13 @@ pub async fn run_tap<W: Write, S: Write>(
                 }
 
                 // Decode a copy for observation.
-                observe_request(&frames, &mut requests, arrival, config.block_size);
+                observe_request(
+                    &frames,
+                    &mut requests,
+                    arrival,
+                    config.block_size,
+                    omni_requests.as_ref(),
+                );
             }
 
             // Upstream -> Downstream: frames from the engine to the frontend.
@@ -657,6 +719,9 @@ pub async fn run_tap<W: Write, S: Write>(
     // channel, so abort them outright.
     req_drain.abort();
     out_drain.abort();
+    if let Some(status_relay) = status_relay {
+        status_relay.abort();
+    }
     proxy_result?;
 
     writer.flush().context("flushing trace writer")?;
@@ -665,11 +730,21 @@ pub async fn run_tap<W: Write, S: Write>(
 
 /// Observe (decode a copy of) an incoming request for recording. `arrival` is
 /// the instant the frames came off the wire, stamped before forwarding.
+/// Decode an `Add` request's primary frame. An omni stage's requests carry
+/// fields past the vLLM tuple, which `omni` splits off.
+fn decode_add(frame: &[u8], omni: Option<&OmniRequestDecoder>) -> Result<Box<EngineCoreRequest>> {
+    match omni {
+        Some(decoder) => Ok(decoder.decode(frame)?.request),
+        None => Ok(decode_msgpack(frame)?),
+    }
+}
+
 fn observe_request<F: AsRef<[u8]>>(
     frames: &[F],
     requests: &mut HashMap<String, RequestState>,
     arrival: Instant,
     block_size: usize,
+    omni: Option<&OmniRequestDecoder>,
 ) {
     // A request is `[request_type, msgpack_blob, aux_tensor_frame...]`: text
     // requests are 2 frames, but a multimodal request appends one aux frame per
@@ -692,25 +767,23 @@ fn observe_request<F: AsRef<[u8]>>(
     };
 
     match request_type {
-        EngineCoreRequestType::Add => {
-            match decode_msgpack::<EngineCoreRequest>(frames[1].as_ref()) {
-                Ok(req) => {
-                    let concurrency = (requests.len() as u64) + 1;
-                    let state = RequestState::new(&req, arrival, block_size, concurrency);
-                    debug!(
-                        request_id = %req.request_id,
-                        prompt_tokens = state.prompt_tokens,
-                        concurrency,
-                        remote_prefill = state.remote_prefill,
-                        "tap: observed Add request"
-                    );
-                    requests.insert(req.request_id, state);
-                }
-                Err(e) => {
-                    warn!(%e, "tap: failed to decode Add request for observation");
-                }
+        EngineCoreRequestType::Add => match decode_add(frames[1].as_ref(), omni) {
+            Ok(req) => {
+                let concurrency = (requests.len() as u64) + 1;
+                let state = RequestState::new(&req, arrival, block_size, concurrency);
+                debug!(
+                    request_id = %req.request_id,
+                    prompt_tokens = state.prompt_tokens,
+                    concurrency,
+                    remote_prefill = state.remote_prefill,
+                    "tap: observed Add request"
+                );
+                requests.insert(req.request_id, state);
             }
-        }
+            Err(e) => {
+                warn!(%e, "tap: failed to decode Add request for observation");
+            }
+        },
         EngineCoreRequestType::Abort => match decode_msgpack::<Vec<String>>(frames[1].as_ref()) {
             Ok(ids) => {
                 for id in &ids {
@@ -1067,7 +1140,7 @@ mod tests {
         ];
 
         let mut requests: HashMap<String, RequestState> = HashMap::new();
-        observe_request(&frames, &mut requests, Instant::now(), 16);
+        observe_request(&frames, &mut requests, Instant::now(), 16, None);
 
         assert_eq!(requests.len(), 1, "multimodal Add must be tracked");
         let state = requests.get("req-mm-large").expect("request_id tracked");

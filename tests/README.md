@@ -13,6 +13,7 @@ ZMQ transport and a real `EngineCoreClient`; there are no mocks.
 | `calibrate.rs` | Timing model quantile fidelity and open-loop arrival replay |
 | `conformance.rs` | Golden testing against real vLLM captures from S3 (needs AWS credentials) |
 | `omni_e2e.rs` | vLLM-Omni stages against a scripted head: attach and READY order, request tail, audio outputs, diffusion generate/abort/shutdown |
+| `omni_tap_e2e.rs` | Recording an omni stage: scripted head, the tap, and a `play` stage chained; registration and status relay, tails passed through, trace contents |
 | `tap_e2e.rs`, `kv_events_pubsub.rs` | Recording tap and KV-event publishing |
 | `nixl_loopback.rs` | NIXL KV transfer over loopback (`nixl` feature) |
 

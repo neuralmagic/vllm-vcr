@@ -993,7 +993,14 @@ pub async fn run_with_log_filter(
         }
         Some(omni::OmniStage::Diffusion(stage)) => {
             info!(omni = ?opt.omni, "starting mock diffusion stage");
-            return stage.run(opt.log_requests, shutdown).await;
+            return stage
+                .run(
+                    opt.log_requests,
+                    opt.control_address.clone(),
+                    log_filter,
+                    shutdown,
+                )
+                .await;
         }
         Some(omni::OmniStage::Llm(stage)) => Some(stage),
         None => None,

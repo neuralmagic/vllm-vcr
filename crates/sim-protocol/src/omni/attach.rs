@@ -32,7 +32,7 @@ struct StageRegistrationRequest<'a> {
 }
 
 /// The master's reply to a stage registration.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageRegistration {
     pub handshake_address: String,
     pub input_address: String,
@@ -59,16 +59,27 @@ pub async fn register_stage(
     replica_bind_address: Option<&str>,
     reply_timeout: Duration,
 ) -> Result<StageRegistration> {
+    register_raw(
+        master_address,
+        encode_registration(stage_id, replica_bind_address)?,
+        reply_timeout,
+    )
+    .await
+}
+
+/// Send an already-encoded registration to the head's `OmniMasterServer`.
+pub async fn register_raw(
+    master_address: &str,
+    registration: Vec<u8>,
+    reply_timeout: Duration,
+) -> Result<StageRegistration> {
     let mut socket = DealerSocket::new();
     socket
         .connect(master_address)
         .await
         .with_context(|| format!("connecting to omni master {master_address}"))?;
     socket
-        .send(ZmqMessage::from(encode_registration(
-            stage_id,
-            replica_bind_address,
-        )?))
+        .send(ZmqMessage::from(registration))
         .await
         .context("sending stage registration")?;
     let frames = timeout(reply_timeout, socket.recv())

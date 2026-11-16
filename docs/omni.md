@@ -151,6 +151,95 @@ same dimensions.
 A request for more than 64 megapixels in total is answered with a 400. An aborted
 request frees its execution slot and sends nothing, as a real stage does.
 
+### Control API
+
+`--control-address` serves the [runtime control API](./control-api.md#diffusion-stages)
+on a diffusion stage too: read and patch the latency knobs and concurrency, and read
+request counters with exact running and waiting counts.
+
+## Recording a stage
+
+`vllm-vcr record` can sit between the head and a real LLM stage and capture that
+stage's requests the way it captures a plain engine's: per-token timing, token ids
+with `--record-tokens`, and the trace metadata, plus `omni_stage_id`. The trace then
+drives a mock of the same stage through `--latency-trace` and `--replay-tokens`.
+
+<div class="vcr-flow vcr-flow-capture" role="img" aria-label="The omni head talks to the recording tap, which talks to the real stage; the tap writes a trace.">
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">real</span>
+    <strong>vLLM-Omni head</strong>
+    <span>master :21212</span>
+  </div>
+  <div class="vcr-connector"><span>registration, handshake, data, status</span></div>
+  <div class="vcr-node vcr-node-accent">
+    <span class="vcr-node-kicker">tap</span>
+    <strong>vllm-vcr record</strong>
+    <span>master :21213</span>
+  </div>
+  <div class="vcr-connector"><span>same four, tap addresses</span></div>
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">real, GPU</span>
+    <strong>headless stage</strong>
+    <span>thinker or talker</span>
+  </div>
+  <div class="vcr-connector"><span>JSONL</span></div>
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">output</span>
+    <strong>trace</strong>
+    <span>one per stage</span>
+  </div>
+</div>
+
+Besides the handshake and data frames the tap already proxies, it stands in the
+middle of the two omni-only exchanges:
+
+- **Registration.** The stage registers with the tap. The tap passes that registration
+  to the head unchanged and answers the stage with its own addresses.
+- **Status.** The stage reports to the tap's coordinator address. The tap forwards each
+  event to the head with the tap-side data addresses swapped for the head-side ones,
+  which are what the head routes by.
+
+```bash
+# The tap: registers with the head on :21212, listens for the stage on :21213.
+vllm-vcr record --omni-master-address tcp://127.0.0.1:21212 \
+  --trace-out thinker.jsonl --model Qwen/Qwen2.5-Omni-7B --record-tokens
+
+# The real stage registers with the tap instead of the head.
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --headless --stage-id 0 \
+  --omni-master-address 127.0.0.1 --omni-master-port 21213
+```
+
+One tap records one stage. To record two stages, run two taps on different ports
+(`--omni-master-listen`, `--omni-coordinator-listen`, `--engine-handshake`,
+`--input-address`, `--output-address`).
+
+To replay, give the mock stage the trace and the real stage's scheduler limits. The
+limits are in the trace's `ready_response_hex`; the thinker below runs one sequence
+at a time.
+
+```bash
+vllm-vcr play --omni-master-address tcp://127.0.0.1:21212 --omni-stage-id 0 \
+  --latency-trace thinker.jsonl --replay-tokens thinker.jsonl --replay-match prefix \
+  --max-num-seqs 1 --max-model-len 32768 --kv-cache-size 48824
+```
+
+### Measured fidelity
+
+Qwen2.5-Omni-7B on one H200, vLLM-Omni v0.32.0. The thinker was recorded under 48
+streaming text requests, then replaced on the same head by a mock replaying the
+trace, and the same requests were sent again. Times are client-side means.
+
+| Workload | | Real thinker | Mock replaying the trace |
+| --- | --- | --- | --- |
+| Concurrency 1 | TTFT | 29.7 ms | 38.0 ms |
+| | Total | 951.6 ms | 965.7 ms |
+| Concurrency 4 | TTFT | 2601 ms | 2523 ms |
+| | Total | 3526 ms | 3453 ms |
+
+Totals are within about 2%. The mock returned the recorded text and the same number
+of chunks. The talker records the same way: 112 codec tokens per request at an 11 ms
+inter-token gap, ending on `stop`.
+
 ## Flags
 
 | Flag | Meaning |
@@ -162,6 +251,7 @@ request frees its execution slot and sends nothing, as a real stage does.
 | `--omni-audio-samples-per-token` | LLM stages. Marks the final audio stage and sets audio duration per token. |
 | `--omni-audio-sample-rate` | LLM stages. Sample rate reported with the audio. |
 | `--output-tokens` | LLM stages. Synthetic EOS point: a request allowed more tokens finishes here with `stop`. |
+| `--control-address` | Either kind. Serves the runtime control API for the stage. |
 | `--omni-diffusion-*` | Diffusion stages. See the latency model. |
 
 ## Versions
@@ -175,7 +265,8 @@ cargo xtask pin-vllm 0.32
 VLLM_TARGET_VERSION=v0.32.0 cargo build --release -p vllm-vcr
 ```
 
-The diffusion protocol does not depend on the vLLM line.
+The diffusion protocol does not depend on the vLLM line. The omni code builds and its
+tests pass on every line in `compat.toml`.
 
 ## The rig
 
@@ -196,6 +287,36 @@ just omni-logs head          # or a stage id
 just omni-down               # release the GPU
 ```
 
+To record, run the stages for real and put a tap in front of one of them:
+
+```bash
+just omni-head Qwen/Qwen2.5-Omni-7B
+just omni-record 0 --model Qwen/Qwen2.5-Omni-7B --record-tokens   # prints the tap's port
+just omni-real-stage 0 Qwen/Qwen2.5-Omni-7B 21213                 # through the tap
+just omni-real-stage 1 Qwen/Qwen2.5-Omni-7B                       # straight to the head
+just omni-real-stage 2 Qwen/Qwen2.5-Omni-7B
+
+kubectl -n inference-sim exec -i omni-rig -c head -- \
+  python3 - --model Qwen/Qwen2.5-Omni-7B --requests 24 < deploy/omni/loadgen.py
+
+just omni-stop-records                                            # finalizes the trace
+just omni-fetch /work/stage0.jsonl /tmp/thinker.jsonl
+```
+
+Two things to know when the real stages share one GPU:
+
+- Start them one at a time and let each finish loading. Loading together races on
+  GPU memory and one of them fails with `No available memory for the cache blocks`.
+- A pipeline's deploy config may place stages on several GPUs and give each most of
+  one. Pass `--stage-overrides` to fit them on one, for example
+  `{"0":{"gpu_memory_utilization":0.45},"1":{"devices":"0","gpu_memory_utilization":0.3},"2":{"gpu_memory_utilization":0.1}}`.
+  `just` does not pass JSON through intact; call `bash deploy/omni/rig.sh real-stage
+  ...` directly for this flag.
+
+A stage that dies while the head is still starting leaves its replica slot stuck: the
+head keeps waiting on it. Restart the head. Once the head is ready, stages can come
+and go.
+
 `just omni-head <model>` restarts the head for another pipeline; run `just
 omni-stop-stages` first and attach new stages after. A stage can be restarted on its
 own: the head detaches the old replica and attaches the new one under a fresh replica
@@ -214,8 +335,7 @@ id.
 - **Video and multi-stage image pipelines are untested.** A diffusion stage answers
   one result per request, which is what the image endpoints use. AR-plus-DiT pipelines
   (HunyuanImage-3, BAGEL) hand data between stages through connectors.
-- **`record` does not attach to omni stages.**
-- **No control API on a diffusion stage.** `--control-address` applies to LLM stages.
+- **`record` taps LLM stages only.** A diffusion stage has no trace format to record into.
 
 ## Where the code is
 
@@ -226,5 +346,7 @@ id.
 | `crates/sim-protocol/src/omni/diffusion.rs` | Diffusion stage wire format. |
 | `src/omni/mod.rs` | `--omni-*` options, stage types, attach and heartbeats. |
 | `src/omni/diffusion.rs` | The mock diffusion stage and its latency model. |
+| `crates/sim-tap/src/omni.rs` | The tap's registration and status relay. |
 | `tests/omni_e2e.rs` | Both stage kinds against a scripted head over real sockets. |
-| `deploy/omni/` | The rig, and the script that dumps ground-truth frames from the head's encoder. |
+| `tests/omni_tap_e2e.rs` | Scripted head, the tap, and a `play` stage in one chain. |
+| `deploy/omni/` | The rig, a load generator, and the script that dumps ground-truth frames from the head's encoder. |

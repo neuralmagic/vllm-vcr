@@ -32,7 +32,7 @@ struct Cli {
 enum Command {
     /// Record a trace by tapping a live vLLM frontend ↔ engine-core link
     /// (transparent ZMQ proxy; frames relayed verbatim, timing observed).
-    Record(record::RecordArgs),
+    Record(Box<record::RecordArgs>),
 
     /// Play a trace back through the mock engine-core backend, or run it as a
     /// GPU-free vLLM engine for frontend / prefill-decode testing.
@@ -88,7 +88,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Record(args) => record::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Record(args) => record::run(*args).map(|()| ExitCode::SUCCESS),
         Command::Play(opt) => play(*opt, log_filter).map(|()| ExitCode::SUCCESS),
         Command::Inspect(command) => inspect::run(command),
         Command::Completions { shell } => {
