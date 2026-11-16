@@ -138,7 +138,8 @@ fn utility_response(engine_index: u32, request: UtilityRequestSpec) -> Result<En
         | "profile"
         | "sleep"
         | "wake_up"
-        | "execute_dummy_batch" => utility_envelope(()),
+        | "execute_dummy_batch"
+        | "omni_release_request_resources" => utility_envelope(()),
         other => {
             warn!(
                 engine_index,
@@ -238,6 +239,8 @@ struct ActiveRequest {
     /// The original prompt token ids, retained so the `TokenSource` can condition on them.
     prompt_token_ids: Vec<u32>,
     max_tokens: usize,
+    /// `max_tokens` is the `--output-tokens` EOS point, below what the request allowed.
+    eos_stop: bool,
     generated: usize,
     rng: StdRng,
     /// Per-request decode pacing state (hierarchical latency models pin a request
@@ -404,6 +407,13 @@ impl ActiveRequest {
             }
         };
 
+        let eos_at = opt
+            .output_tokens
+            .filter(|_| !verbatim)
+            .map(|tokens| (tokens as usize).max(min_tokens));
+        let eos_stop = eos_at.is_some_and(|tokens| tokens < max_tokens);
+        let max_tokens = eos_at.map_or(max_tokens, |tokens| tokens.min(max_tokens));
+
         let pacing = DecodePacing::for_prompt(prompt_len, churn);
 
         // A remote-prefill request (P/D decode side) runs no local chunks;
@@ -434,6 +444,7 @@ impl ActiveRequest {
             prompt_len,
             prompt_token_ids,
             max_tokens,
+            eos_stop,
             generated: 0,
             prefill_advertise,
             remote_prefill,
@@ -1603,11 +1614,13 @@ impl SimEngine {
                 let is_first = request.emitted == 0;
                 request.emitted += emit.tokens.len();
                 let finished = request.emitted >= request.max_tokens;
-                // A replayed request ends with its recorded finish reason; the
-                // sim's own stop condition is always max_tokens (Length).
+                // A replayed request ends with its recorded finish reason and a
+                // request cut at the `--output-tokens` EOS point with Stop; the
+                // sim's own stop condition is otherwise max_tokens (Length).
                 let finish_reason = finished.then(|| {
                     self.token_source
                         .finish_reason(&request.request_id)
+                        .or(request.eos_stop.then_some(EngineCoreFinishReason::Stop))
                         .unwrap_or(EngineCoreFinishReason::Length)
                 });
 
@@ -2102,6 +2115,78 @@ mod tests {
         let tokens: usize = outputs.iter().map(|o| o.new_token_ids.len()).sum();
         assert_eq!(tokens, 3);
         assert!(outputs.last().unwrap().finished());
+    }
+
+    fn finish_of(outputs: &[EngineCoreOutput]) -> (usize, Option<EngineCoreFinishReason>) {
+        let tokens = outputs.iter().map(|o| o.new_token_ids.len()).sum();
+        (tokens, outputs.last().and_then(|o| o.finish_reason))
+    }
+
+    fn output_tokens_opt(output_tokens: u32) -> Opt {
+        Opt {
+            output_tokens: Some(output_tokens),
+            ..test_opt()
+        }
+    }
+
+    #[test]
+    fn output_tokens_stops_a_longer_request_with_eos() {
+        let (mut engine, mut rx) = test_engine(output_tokens_opt(5));
+        add(&mut engine, &mut rx, request("r1", 4, 400));
+        assert_eq!(
+            finish_of(&drain(&mut engine, &mut rx)),
+            (5, Some(EngineCoreFinishReason::Stop))
+        );
+    }
+
+    #[test]
+    fn output_tokens_leaves_a_shorter_request_to_finish_on_length() {
+        let (mut engine, mut rx) = test_engine(output_tokens_opt(5));
+        add(&mut engine, &mut rx, request("r1", 4, 3));
+        assert_eq!(
+            finish_of(&drain(&mut engine, &mut rx)),
+            (3, Some(EngineCoreFinishReason::Length))
+        );
+    }
+
+    #[test]
+    fn output_tokens_equal_to_max_tokens_finishes_on_length() {
+        let (mut engine, mut rx) = test_engine(output_tokens_opt(5));
+        add(&mut engine, &mut rx, request("r1", 4, 5));
+        assert_eq!(
+            finish_of(&drain(&mut engine, &mut rx)),
+            (5, Some(EngineCoreFinishReason::Length))
+        );
+    }
+
+    #[test]
+    fn output_tokens_is_raised_to_min_tokens() {
+        let (mut engine, mut rx) = test_engine(output_tokens_opt(5));
+        let req = EngineCoreRequest {
+            request_id: "r1".to_string(),
+            prompt_token_ids: Some(vec![0u32; 4]),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens: 400,
+                min_tokens: 9,
+                ..EngineCoreSamplingParams::for_test()
+            }),
+            ..Default::default()
+        };
+        add(&mut engine, &mut rx, req);
+        assert_eq!(
+            finish_of(&drain(&mut engine, &mut rx)),
+            (9, Some(EngineCoreFinishReason::Stop))
+        );
+    }
+
+    #[test]
+    fn without_output_tokens_a_request_runs_to_max_tokens() {
+        let (mut engine, mut rx) = test_engine(test_opt());
+        add(&mut engine, &mut rx, request("r1", 4, 7));
+        assert_eq!(
+            finish_of(&drain(&mut engine, &mut rx)),
+            (7, Some(EngineCoreFinishReason::Length))
+        );
     }
 
     /// Instant model that caps every request's output at a fixed length, the

@@ -435,6 +435,7 @@ async fn downstream_connect(
         ready_message.headless.unwrap_or(true),
         ready_response_payload,
         std::time::Duration::from_secs(5),
+        sim_protocol::frontend_connect::ReadyOrder::AfterDataSockets,
     )
     .await
     .map_err(|e| anyhow!("connecting to frontend: {e}"))

@@ -1,0 +1,45 @@
+# vLLM-Omni rig: a real omni head (API server + orchestrator, every stage remote)
+# and vllm-vcr play attached as the stages, in one pod so they share localhost.
+#
+# The head image pins one vLLM version (v0.32.0 is vLLM 0.32.0). `rig.sh build`
+# builds play for that line; keep VLLM_LINE in step with the image tag.
+#
+# The head needs a GPU even though it loads no model: vLLM's platform probe
+# fails on the CUDA image without one.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: omni-rig
+  labels:
+    llm-d.ai/rig: omni
+spec:
+  restartPolicy: Never
+  containers:
+    - name: head
+      image: vllm/vllm-omni:v0.32.0
+      command: ["sleep", "infinity"]
+      env:
+        - { name: HF_HUB_CACHE, value: /hf-cache }
+        - { name: HF_HUB_DISABLE_XET, value: "1" }
+      resources:
+        requests: { cpu: "8", memory: 32Gi, nvidia.com/gpu: "1" }
+        limits: { cpu: "16", memory: 64Gi, nvidia.com/gpu: "1" }
+      volumeMounts:
+        - { mountPath: /hf-cache, name: hf-cache }
+        - { mountPath: /dev/shm, name: shm }
+    - name: sim
+      image: rust:1-bookworm
+      command: ["sleep", "infinity"]
+      resources:
+        requests: { cpu: "16", memory: 16Gi }
+        limits: { cpu: "32", memory: 32Gi }
+      volumeMounts:
+        - { mountPath: /work, name: work }
+        - { mountPath: /dev/shm, name: shm }
+  volumes:
+    - name: hf-cache
+      emptyDir: { sizeLimit: 150Gi }
+    - name: work
+      emptyDir: { sizeLimit: 30Gi }
+    - name: shm
+      emptyDir: { medium: Memory, sizeLimit: 16Gi }

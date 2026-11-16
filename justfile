@@ -84,6 +84,48 @@ capture-fetch out="/tmp/tap-trace.jsonl":
     kubectl -n {{namespace}} exec deploy/{{deploy}} -c tap -- cat /trace/trace.jsonl > {{out}}
     @wc -l {{out}}
 
+# --- vLLM-Omni rig (deploy/omni) ---------------------------------------------------
+# A real vllm-omni head with vllm-vcr play attached as every stage. See docs/omni.md.
+#   just omni-up && just omni-build
+#   just omni-head Qwen/Qwen2.5-Omni-7B
+#   just omni-stage 0 --inter-token-latency 20
+#   just omni-stage 1 --output-tokens 250
+#   just omni-stage 2 --output-tokens 250 --omni-audio-samples-per-token 480
+#   just omni-status
+#   just omni-down                          # release the GPU
+
+# Schedule the omni rig pod (1x GPU for the head's platform probe).
+omni-up:
+    bash deploy/omni/rig.sh up
+
+# Delete the omni rig pod (always do this when finished).
+omni-down:
+    bash deploy/omni/rig.sh down
+
+# Copy the working tree into the rig and build play for the head's vLLM line (VLLM_LINE, default 0.32).
+omni-build:
+    bash deploy/omni/rig.sh build
+
+# (Re)start the head for a model with every stage remote; extra args go to `vllm serve`.
+omni-head model *args:
+    bash deploy/omni/rig.sh head {{model}} {{args}}
+
+# Attach play as one stage; extra args go to `vllm-vcr play`.
+omni-stage stage *args:
+    bash deploy/omni/rig.sh stage {{stage}} {{args}}
+
+# Stop every play stage (the head detaches them).
+omni-stop-stages:
+    bash deploy/omni/rig.sh stop-stages
+
+# Head health, attached replicas, and recent request timings.
+omni-status:
+    bash deploy/omni/rig.sh status
+
+# Tail the head log (`head`) or a stage log (stage id).
+omni-logs target lines="40":
+    bash deploy/omni/rig.sh logs {{target}} {{lines}}
+
 # --- conformance captures (deploy/trace-capture/models.toml) -----------------------
 # Kueue-serialized golden captures, one model x scenario per Job. See docs/conformance.md.
 

@@ -6,6 +6,7 @@
 pub mod frontend_connect;
 pub mod kvparams;
 pub mod mock_engine;
+pub mod omni;
 pub mod step_stats;
 pub mod vllm;
 pub mod wire;

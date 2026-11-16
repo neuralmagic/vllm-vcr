@@ -30,6 +30,7 @@ mod engine_core;
 mod io;
 pub mod kvevents;
 pub mod lora;
+pub mod omni;
 mod replay_steps;
 mod sched;
 mod tokens;
@@ -124,6 +125,13 @@ pub struct Opt {
     /// Random token IDs are sampled uniformly from 0..vocab_size.
     #[arg(long, default_value_t = 32_000)]
     pub vocab_size: u32,
+
+    /// Output tokens after which a synthetic request emits EOS: a request whose
+    /// `max_tokens` exceeds this finishes there with `stop` instead of running to
+    /// `max_tokens` with `length`. Raised to the request's `min_tokens`. Ignored under
+    /// `--replay-tokens` / `--replay-steps`, which pin each request to its recorded length.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub output_tokens: Option<u32>,
 
     /// Path or `s3://bucket/key`/`hf://org/repo/file` URI to a JSONL trace whose
     /// recorded output token ids (tap `--record-tokens`) are served verbatim instead
@@ -373,6 +381,9 @@ pub struct Opt {
     /// every in-flight request immediately.
     #[arg(long, default_value_t = 0)]
     pub shutdown_timeout: u64,
+
+    #[command(flatten)]
+    pub omni: omni::OmniOpt,
 }
 
 /// Offset the port of a `tcp://host:port` endpoint by `n` (no-op for `n == 0` or non-tcp),
@@ -683,6 +694,7 @@ fn local_input<'a>(uri: &'a TraceUri, flag: &str) -> Result<&'a std::path::Path>
 async fn run_engine(
     engine_index: u32,
     opt: Opt,
+    omni_stage: Option<omni::LlmStage>,
     input_tx: mpsc::UnboundedSender<engine_core::EngineInput>,
     input_rx: mpsc::UnboundedReceiver<engine_core::EngineInput>,
     shutdown: CancellationToken,
@@ -729,16 +741,41 @@ async fn run_engine(
     }
     .encode()?;
 
+    let engine_id = engine_id_from_index(engine_index)?;
     // A shutdown signal during the handshake means there is nothing to drain; just leave.
-    let connect = frontend_connect::connect_to_frontend_raw(
-        &opt.handshake_address,
-        engine_id_from_index(engine_index)?,
-        false,
-        true,
-        &ready_payload,
-        std::time::Duration::from_secs(5),
-    );
-    let MockEngineSockets { data_sockets, .. } = tokio::select! {
+    let connect = async {
+        let replica = match &omni_stage {
+            Some(omni) => Some(omni.stage.register().await?),
+            None => None,
+        };
+        let (handshake_address, ready_order) = match &replica {
+            Some(replica) => (
+                replica.handshake_address(),
+                frontend_connect::ReadyOrder::BeforeDataSockets,
+            ),
+            None => (
+                opt.handshake_address.as_str(),
+                frontend_connect::ReadyOrder::AfterDataSockets,
+            ),
+        };
+        let sockets = frontend_connect::connect_to_frontend_raw(
+            handshake_address,
+            engine_id,
+            false,
+            true,
+            &ready_payload,
+            std::time::Duration::from_secs(5),
+            ready_order,
+        )
+        .await?;
+        anyhow::Ok((sockets, replica))
+    };
+    let (
+        MockEngineSockets {
+            init, data_sockets, ..
+        },
+        replica,
+    ) = tokio::select! {
         biased;
         _ = shutdown.cancelled() => {
             info!(engine_index, "shutdown requested before frontend handshake completed");
@@ -752,11 +789,28 @@ async fn run_engine(
 
     let (output_tx, output_rx) = mpsc::unbounded_channel();
 
-    let mut io_loop = tokio::spawn(io::run_io_loop(data_sockets, input_tx, output_rx));
+    let codec = match &omni_stage {
+        Some(omni) => io::Codec::omni(omni.audio)?,
+        None => io::Codec::Vllm,
+    };
+    let mut io_loop = tokio::spawn(io::run_io_loop(data_sockets, codec, input_tx, output_rx));
     // The publisher's token is cancelled only after the engine loop exits, so KV events
     // keep flowing while in-flight requests drain (the publisher also exits on its own
     // once the engine drops its KvEventTx).
     let engine_done = CancellationToken::new();
+    let unfinished = engine_core::UnfinishedGauge::default();
+    let heartbeats = match (
+        &replica,
+        init.addresses.inputs.first(),
+        init.addresses.outputs.first(),
+    ) {
+        (Some(replica), Some(input_address), Some(output_address)) => Some(
+            replica
+                .announce(input_address, output_address, unfinished.clone())
+                .await?,
+        ),
+        _ => None,
+    };
     let events = kvevents::spawn(opt.kv_events_config(engine_index), engine_done.clone())
         .await
         .unwrap_or_else(|error| {
@@ -771,9 +825,10 @@ async fn run_engine(
         output_tx,
         shutdown.clone(),
         shutdown_timeout,
+        unfinished,
     ));
 
-    tokio::select! {
+    let outcome = tokio::select! {
         biased;
         result = &mut engine_loop => {
             engine_done.cancel();
@@ -798,16 +853,20 @@ async fn run_engine(
                     io_loop.await.ok();
                 }
             }
-            result??;
+            result
         }
         result = &mut io_loop => {
             error!(engine_index, "engine IO loop exited unexpectedly");
             engine_done.cancel();
             engine_loop.abort();
             engine_loop.await.ok();
-            result??;
+            result
         }
+    };
+    if let Some(heartbeats) = heartbeats {
+        heartbeats.stop().await;
     }
+    outcome??;
 
     info!(engine_index, "engine shut down");
     Ok(())
@@ -928,6 +987,18 @@ pub async fn run_with_log_filter(
     shutdown: CancellationToken,
     log_filter: Option<LogFilter>,
 ) -> Result<()> {
+    let omni_stage = match opt.omni.stage()? {
+        Some(_) if opt.engine_count != 1 => {
+            bail!("an omni stage replica is one engine; --engine-count must be 1")
+        }
+        Some(omni::OmniStage::Diffusion(stage)) => {
+            info!(omni = ?opt.omni, "starting mock diffusion stage");
+            return stage.run(opt.log_requests, shutdown).await;
+        }
+        Some(omni::OmniStage::Llm(stage)) => Some(stage),
+        None => None,
+    };
+
     materialize_remote_inputs(&mut opt).await?;
 
     // Validate the latency configuration (knob/trace conflict, trace parse) before any
@@ -947,6 +1018,7 @@ pub async fn run_with_log_filter(
         engines.spawn(run_engine(
             engine_index as u32,
             opt.clone(),
+            omni_stage.clone(),
             input_tx,
             input_rx,
             shutdown.clone(),

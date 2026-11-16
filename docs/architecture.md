@@ -51,6 +51,10 @@ The main pieces are:
   `NoopDataPlane` only exercises the control plane, while `NixlDataPlane` performs
   real NIXL reads when the `nixl` feature is enabled.
 
+`play` can also attach to a vLLM-Omni head as one stage of a pipeline: an LLM stage
+reuses this engine-core path, and a diffusion stage runs its own loop. See
+[vLLM-Omni stages](./omni.md).
+
 `record` uses the same boundary in proxy form: it presents as an engine to the
 frontend, presents as a frontend to the real engine, relays frames unchanged, and
 records timing/token metadata from decoded copies.

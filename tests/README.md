@@ -12,6 +12,7 @@ ZMQ transport and a real `EngineCoreClient`; there are no mocks.
 | `real_trace_replay.rs`, `spec_replay_fidelity.rs`, `diffusion_replay_demo.rs`, `gemma4_replay_demo.rs`, `closed_loop_prefix_replay.rs` | Byte-identical replay of real GPU captures |
 | `calibrate.rs` | Timing model quantile fidelity and open-loop arrival replay |
 | `conformance.rs` | Golden testing against real vLLM captures from S3 (needs AWS credentials) |
+| `omni_e2e.rs` | vLLM-Omni stages against a scripted head: attach and READY order, request tail, audio outputs, diffusion generate/abort/shutdown |
 | `tap_e2e.rs`, `kv_events_pubsub.rs` | Recording tap and KV-event publishing |
 | `nixl_loopback.rs` | NIXL KV transfer over loopback (`nixl` feature) |
 

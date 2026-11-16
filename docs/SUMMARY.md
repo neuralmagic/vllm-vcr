@@ -20,6 +20,7 @@
 - [Real-world examples](./examples.md)
 - [LoRA simulation](./lora.md)
 - [NIXL data plane](./nixl.md)
+- [vLLM-Omni stages](./omni.md)
 - [Engine internals](./engine-internals.md)
 - [Runtime control API](./control-api.md)
 

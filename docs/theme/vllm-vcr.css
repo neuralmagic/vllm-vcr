@@ -222,6 +222,10 @@ blockquote {
   grid-template-columns: minmax(130px, 1fr) auto minmax(130px, 1fr) auto minmax(130px, 1fr) auto minmax(150px, 1fr);
 }
 
+.vcr-flow-omni {
+  grid-template-columns: minmax(150px, 1fr) auto minmax(180px, 1fr);
+}
+
 .vcr-node,
 .vcr-node-stack {
   min-width: 0;
@@ -315,6 +319,7 @@ blockquote {
 }
 
 @media (max-width: 900px) {
+  .vcr-flow-omni,
   .vcr-flow-arch,
   .vcr-flow-capture,
   .vcr-flow-replay {

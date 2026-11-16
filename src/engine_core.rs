@@ -4,6 +4,8 @@
 //! ZMQ IO loop. `SimEngine` (in `engine.rs`) is the only implementation today, but the
 //! trait lets us swap in alternative backends without touching the loop or transport.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -48,6 +50,21 @@ pub(crate) struct EngineOutput {
     pub outputs: Envelope,
 }
 
+/// The engine's unfinished-request count, published by the loop for observers
+/// outside the engine task.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UnfinishedGauge(Arc<AtomicUsize>);
+
+impl UnfinishedGauge {
+    pub(crate) fn set(&self, unfinished: usize) {
+        self.0.store(unfinished, Ordering::Relaxed);
+    }
+
+    pub(crate) fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// The contract an engine implementation must satisfy to plug into the generic loop.
 pub(crate) trait EngineCore: Send {
     /// Engine-internal completion events (e.g. finished KV pulls). Engines without
@@ -90,12 +107,14 @@ pub(crate) async fn run_loop<E: EngineCore>(
     output_tx: mpsc::UnboundedSender<EngineOutput>,
     shutdown: CancellationToken,
     shutdown_timeout: Duration,
+    unfinished: UnfinishedGauge,
 ) -> Result<()> {
     let mut internal_rx = engine.take_internal_rx();
     // `None` while running; `Some(deadline)` once a drain has started.
     let mut drain_deadline: Option<Instant> = None;
 
     loop {
+        unfinished.set(engine.num_unfinished_requests());
         if drain_deadline.is_some() && engine.num_unfinished_requests() == 0 {
             info!("shutdown: request processing complete");
             break;
@@ -174,6 +193,7 @@ pub(crate) async fn run_loop<E: EngineCore>(
         }
     }
 
+    unfinished.set(engine.num_unfinished_requests());
     Ok(())
 }
 
@@ -188,7 +208,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    use crate::engine_core::{EngineCore, EngineInput, EngineOutput, run_loop};
+    use crate::engine_core::{EngineCore, EngineInput, EngineOutput, UnfinishedGauge, run_loop};
 
     /// A trivially simple engine that responds to every request with one fixed token
     /// and an immediate Length finish. No scheduling, no rng, no latency, Internal = ().
@@ -403,6 +423,7 @@ mod tests {
             output_tx,
             shutdown_clone,
             std::time::Duration::ZERO,
+            UnfinishedGauge::default(),
         ));
 
         // Send two requests through the loop and verify each gets the constant response.
@@ -456,6 +477,7 @@ mod tests {
             output_tx,
             shutdown.clone(),
             std::time::Duration::ZERO,
+            UnfinishedGauge::default(),
         ));
 
         shutdown.cancel();
@@ -477,6 +499,44 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn gauge_tracks_unfinished_requests() {
+        let due = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
+        let engine = DelayedEngine::new("gauge-1", due);
+        let (_input_tx, input_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let gauge = UnfinishedGauge::default();
+
+        let loop_handle = tokio::spawn(run_loop(
+            engine,
+            input_rx,
+            output_tx,
+            shutdown.clone(),
+            std::time::Duration::ZERO,
+            gauge.clone(),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            gauge.get(),
+            1,
+            "in-flight request is counted before it finishes"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), output_rx.recv())
+            .await
+            .expect("output timed out")
+            .expect("output");
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), loop_handle)
+            .await
+            .expect("loop should exit")
+            .expect("join")
+            .expect("loop result");
+        assert_eq!(gauge.get(), 0);
+    }
+
     /// With a nonzero timeout, the loop drains: the in-flight request finishes
     /// naturally, a request arriving mid-drain is rejected with Abort, and the loop
     /// exits once nothing is unfinished.
@@ -494,6 +554,7 @@ mod tests {
             output_tx,
             shutdown.clone(),
             std::time::Duration::from_secs(10),
+            UnfinishedGauge::default(),
         ));
 
         shutdown.cancel();
@@ -557,6 +618,7 @@ mod tests {
             output_tx,
             shutdown.clone(),
             std::time::Duration::from_millis(200),
+            UnfinishedGauge::default(),
         ));
 
         shutdown.cancel();

@@ -143,60 +143,21 @@ fn status_message(status: &str, local: bool, headless: bool) -> ReadyMessage {
     }
 }
 
-/// Join a frontend-owned handshake endpoint and open engine data sockets,
-/// registering with `ready_response_payload` verbatim.
-pub async fn connect_to_frontend_raw(
-    frontend_handshake: &str,
-    engine_id: EngineId,
-    local: bool,
-    headless: bool,
+/// When the engine reports READY on the handshake socket relative to opening
+/// its data sockets. A vLLM frontend binds the data sockets before the
+/// handshake; a vLLM-Omni head binds them once it has READY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyOrder {
+    AfterDataSockets,
+    BeforeDataSockets,
+}
+
+async fn open_data_sockets(
+    init: &HandshakeInitMessage,
+    peer_identity: &PeerIdentity,
     ready_response_payload: &[u8],
     connect_timeout: Duration,
-) -> Result<MockEngineSockets> {
-    wait_for_ipc_endpoint(frontend_handshake, connect_timeout).await?;
-
-    let peer_identity = PeerIdentity::try_from(engine_id.clone())
-        .map_err(|e| anyhow!("invalid engine identity {:?}: {e}", engine_id.to_vec()))?;
-    let mut options = SocketOptions::default();
-    options.peer_identity(peer_identity.clone());
-    let mut handshake = DealerSocket::with_options(options);
-    handshake
-        .connect(frontend_handshake)
-        .await
-        .with_context(|| format!("connecting to frontend handshake {frontend_handshake}"))?;
-    handshake
-        .send(ZmqMessage::from(
-            encode_msgpack(&status_message("HELLO", local, headless))
-                .map_err(|e| anyhow!("encoding HELLO: {e}"))?,
-        ))
-        .await
-        .context("sending HELLO to frontend")?;
-
-    let init_frames = handshake
-        .recv()
-        .await
-        .context("receiving INIT from frontend")?
-        .into_vec();
-    if init_frames.len() != 1 {
-        bail!(
-            "expected one INIT frame from frontend, got {}",
-            init_frames.len()
-        );
-    }
-    let init: HandshakeInitMessage =
-        decode_msgpack(init_frames[0].as_ref()).map_err(|e| anyhow!("decoding INIT: {e}"))?;
-
-    if init.addresses.inputs.is_empty() {
-        bail!("frontend INIT did not include an input address");
-    }
-    if init.addresses.inputs.len() != init.addresses.outputs.len() {
-        bail!(
-            "frontend INIT input/output address count mismatch: {} inputs, {} outputs",
-            init.addresses.inputs.len(),
-            init.addresses.outputs.len()
-        );
-    }
-
+) -> Result<Vec<MockEngineDataSockets>> {
     let mut data_sockets = Vec::with_capacity(init.addresses.inputs.len());
     for (input_address, output_address) in init
         .addresses
@@ -226,8 +187,11 @@ pub async fn connect_to_frontend_raw(
 
         data_sockets.push(MockEngineDataSockets { dealer, push });
     }
+    Ok(data_sockets)
+}
 
-    let coordinator = match (
+async fn open_coordinator(init: &HandshakeInitMessage) -> Result<Option<MockCoordinatorSockets>> {
+    match (
         init.addresses.coordinator_input.as_deref(),
         init.addresses.coordinator_output.as_deref(),
     ) {
@@ -257,25 +221,148 @@ pub async fn connect_to_frontend_raw(
                 bail!("expected coordinator READY marker, got {ready:?}");
             }
 
-            Some(MockCoordinatorSockets {
+            Ok(Some(MockCoordinatorSockets {
                 input_sub,
                 output_push,
-            })
+            }))
         }
-        (None, None) => None,
+        (None, None) => Ok(None),
         _ => bail!("coordinator handshake addresses must be both present or both absent"),
+    }
+}
+
+/// An engine-core handshake that has its INIT and has not reported READY.
+pub struct OpenHandshake {
+    socket: DealerSocket,
+    peer_identity: PeerIdentity,
+    local: bool,
+    headless: bool,
+    /// The INIT message the frontend answered HELLO with.
+    pub init: HandshakeInitMessage,
+}
+
+impl OpenHandshake {
+    /// Join a frontend-owned handshake endpoint: send HELLO, take INIT.
+    pub async fn open(
+        frontend_handshake: &str,
+        engine_id: EngineId,
+        local: bool,
+        headless: bool,
+        connect_timeout: Duration,
+    ) -> Result<Self> {
+        wait_for_ipc_endpoint(frontend_handshake, connect_timeout).await?;
+
+        let peer_identity = PeerIdentity::try_from(engine_id.clone())
+            .map_err(|e| anyhow!("invalid engine identity {:?}: {e}", engine_id.to_vec()))?;
+        let mut options = SocketOptions::default();
+        options.peer_identity(peer_identity.clone());
+        let mut socket = DealerSocket::with_options(options);
+        socket
+            .connect(frontend_handshake)
+            .await
+            .with_context(|| format!("connecting to frontend handshake {frontend_handshake}"))?;
+        socket
+            .send(ZmqMessage::from(
+                encode_msgpack(&status_message("HELLO", local, headless))
+                    .map_err(|e| anyhow!("encoding HELLO: {e}"))?,
+            ))
+            .await
+            .context("sending HELLO to frontend")?;
+
+        let init_frames = socket
+            .recv()
+            .await
+            .context("receiving INIT from frontend")?
+            .into_vec();
+        if init_frames.len() != 1 {
+            bail!(
+                "expected one INIT frame from frontend, got {}",
+                init_frames.len()
+            );
+        }
+        let init: HandshakeInitMessage =
+            decode_msgpack(init_frames[0].as_ref()).map_err(|e| anyhow!("decoding INIT: {e}"))?;
+
+        if init.addresses.inputs.is_empty() {
+            bail!("frontend INIT did not include an input address");
+        }
+        if init.addresses.inputs.len() != init.addresses.outputs.len() {
+            bail!(
+                "frontend INIT input/output address count mismatch: {} inputs, {} outputs",
+                init.addresses.inputs.len(),
+                init.addresses.outputs.len()
+            );
+        }
+
+        Ok(Self {
+            socket,
+            peer_identity,
+            local,
+            headless,
+            init,
+        })
+    }
+
+    /// Report READY on the handshake socket.
+    pub async fn ready(&mut self) -> Result<()> {
+        let ready = encode_msgpack(&status_message("READY", self.local, self.headless))
+            .map_err(|e| anyhow!("encoding READY: {e}"))?;
+        self.socket
+            .send(ZmqMessage::from(ready))
+            .await
+            .context("sending READY to frontend")
+    }
+}
+
+/// Join a frontend-owned handshake endpoint and open engine data sockets,
+/// registering with `ready_response_payload` verbatim.
+pub async fn connect_to_frontend_raw(
+    frontend_handshake: &str,
+    engine_id: EngineId,
+    local: bool,
+    headless: bool,
+    ready_response_payload: &[u8],
+    connect_timeout: Duration,
+    ready_order: ReadyOrder,
+) -> Result<MockEngineSockets> {
+    let mut handshake = OpenHandshake::open(
+        frontend_handshake,
+        engine_id,
+        local,
+        headless,
+        connect_timeout,
+    )
+    .await?;
+
+    let (data_sockets, coordinator) = match ready_order {
+        ReadyOrder::AfterDataSockets => {
+            let data_sockets = open_data_sockets(
+                &handshake.init,
+                &handshake.peer_identity,
+                ready_response_payload,
+                connect_timeout,
+            )
+            .await?;
+            let coordinator = open_coordinator(&handshake.init).await?;
+            handshake.ready().await?;
+            (data_sockets, coordinator)
+        }
+        ReadyOrder::BeforeDataSockets => {
+            let coordinator = open_coordinator(&handshake.init).await?;
+            handshake.ready().await?;
+            let data_sockets = open_data_sockets(
+                &handshake.init,
+                &handshake.peer_identity,
+                ready_response_payload,
+                connect_timeout,
+            )
+            .await?;
+            (data_sockets, coordinator)
+        }
     };
 
-    handshake
-        .send(ZmqMessage::from(
-            encode_msgpack(&status_message("READY", local, headless))
-                .map_err(|e| anyhow!("encoding READY: {e}"))?,
-        ))
-        .await
-        .context("sending READY to frontend")?;
-
     Ok(MockEngineSockets {
-        init,
+        init: handshake.init,
         data_sockets,
         coordinator,
     })
